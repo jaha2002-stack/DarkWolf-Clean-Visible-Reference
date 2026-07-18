@@ -79,7 +79,20 @@ try {
     Invoke-MSBuildProject 'src\renderer\renderer.vcxproj'
     Invoke-MSBuildProject 'src\cgame\cgame.vcxproj'
     Invoke-MSBuildProject 'src\ui\ui.vcxproj'
-    Invoke-MSBuildProject 'src\game\game.vcxproj'
+
+    # RTCW game.vcxproj regenerates the game function table during a clean CI build.
+    # The first pass can update that table and then stop at link time because an
+    # object such as .\Release\g_save.obj has not yet been rebuilt. A second
+    # invocation uses the regenerated table and completes the normal build.
+    # Only one retry is allowed; a failure on the second pass remains fatal.
+    try {
+        Invoke-MSBuildProject 'src\game\game.vcxproj'
+    }
+    catch {
+        Write-Warning 'game.vcxproj failed on the first pass. Retrying once after the game function table was regenerated.'
+        Invoke-MSBuildProject 'src\game\game.vcxproj'
+    }
+
     Invoke-MSBuildProject 'src\wolf.vcxproj' $false
 
     $dist = Join-Path $RepoRoot 'dist'
