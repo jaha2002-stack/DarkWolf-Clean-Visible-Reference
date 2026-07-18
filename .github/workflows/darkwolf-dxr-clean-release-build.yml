@@ -1,0 +1,44 @@
+name: DarkWolf DXR Clean Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Apply full DXR visibility/debug patch stack
+        shell: pwsh
+        run: ./scripts/apply-dxr-visibility-debug-full.ps1
+
+      - name: Build clean runtime package
+        shell: pwsh
+        run: ./scripts/build-windows-clean-release.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Show packaged files
+        shell: pwsh
+        run: Get-ChildItem -Path dist -Recurse | Format-Table FullName, Length
+
+      - name: Upload clean runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-DXR-Clean-Runtime-${{ inputs.configuration }}
+          path: dist/**
+          if-no-files-found: error
