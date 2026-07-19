@@ -125,7 +125,7 @@ index a6219e6e879b066b19a61190328f0d608ed7352e..66b89af75db94b2bb647369cbf29b5db
 +		return 0;
 +	}
 +
-+	if (g_glRaytracingErrorCount < std::max(g_glRaytracingSafety.errorLimit, 1))
++	if (g_glRaytracingErrorCount < (std::max)(g_glRaytracingSafety.errorLimit, 1))
 +	{
 +		++g_glRaytracingErrorCount;
 +		glRaytracingFatal("%s failed 0x%08X at %s:%d",
@@ -719,9 +719,9 @@ index a6219e6e879b066b19a61190328f0d608ed7352e..66b89af75db94b2bb647369cbf29b5db
 +		const float dy = light.position.y - cy;
 +		const float dz = light.position.z - cz;
 +		const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
-+		const float radius = std::max(light.radius, 1.0f);
++		const float radius = (std::max)(light.radius, 1.0f);
 +		const float inside = glRaytracingClamp(1.0f - distance / radius, 0.0f, 1.0f);
-+		float score = std::max(light.intensity, 0.0f) * (0.25f + inside * 4.0f);
++		float score = (std::max)(light.intensity, 0.0f) * (0.25f + inside * 4.0f);
 +		score += radius / (distance + 64.0f);
 +		if (light.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
 +			score *= 1.20f;
@@ -737,7 +737,7 @@ index a6219e6e879b066b19a61190328f0d608ed7352e..66b89af75db94b2bb647369cbf29b5db
 +
 +	const size_t limit = glRaytracingClamp<size_t>(
 +		(size_t)g_glRaytracingPerformance.maxLights, 1, GL_RAYTRACING_MAX_LIGHTS);
-+	const size_t selectedCount = std::min(limit, scored.size());
++	const size_t selectedCount = (std::min)(limit, scored.size());
 +	g_glRaytracingLighting.selectedLights.reserve(selectedCount);
 +	for (size_t i = 0; i < selectedCount; ++i)
 +		g_glRaytracingLighting.selectedLights.push_back(g_glRaytracingLighting.cpuLights[scored[i].index]);
