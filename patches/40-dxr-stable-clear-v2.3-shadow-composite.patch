@@ -1,0 +1,52 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 0f77986..9a122fe 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -2499,17 +2499,30 @@ void RayGen()
+     }
+     else
+     {
+-        float3 rtLitColor = albedo * lightingAccum + specularAccum;
+-        rtLitColor = max(rtLitColor, baseAlbedo * 0.15);
++        // Keep diffuse and specular separate so the authored-light shadow mask
++        // can affect the whole diffuse composite instead of only the legacy
++        // raster half.  In v2.2 a bright camera-fill/ambient term remained in
++        // rtLitColor, so a valid grille or torch shadow was clearly visible in
++        // debugMode 5 but almost disappeared in the final image.
++        float3 rtDiffuseColor = max(albedo * lightingAccum, baseAlbedo * 0.15);
++        float3 rtSpecularColor = specularAccum;
++        float3 rtLitColor = rtDiffuseColor + rtSpecularColor;
+ 
+         float legacyKeep = saturate(gLegacyBlend);
+-        float legacyShadowInfluence = saturate(strongestDirectWeight * 1.50);
++        float legacyShadowInfluence = saturate(strongestDirectWeight * 3.00);
+         float legacyShadow = lerp(
+             1.0,
+             strongestDirectVisibility,
+             saturate(gLegacyShadowStrength) * legacyShadowInfluence);
+         legacyShadow = max(legacyShadow, saturate(gShadowMinVisibility));
+-        float3 finalColor = lerp(rtLitColor, baseAlbedo * legacyShadow, legacyKeep);
++
++        // Apply the stable world-light shadow to both raster and RT diffuse.
++        // Specular is only partially attenuated, preserving metal highlights
++        // without allowing them to erase the silhouette of doors/grilles.
++        float3 blendedDiffuse = lerp(rtDiffuseColor, baseAlbedo, legacyKeep);
++        float specularShadow = lerp(1.0, legacyShadow, 0.35);
++        float3 finalColor = blendedDiffuse * legacyShadow +
++                            rtSpecularColor * specularShadow;
+         finalColor *= max(gExposure, 0.001);
+ 
+         if (gDebugMode == 1)
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index ab8a8a7..de4dbaa 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1295,7 +1295,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.3 shadow-composite: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
