@@ -1,0 +1,548 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 0f77986..43213e6 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1762,8 +1762,8 @@ struct glRaytracingLightingConstants_t
+ 	float contactShadowLength;
+ 	uint32_t contactShadows;
+ 	uint32_t frameIndex;
+-	uint32_t qualityPad0;
+-	uint32_t qualityPad1;
++	float fallbackDiffuseScale;
++	float highlightCompression;
+ };
+ 
+ static_assert(sizeof(glRaytracingLightingConstants_t) == 256,
+@@ -1791,12 +1791,24 @@ struct glRaytracingLightingState_t
+ 	glRaytracingBuffer_t missTable;
+ 	glRaytracingBuffer_t hitTable;
+ 
++	uint32_t selectedPointCount;
++	uint32_t selectedRectCount;
++	uint32_t selectedFillCount;
++	uint32_t droppedLightCount;
++	float selectedMaxRadius;
++	float selectedMaxIntensity;
+ 	bool initialized;
+ 
+ 	glRaytracingLightingState_t()
+ 	{
+ 		memset(&constants, 0, sizeof(constants));
+ 		descriptorStride = 0;
++		selectedPointCount = 0;
++		selectedRectCount = 0;
++		selectedFillCount = 0;
++		droppedLightCount = 0;
++		selectedMaxRadius = 0.0f;
++		selectedMaxIntensity = 0.0f;
+ 		initialized = false;
+ 	}
+ };
+@@ -1856,8 +1868,8 @@ cbuffer LightingCB : register(b0)
+     float    gContactShadowLength;
+     uint     gContactShadows;
+     uint     gFrameIndex;
+-    uint     gQualityPad0;
+-    uint     gQualityPad1;
++    float    gFallbackDiffuseScale;
++    float    gHighlightCompression;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -1877,6 +1889,20 @@ static const float GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY = 1.0;
+ static const uint GEOMETRY_FLAG_SKELETAL = 1;
+ static const uint GEOMETRY_FLAG_UNLIT    = 2;
+ 
++float Luminance(float3 c)
++{
++    return dot(max(c, 0.0), float3(0.2126, 0.7152, 0.0722));
++}
++
++float3 ApplyAcesHighlightCompression(float3 color)
++{
++    color = max(color, 0.0);
++    float3 mapped = saturate(
++        (color * (2.51 * color + 0.03)) /
++        (color * (2.43 * color + 0.59) + 0.14));
++    return lerp(color, mapped, saturate(gHighlightCompression));
++}
++
+ float3 LoadScenePosition(uint2 pixel)
+ {
+     float4 p = gPositionTex.Load(int3(pixel, 0));
+@@ -2356,18 +2382,24 @@ void RayGen()
+ 
+     float skyStrength = 1.35 + gAmbientColor.a * 0.65;
+ 
+-    float3 lightingAccum = gAmbientColor.rgb * gAmbientColor.a;
+-    float3 specularAccum = 0.0;
+-    float strongestDirectWeight = 0.0;
+-    float strongestDirectVisibility = 1.0;
+-
+-    lightingAccum += skyColor * (skyStrength * skyVis);
++    // Quality Lab 1 keeps indirect/fill light separate from authored direct
++    // light.  This is the key to a stable multi-light shadow composite: the
++    // shadow mask is derived from the energy of all real map lights instead of
++    // whichever single light happens to win at a pixel.
++    float3 indirectLighting = gAmbientColor.rgb * gAmbientColor.a;
++    indirectLighting += skyColor * (skyStrength * skyVis);
+ 
+     if (geoFlag == GEOMETRY_FLAG_SKELETAL)
+     {
+-        lightingAccum += 0.15;
++        indirectLighting += 0.15;
+     }
+ 
++    float3 authoredDirectUnshadowed = 0.0;
++    float3 authoredDirectShadowed = 0.0;
++    float3 fillDiffuseAccum = 0.0;
++    float3 authoredSpecularAccum = 0.0;
++    float3 fillSpecularAccum = 0.0;
++
+     [loop]
+     for (uint i = 0; i < gLightCount; ++i)
+     {
+@@ -2383,13 +2415,18 @@ void RayGen()
+             float  dist    = sqrt(max(distSq, 1e-6));
+             float3 L       = toLight / dist;
+ 
+-            float atten = saturate((radius - dist) / radius);
+-            atten = atten * atten;
++            const bool fillOnly = (Lgt.pad1 >= GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY);
++            float attenBase = saturate((radius - dist) / radius);
++            // The camera fill has a very large radius.  A fourth-power falloff
++            // prevents it from painting broad white circles while preserving
++            // the close weapon/specular response that defined Clean Reference.
++            float atten = fillOnly
++                ? attenBase * attenBase * attenBase * attenBase
++                : attenBase * attenBase;
+ 
+             float wrap = 0.35;
+             float NdotLWrap = saturate((dot(N, L) + wrap) / (1.0 + wrap));
+ 
+-            const bool fillOnly = (Lgt.pad1 >= GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY);
+             float shadow = 1.0;
+             if (!fillOnly && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
+             {
+@@ -2397,16 +2434,25 @@ void RayGen()
+             }
+ 
+             float directInfluence = atten * NdotLWrap;
+-            if (!fillOnly && directInfluence > strongestDirectWeight)
++            float3 unshadowedDiffuse = Lgt.color * (Lgt.intensity * directInfluence);
++            float3 unshadowedSpecular = ComputeSpecular(
++                N, V, L, Lgt.color, Lgt.intensity, atten, 1.0, baseAlbedo);
++
++            if (fillOnly)
+             {
+-                strongestDirectWeight = directInfluence;
+-                strongestDirectVisibility = shadow;
++                float fillDiffuseScale = saturate(gFallbackDiffuseScale);
++                fillDiffuseAccum += unshadowedDiffuse * fillDiffuseScale;
++                // Keep more of the successful metallic highlight than the broad
++                // diffuse fill, but never let it return to full unbounded power.
++                float fillSpecularScale = lerp(0.25, 0.70, sqrt(fillDiffuseScale));
++                fillSpecularAccum += unshadowedSpecular * fillSpecularScale;
++            }
++            else
++            {
++                authoredDirectUnshadowed += unshadowedDiffuse;
++                authoredDirectShadowed += unshadowedDiffuse * shadow;
++                authoredSpecularAccum += unshadowedSpecular * shadow;
+             }
+-
+-            float3 diffuse = Lgt.color * (Lgt.intensity * directInfluence * shadow);
+-            lightingAccum += diffuse;
+-
+-            specularAccum += ComputeSpecular(N, V, L, Lgt.color, Lgt.intensity, atten, shadow, baseAlbedo);
+         }
+         else if (Lgt.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+         {
+@@ -2416,7 +2462,6 @@ void RayGen()
+             if (centerDistSq >= attenRadius * attenRadius)
+                 continue;
+             float  centerDist = sqrt(max(centerDistSq, 1e-6));
+-            float3 centerDir = toCenter / centerDist;
+ 
+             float atten = saturate((attenRadius - centerDist) / attenRadius);
+             atten = atten * atten * atten * atten;
+@@ -2457,7 +2502,6 @@ void RayGen()
+                     : saturate(dot(-L, Lgt.normal));
+ 
+                 float sampleWeight = Lgt.intensity * NdotL * faceTerm;
+-
+                 rectDiffuseAccum += Lgt.color * sampleWeight;
+ 
+                 rectSpecAccum += ComputeSpecular(
+@@ -2474,47 +2518,61 @@ void RayGen()
+             rectDiffuseAccum /= (float)sampleCount;
+             rectSpecAccum    /= (float)sampleCount;
+ 
+-            if (atten > strongestDirectWeight)
+-            {
+-                strongestDirectWeight = atten;
+-                strongestDirectVisibility = shadow;
+-            }
+-            lightingAccum += clamp(rectDiffuseAccum * atten * shadow, 0.0, 4.0);
+-            specularAccum += rectSpecAccum * atten * shadow;
++            float3 rectDirect = clamp(rectDiffuseAccum * atten, 0.0, 4.0);
++            authoredDirectUnshadowed += rectDirect;
++            authoredDirectShadowed += rectDirect * shadow;
++            authoredSpecularAccum += rectSpecAccum * atten * shadow;
+         }
+     }
+ 
+-    lightingAccum *= ao;
++    float3 diffuseLighting = indirectLighting + fillDiffuseAccum + authoredDirectShadowed;
++    float3 specularAccum = authoredSpecularAccum + fillSpecularAccum;
++
++    diffuseLighting *= ao;
+     specularAccum *= lerp(1.0, ao, 0.5);
+ 
+     if (geoFlag == GEOMETRY_FLAG_SKELETAL)
+     {
+-        lightingAccum *= 1.05;
++        diffuseLighting *= 1.05;
+         specularAccum *= 1.05;
+     }
+ 
++    // Energy-weighted visibility of all authored direct lights.  An unoccluded
++    // second light correctly fills a shadow from the first; a camera fill never
++    // enters this ratio and therefore cannot rotate or erase world shadows.
++    float authoredUnshadowedLum = Luminance(authoredDirectUnshadowed);
++    float authoredShadowedLum = Luminance(authoredDirectShadowed);
++    float multiLightVisibility = (authoredUnshadowedLum > 1e-5)
++        ? saturate(authoredShadowedLum / authoredUnshadowedLum)
++        : 1.0;
++
++    float supportLum = Luminance(indirectLighting + fillDiffuseAccum);
++    float authoredDirectShare = (authoredUnshadowedLum > 1e-5)
++        ? saturate(authoredUnshadowedLum / (authoredUnshadowedLum + supportLum + 0.15))
++        : 0.0;
++
++    float legacyShadowTarget = max(multiLightVisibility, saturate(gShadowMinVisibility));
++    float legacyShadowWeight = saturate(gLegacyShadowStrength) *
++        smoothstep(0.05, 0.65, authoredDirectShare);
++    float legacyShadow = lerp(1.0, legacyShadowTarget, legacyShadowWeight);
++
+     if (geoFlag == GEOMETRY_FLAG_UNLIT)
+     {
+         gOutputTex[pixel] = float4(baseAlbedo, albedoSample.a);
+     }
+     else
+     {
+-        float3 rtLitColor = albedo * lightingAccum + specularAccum;
++        float3 rtLitColor = albedo * diffuseLighting + specularAccum;
+         rtLitColor = max(rtLitColor, baseAlbedo * 0.15);
+ 
+         float legacyKeep = saturate(gLegacyBlend);
+-        float legacyShadowInfluence = saturate(strongestDirectWeight * 1.50);
+-        float legacyShadow = lerp(
+-            1.0,
+-            strongestDirectVisibility,
+-            saturate(gLegacyShadowStrength) * legacyShadowInfluence);
+-        legacyShadow = max(legacyShadow, saturate(gShadowMinVisibility));
+         float3 finalColor = lerp(rtLitColor, baseAlbedo * legacyShadow, legacyKeep);
+         finalColor *= max(gExposure, 0.001);
++        finalColor = ApplyAcesHighlightCompression(finalColor);
+ 
+         if (gDebugMode == 1)
+         {
+-            finalColor = rtLitColor;
++            finalColor = ApplyAcesHighlightCompression(rtLitColor);
+         }
+         else if (gDebugMode == 2)
+         {
+@@ -2527,11 +2585,27 @@ void RayGen()
+         }
+         else if (gDebugMode == 4)
+         {
+-            finalColor = lightingAccum / (1.0 + lightingAccum);
++            finalColor = diffuseLighting / (1.0 + diffuseLighting);
++        }
++        else if (gDebugMode == 5 || gDebugMode == 8)
++        {
++            finalColor = float3(multiLightVisibility, multiLightVisibility, multiLightVisibility);
++        }
++        else if (gDebugMode == 6)
++        {
++            finalColor = authoredDirectUnshadowed / (1.0 + authoredDirectUnshadowed);
++        }
++        else if (gDebugMode == 7)
++        {
++            finalColor = authoredDirectShadowed / (1.0 + authoredDirectShadowed);
++        }
++        else if (gDebugMode == 9)
++        {
++            finalColor = fillDiffuseAccum / (1.0 + fillDiffuseAccum);
+         }
+-        else if (gDebugMode == 5)
++        else if (gDebugMode == 10)
+         {
+-            finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
++            finalColor = float3(authoredDirectShare, authoredDirectShare, authoredDirectShare);
+         }
+ 
+         gOutputTex[pixel] = float4(finalColor, albedoSample.a);
+@@ -2715,6 +2789,12 @@ static void glRaytracingLightingUpdateConstants(void)
+ static void glRaytracingLightingPrepareSelectedLights(void)
+ {
+ 	g_glRaytracingLighting.selectedLights.clear();
++	g_glRaytracingLighting.selectedPointCount = 0;
++	g_glRaytracingLighting.selectedRectCount = 0;
++	g_glRaytracingLighting.selectedFillCount = 0;
++	g_glRaytracingLighting.droppedLightCount = 0;
++	g_glRaytracingLighting.selectedMaxRadius = 0.0f;
++	g_glRaytracingLighting.selectedMaxIntensity = 0.0f;
+ 	if (g_glRaytracingLighting.cpuLights.empty())
+ 	{
+ 		g_glRaytracingLighting.constants.lightCount = 0;
+@@ -2761,7 +2841,21 @@ static void glRaytracingLightingPrepareSelectedLights(void)
+ 	const size_t selectedCount = (std::min)(limit, scored.size());
+ 	g_glRaytracingLighting.selectedLights.reserve(selectedCount);
+ 	for (size_t i = 0; i < selectedCount; ++i)
+-		g_glRaytracingLighting.selectedLights.push_back(g_glRaytracingLighting.cpuLights[scored[i].index]);
++	{
++		const glRaytracingLight_t& selected = g_glRaytracingLighting.cpuLights[scored[i].index];
++		g_glRaytracingLighting.selectedLights.push_back(selected);
++		if (selected.pad1 >= 0.5f)
++			++g_glRaytracingLighting.selectedFillCount;
++		else if (selected.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
++			++g_glRaytracingLighting.selectedRectCount;
++		else
++			++g_glRaytracingLighting.selectedPointCount;
++		g_glRaytracingLighting.selectedMaxRadius = (std::max)(
++			g_glRaytracingLighting.selectedMaxRadius, selected.radius);
++		g_glRaytracingLighting.selectedMaxIntensity = (std::max)(
++			g_glRaytracingLighting.selectedMaxIntensity, selected.intensity);
++	}
++	g_glRaytracingLighting.droppedLightCount = (uint32_t)(scored.size() - selectedCount);
+ 
+ 	g_glRaytracingLighting.constants.lightCount = (uint32_t)g_glRaytracingLighting.selectedLights.size();
+ 	if (!g_glRaytracingLighting.selectedLights.empty())
+@@ -3053,6 +3147,8 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.contactShadowLength = 96.0f;
+ 	g_glRaytracingLighting.constants.contactShadows = 0u;
+ 	g_glRaytracingLighting.constants.frameIndex = 0u;
++	g_glRaytracingLighting.constants.fallbackDiffuseScale = 0.35f;
++	g_glRaytracingLighting.constants.highlightCompression = 1.0f;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -3204,6 +3300,15 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetCompositeOptions(float fallbackDiffuseScale, float highlightCompression)
++{
++	g_glRaytracingLighting.constants.fallbackDiffuseScale =
++		glRaytracingClamp(fallbackDiffuseScale, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.highlightCompression =
++		glRaytracingClamp(highlightCompression, 0.0f, 1.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+@@ -3451,3 +3556,41 @@ uint32_t glRaytracingLightingGetSelectedLightCount(void)
+ {
+ 	return (uint32_t)g_glRaytracingLighting.selectedLights.size();
+ }
++
++uint32_t glRaytracingLightingGetSelectedPointCount(void)
++{
++	return g_glRaytracingLighting.selectedPointCount;
++}
++
++uint32_t glRaytracingLightingGetSelectedRectCount(void)
++{
++	return g_glRaytracingLighting.selectedRectCount;
++}
++
++uint32_t glRaytracingLightingGetSelectedFillCount(void)
++{
++	return g_glRaytracingLighting.selectedFillCount;
++}
++
++uint32_t glRaytracingLightingGetDroppedLightCount(void)
++{
++	return g_glRaytracingLighting.droppedLightCount;
++}
++
++float glRaytracingLightingGetSelectedMaxRadius(void)
++{
++	return g_glRaytracingLighting.selectedMaxRadius;
++}
++
++float glRaytracingLightingGetSelectedMaxIntensity(void)
++{
++	return g_glRaytracingLighting.selectedMaxIntensity;
++}
++
++int glRaytracingLightingGetSelectedLight(uint32_t index, glRaytracingLight_t* outLight)
++{
++	if (!outLight || index >= g_glRaytracingLighting.selectedLights.size())
++		return 0;
++	*outLight = g_glRaytracingLighting.selectedLights[index];
++	return 1;
++}
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index b17240e..fe7e3f5 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1713,6 +1713,7 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
++void                       glRaytracingLightingSetCompositeOptions(float fallbackDiffuseScale, float highlightCompression);
+ void                       glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+@@ -1746,6 +1747,13 @@ glRaytracingLight_t        glRaytracingLightingMakeRectLight(
+ 
+ uint32_t                   glRaytracingLightingGetLightCount(void);
+ uint32_t                   glRaytracingLightingGetSelectedLightCount(void);
++uint32_t                   glRaytracingLightingGetSelectedPointCount(void);
++uint32_t                   glRaytracingLightingGetSelectedRectCount(void);
++uint32_t                   glRaytracingLightingGetSelectedFillCount(void);
++uint32_t                   glRaytracingLightingGetDroppedLightCount(void);
++float                      glRaytracingLightingGetSelectedMaxRadius(void);
++float                      glRaytracingLightingGetSelectedMaxIntensity(void);
++int                        glRaytracingLightingGetSelectedLight(uint32_t index, glRaytracingLight_t* outLight);
+ 
+ void                       glLightScene(void);
+ 
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index ab8a8a7..f569695 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1286,8 +1286,21 @@ static void RB_RunRaytracedLightingPass(void)
+ 		glRaytracingLightingSetDebugMode(0);
+ 	}
+ 
++	glRaytracingLightingSetCompositeOptions(
++		r_dxrFallbackDiffuseScale ? r_dxrFallbackDiffuseScale->value : 0.35f,
++		r_dxrHighlightCompression ? r_dxrHighlightCompression->value : 1.0f);
++
+ 	RB_AddDXRFallbackLightIfNeeded();
+ 
++	// glLightScene submits the raster transitions before DXR. A global
++	// glFinish here forces the whole GPU idle every frame and was the largest
++	// avoidable source of stutter. Keep it only as an explicit diagnostic mode.
++	if (r_dxrCpuSync && r_dxrCpuSync->integer)
++		glFinish();
++	glLightScene();
++
++	// Print diagnostics after glLightScene, when the current frame's importance
++	// selection is complete.  v2.2 printed the previous frame's selected count.
+ 	if (r_dxrDebug && r_dxrDebug->integer)
+ 	{
+ 		const int now = ri.Milliseconds();
+@@ -1295,11 +1308,17 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.2 Quality Lab 1: meshes=%u instances=%u lights=%u selected=%u dropped=%u point=%u rect=%u fill=%u maxRadius=%.1f maxIntensity=%.2f async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d fillScale=%.2f highlight=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+ 				glRaytracingLightingGetSelectedLightCount(),
++				glRaytracingLightingGetDroppedLightCount(),
++				glRaytracingLightingGetSelectedPointCount(),
++				glRaytracingLightingGetSelectedRectCount(),
++				glRaytracingLightingGetSelectedFillCount(),
++				glRaytracingLightingGetSelectedMaxRadius(),
++				glRaytracingLightingGetSelectedMaxIntensity(),
+ 				r_dxrAsyncSubmit ? r_dxrAsyncSubmit->integer : 0,
+ 				r_dxrCpuSync ? r_dxrCpuSync->integer : 1,
+ 				r_dxrShadowSamples ? r_dxrShadowSamples->integer : 1,
+@@ -1308,22 +1327,35 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrSkySamples ? r_dxrSkySamples->integer : 0,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
+ 				r_dxrFallbackCastsShadows ? r_dxrFallbackCastsShadows->integer : 0,
+-				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+-				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
++				r_dxrFallbackDiffuseScale ? r_dxrFallbackDiffuseScale->value : 0.35f,
++				r_dxrHighlightCompression ? r_dxrHighlightCompression->value : 1.0f,
+ 				r_dxrShadowBias ? r_dxrShadowBias->value : 0.0f,
+ 				r_dxrAmbientIntensity ? r_dxrAmbientIntensity->value : 0.0f,
+ 				r_dxrLegacyBlend ? r_dxrLegacyBlend->value : 0.0f,
+ 				r_dxrExposure ? r_dxrExposure->value : 0.0f,
+ 				r_dxrDebugMode ? r_dxrDebugMode->integer : 0);
++
++			int dumpCount = r_dxrDebugLights ? r_dxrDebugLights->integer : 0;
++			if (dumpCount < 0) dumpCount = 0;
++			if (dumpCount > 16) dumpCount = 16;
++			for (int i = 0; i < dumpCount; ++i)
++			{
++				glRaytracingLight_t light;
++				if (!glRaytracingLightingGetSelectedLight((uint32_t)i, &light))
++					break;
++				ri.Printf(PRINT_ALL,
++					"  QL1 light[%d] type=%s fill=%d persistent=%d pos=(%.1f %.1f %.1f) radius=%.1f intensity=%.2f color=(%.2f %.2f %.2f)\n",
++					i,
++					(light.type == GL_RAYTRACING_LIGHT_TYPE_RECT) ? "rect" : "point",
++					(light.pad1 >= 0.5f) ? 1 : 0,
++					(light.persistant >= 0.5f) ? 1 : 0,
++					light.position.x, light.position.y, light.position.z,
++					light.radius, light.intensity,
++					light.color.x, light.color.y, light.color.z);
++			}
+ 		}
+ 	}
+ 
+-	// glLightScene submits the raster transitions before DXR. A global
+-	// glFinish here forces the whole GPU idle every frame and was the largest
+-	// avoidable source of stutter. Keep it only as an explicit diagnostic mode.
+-	if (r_dxrCpuSync && r_dxrCpuSync->integer)
+-		glFinish();
+-	glLightScene();
+ 	glRaytracingLightingClearLights(false);
+ }
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 8258b2d..2bfd3d3 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -84,6 +84,9 @@ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
+ cvar_t  *r_dxrFallbackCastsShadows;
++cvar_t  *r_dxrFallbackDiffuseScale;
++cvar_t  *r_dxrHighlightCompression;
++cvar_t  *r_dxrDebugLights;
+ cvar_t  *r_dxrSafeMode;
+ cvar_t  *r_dxrErrorLimit;
+ cvar_t  *r_dxrFenceWaitMs;
+@@ -1022,6 +1025,9 @@ void R_Register( void ) {
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
+ 	r_dxrFallbackCastsShadows = ri.Cvar_Get( "r_dxrFallbackCastsShadows", "0", CVAR_ARCHIVE );
++	r_dxrFallbackDiffuseScale = ri.Cvar_Get( "r_dxrFallbackDiffuseScale", "0.35", CVAR_ARCHIVE );
++	r_dxrHighlightCompression = ri.Cvar_Get( "r_dxrHighlightCompression", "1.0", CVAR_ARCHIVE );
++	r_dxrDebugLights = ri.Cvar_Get( "r_dxrDebugLights", "0", CVAR_ARCHIVE );
+ 	r_dxrSafeMode = ri.Cvar_Get( "r_dxrSafeMode", "1", CVAR_ARCHIVE );
+ 	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "4", CVAR_ARCHIVE );
+ 	r_dxrFenceWaitMs = ri.Cvar_Get( "r_dxrFenceWaitMs", "5000", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 0ae7354..6bfa988 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1137,11 +1137,14 @@ extern cvar_t   *r_dxrAmbientIntensity; // global ambient lift for the DXR resol
+ extern cvar_t   *r_dxrLegacyBlend;      // how much of the original RTCW shading is preserved
+ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR resolve
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+-extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
++extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 RT, 2 AO/sky, 3 albedo, 4 lighting, 5/8 multi-light visibility, 6 unshadowed direct, 7 shadowed direct, 9 fill, 10 direct share
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;
+ extern cvar_t   *r_dxrFallbackCastsShadows; // camera fill should not move world shadows
++extern cvar_t   *r_dxrFallbackDiffuseScale; // diffuse contribution of the camera-following fill
++extern cvar_t   *r_dxrHighlightCompression; // ACES highlight shoulder blend, 0=off 1=full
++extern cvar_t   *r_dxrDebugLights;          // dump this many selected lights once per second
+ extern cvar_t   *r_dxrSafeMode;
+ extern cvar_t   *r_dxrErrorLimit;
+ extern cvar_t   *r_dxrFenceWaitMs;
