@@ -1,0 +1,296 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 770a067..0f77986 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1870,6 +1870,9 @@ RWTexture2D<float4>     gOutputTex   : register(u0);
+ 
+ static const uint GL_RAYTRACING_LIGHT_TYPE_POINT = 0;
+ static const uint GL_RAYTRACING_LIGHT_TYPE_RECT  = 1;
++// Stored in Light.pad1. A fill-only light contributes diffuse/specular light but
++// never casts a ray-traced shadow or overrides the authored-light shadow mask.
++static const float GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY = 1.0;
+ 
+ static const uint GEOMETRY_FLAG_SKELETAL = 1;
+ static const uint GEOMETRY_FLAG_UNLIT    = 2;
+@@ -1911,7 +1914,8 @@ float TraceShadow(float3 origin, float3 dir, float maxT)
+ 
+     TraceRay(
+         gSceneBVH,
+-        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE,
++        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
++        RAY_FLAG_CULL_FRONT_FACING_TRIANGLES | RAY_FLAG_FORCE_OPAQUE,
+         0xFF,
+         0,
+         1,
+@@ -2225,8 +2229,17 @@ float ComputeCavity(uint2 pixel, float3 worldPos, float3 N)
+         if (sp.x < 0 || sp.y < 0 || sp.x >= (int)gScreenSize.x || sp.y >= (int)gScreenSize.y)
+             continue;
+ 
+-        float3 samplePos = gPositionTex.Load(int3(sp, 0)).xyz;
+-        float3 sampleN   = normalize(gNormalTex.Load(int3(sp, 0)).xyz);
++        float4 samplePosition = gPositionTex.Load(int3(sp, 0));
++        if (samplePosition.w < 0.5)
++            continue;
++
++        float3 sampleNormalRaw = gNormalTex.Load(int3(sp, 0)).xyz;
++        float sampleNormalLenSq = dot(sampleNormalRaw, sampleNormalRaw);
++        if (sampleNormalLenSq < 0.25)
++            continue;
++
++        float3 samplePos = samplePosition.xyz;
++        float3 sampleN   = sampleNormalRaw * rsqrt(sampleNormalLenSq);
+ 
+         float3 d = samplePos - worldPos;
+         float distSq = dot(d, d);
+@@ -2300,14 +2313,32 @@ void RayGen()
+         return;
+     }
+ 
+-    float3 baseAlbedo    = albedoSample.rgb;
++    float3 baseAlbedo = albedoSample.rgb;
+     float4 positionSample = gPositionTex.Load(int3(pixel, 0));
+-    float3 worldPos      = positionSample.xyz;
+-    float4 normalSample  = LoadSceneNormal(pixel);
+-    float3 N             = normalize(normalSample.xyz);
+-    float3 V             = normalize(gCameraPos.xyz - worldPos);
+ 
+-    float geoFlag = positionSample.w;
++    // ARB-program and other color-only passes do not populate the opaque
++    // G-buffer. Their cleared marker is zero. Preserve their raster color
++    // instead of lighting an invalid world position/normal.
++    if (positionSample.w < 0.5)
++    {
++        gOutputTex[pixel] = albedoSample;
++        return;
++    }
++
++    float4 normalSample = LoadSceneNormal(pixel);
++    float normalLenSq = dot(normalSample.xyz, normalSample.xyz);
++    if (normalLenSq < 0.25)
++    {
++        gOutputTex[pixel] = albedoSample;
++        return;
++    }
++
++    float3 worldPos = positionSample.xyz;
++    float3 N = normalSample.xyz * rsqrt(normalLenSq);
++    float3 V = normalize(gCameraPos.xyz - worldPos);
++
++    // Raster G-buffer stores geometryFlag + 1 so zero remains an invalid marker.
++    float geoFlag = positionSample.w - 1.0;
+ 
+     float cavity = ComputeCavity(pixel, worldPos, N);
+     float microShadow = lerp(0.90, 1.0, cavity);
+@@ -2358,14 +2389,15 @@ void RayGen()
+             float wrap = 0.35;
+             float NdotLWrap = saturate((dot(N, L) + wrap) / (1.0 + wrap));
+ 
++            const bool fillOnly = (Lgt.pad1 >= GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY);
+             float shadow = 1.0;
+-            if (NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
++            if (!fillOnly && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
+             {
+                 shadow = TraceSoftShadow(worldPos, N, Lgt, toLight, dist);
+             }
+ 
+             float directInfluence = atten * NdotLWrap;
+-            if (directInfluence > strongestDirectWeight)
++            if (!fillOnly && directInfluence > strongestDirectWeight)
+             {
+                 strongestDirectWeight = directInfluence;
+                 strongestDirectVisibility = shadow;
+@@ -2714,8 +2746,8 @@ static void glRaytracingLightingPrepareSelectedLights(void)
+ 		score += radius / (distance + 64.0f);
+ 		if (light.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+ 			score *= 1.20f;
+-		if (!light.persistant)
+-			score += 1000000.0f; // keep the explicitly requested camera light
++		if (light.pad1 >= 0.5f)
++			score += 1000000.0f; // keep only the explicit camera fill light
+ 		scored.push_back({ i, score });
+ 	}
+ 
+diff --git a/src/opengl/gl_d3d12shim.cpp b/src/opengl/gl_d3d12shim.cpp
+index 49a4f3c..c1883ea 100644
+--- a/src/opengl/gl_d3d12shim.cpp
++++ b/src/opengl/gl_d3d12shim.cpp
+@@ -216,6 +216,11 @@ static const UINT QD3D12_UploadBufferSize = 128 * 1024 * 1024;
+ 
+ static const DXGI_FORMAT QD3D12_SceneColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+ static const DXGI_FORMAT QD3D12_VelocityFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
++// Absolute RTCW world coordinates exceed FP16 precision. A half-float position
++// buffer quantizes ray origins by fractions of a unit (or more), which produces
++// moving shadow acne, dotted surfaces and white bands. Keep normals/velocity in
++// FP16, but store world position in full FP32.
++static const DXGI_FORMAT QD3D12_PositionFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
+ static const DXGI_FORMAT QD3D12_DepthFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+ static const DXGI_FORMAT QD3D12_DepthResourceFormat = DXGI_FORMAT_R32G8X24_TYPELESS;
+ static const DXGI_FORMAT QD3D12_DepthSrvFormat = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+@@ -1497,13 +1502,12 @@ float4 BuildTexturedColor(VSOut i)
+     float4 primary = i.col;
+     float4 outColor = primary;
+ 
++    // Sample the original texture coordinates directly. The old screen-space
++    // TinyNoise offset changed the sampled texel when the camera moved and made
++    // old low-resolution textures shimmer or break into horizontal/diagonal lines.
+     float2 uv0 = i.uv0;
+     float2 uv1 = i.uv1;
+ 
+-    float n = TinyNoise(int2(i.pos.xy)) * 0.0005;
+-    uv0 += float2(n, -n);
+-    uv1 += float2(-n, n);
+-
+     if (gUseTex0 > 0.5)
+     {
+         float4 tex0 = gTex0.Sample(gSamp0, uv0);
+@@ -1575,7 +1579,7 @@ PSOut PSMain(VSOut i)
+     PSOut o;
+     o.color = BuildTexturedColor(i);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x);
++    o.position = float4(i.worldPos, i.attr.x + 1.0);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+@@ -1586,7 +1590,7 @@ PSOut PSMainAlphaTest(VSOut i)
+     o.color = BuildTexturedColor(i);
+     QD3D12_AlphaTest(o.color.a);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x);
++    o.position = float4(i.worldPos, i.attr.x + 1.0);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+@@ -1596,7 +1600,7 @@ PSOut PSMainUntextured(VSOut i)
+     PSOut o;
+     o.color = ApplyFog(i.col, i.fogCoord);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x);
++    o.position = float4(i.worldPos, i.attr.x + 1.0);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+@@ -3484,7 +3488,7 @@ static void QD3D12_CreateRTVsForWindow(QD3D12Window& w)
+ 		CreateRenderTexture(w.normalBuffers[i], w.normalBufferState[i], DXGI_FORMAT_R16G16B16A16_FLOAT, normalClear, true, w.renderWidth, w.renderHeight);
+ 
+ 	for (UINT i = 0; i < QD3D12_FrameCount; ++i)
+-		CreateRenderTexture(w.positionBuffers[i], w.positionBufferState[i], DXGI_FORMAT_R16G16B16A16_FLOAT, positionClear, true, w.renderWidth, w.renderHeight);
++		CreateRenderTexture(w.positionBuffers[i], w.positionBufferState[i], QD3D12_PositionFormat, positionClear, true, w.renderWidth, w.renderHeight);
+ 
+ 	for (UINT i = 0; i < QD3D12_FrameCount; ++i)
+ 		CreateRenderTexture(w.velocityBuffers[i], w.velocityBufferState[i], QD3D12_VelocityFormat, velocityClear, true, w.renderWidth, w.renderHeight);
+@@ -3532,7 +3536,7 @@ static void QD3D12_CreateRTVsForWindow(QD3D12Window& w)
+ 		CreateTextureSrv(w.normalBuffers[i].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, w.normalSrvIndex[i], w.normalSrvCpu[i], w.normalSrvGpu[i]);
+ 
+ 	for (UINT i = 0; i < QD3D12_FrameCount; ++i)
+-		CreateTextureSrv(w.positionBuffers[i].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, w.positionSrvIndex[i], w.positionSrvCpu[i], w.positionSrvGpu[i]);
++		CreateTextureSrv(w.positionBuffers[i].Get(), QD3D12_PositionFormat, w.positionSrvIndex[i], w.positionSrvCpu[i], w.positionSrvGpu[i]);
+ 
+ 	for (UINT i = 0; i < QD3D12_FrameCount; ++i)
+ 		CreateTextureSrv(w.velocityBuffers[i].Get(), QD3D12_VelocityFormat, w.velocitySrvIndex[i], w.velocitySrvCpu[i], w.velocitySrvGpu[i]);
+@@ -3779,7 +3783,10 @@ static void QD3D12_CreateRootSignature()
+ 	D3D12_STATIC_SAMPLER_DESC samps[QD3D12_MaxTextureUnits] = {};
+ 	for (UINT i = 0; i < QD3D12_MaxTextureUnits; ++i)
+ 	{
+-		samps[i].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++		// Anisotropic sampling keeps floors and walls sharp at oblique angles and
++		// reduces mip shimmer while preserving the original texture content.
++		samps[i].Filter = D3D12_FILTER_ANISOTROPIC;
++		samps[i].MaxAnisotropy = 8;
+ 		samps[i].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+ 		samps[i].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+ 		samps[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+@@ -3880,7 +3887,7 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC BuildPSODesc(
+ 	if (!nativeColorOnly)
+ 	{
+ 		d.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+-		d.RTVFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
++		d.RTVFormats[2] = QD3D12_PositionFormat;
+ 		d.RTVFormats[3] = QD3D12_VelocityFormat;
+ 	}
+ 
+@@ -4106,7 +4113,7 @@ static D3D12_GRAPHICS_PIPELINE_STATE_DESC BuildARBPSODesc(
+ 	if (!nativeColorOnly)
+ 	{
+ 		d.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+-		d.RTVFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
++		d.RTVFormats[2] = QD3D12_PositionFormat;
+ 		d.RTVFormats[3] = QD3D12_VelocityFormat;
+ 	}
+ 
+@@ -9562,7 +9569,7 @@ void glLightScene(void)
+ 	pass.normalFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+ 
+ 	pass.positionTexture = scenePosition;
+-	pass.positionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
++	pass.positionFormat = QD3D12_PositionFormat;
+ 
+ 	pass.depthTexture = sceneDepth;
+ 	pass.depthFormat = QD3D12_DepthSrvFormat;
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 55dd51c..ab8a8a7 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1202,6 +1202,13 @@ static void RB_AddDXRFallbackLightIfNeeded(void)
+ 		radius,
+ 		1.00f, 0.96f, 0.90f,
+ 		intensity);
++
++	// The fallback follows the camera only to retain the successful Clean
++	// Reference fill/specular look. By default it is not a physical shadow
++	// caster, so torch and ceiling-light shadows stay anchored in the map.
++	light.pad1 = (r_dxrFallbackCastsShadows && r_dxrFallbackCastsShadows->integer)
++		? 0.0f
++		: 1.0f;
+ 	glRaytracingLightingAddLight(&light);
+ }
+ 
+@@ -1288,7 +1295,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.1 stable-clear: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1300,6 +1307,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrAOSamples ? r_dxrAOSamples->integer : 0,
+ 				r_dxrSkySamples ? r_dxrSkySamples->integer : 0,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
++				r_dxrFallbackCastsShadows ? r_dxrFallbackCastsShadows->integer : 0,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+ 				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
+ 				r_dxrShadowBias ? r_dxrShadowBias->value : 0.0f,
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 8cf26ed..8258b2d 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -83,6 +83,7 @@ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
++cvar_t  *r_dxrFallbackCastsShadows;
+ cvar_t  *r_dxrSafeMode;
+ cvar_t  *r_dxrErrorLimit;
+ cvar_t  *r_dxrFenceWaitMs;
+@@ -1020,6 +1021,7 @@ void R_Register( void ) {
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
++	r_dxrFallbackCastsShadows = ri.Cvar_Get( "r_dxrFallbackCastsShadows", "0", CVAR_ARCHIVE );
+ 	r_dxrSafeMode = ri.Cvar_Get( "r_dxrSafeMode", "1", CVAR_ARCHIVE );
+ 	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "4", CVAR_ARCHIVE );
+ 	r_dxrFenceWaitMs = ri.Cvar_Get( "r_dxrFenceWaitMs", "5000", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 8baa2cc..0ae7354 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1141,6 +1141,7 @@ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky v
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;
++extern cvar_t   *r_dxrFallbackCastsShadows; // camera fill should not move world shadows
+ extern cvar_t   *r_dxrSafeMode;
+ extern cvar_t   *r_dxrErrorLimit;
+ extern cvar_t   *r_dxrFenceWaitMs;
