@@ -1,0 +1,1290 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index a6219e6..770a067 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -20,6 +20,7 @@ extern void __cdecl Com_Printf(const char* fmt, ...);
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <assert.h>
++#include <math.h>
+ 
+ #pragma comment(lib, "dxcompiler.lib")
+ #pragma comment(lib, "d3dcompiler.lib")
+@@ -50,15 +51,17 @@ static void glRaytracingFatal(const char* fmt, ...)
+ 	va_end(args);
+ 	OutputDebugStringA(buffer);
+ 	OutputDebugStringA("\n");
+-	MessageBoxA(nullptr, buffer, "glRaytracing Fatal", MB_OK | MB_ICONERROR);
+-	DebugBreak();
++	Com_Printf("^1DXR ERROR:^7 %s\n", buffer);
+ }
+ 
++static int glRaytracingHandleFailure(HRESULT hr, const char* what, const char* file, int line);
++static int glRaytracingShouldAbortWork(void);
++
+ #define GLR_CHECK(x) \
+-    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingFatal("HRESULT 0x%08X failed at %s:%d", (unsigned)_hr, __FILE__, __LINE__); return 0; } } while (0)
++    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingHandleFailure(_hr, #x, __FILE__, __LINE__); return 0; } } while (0)
+ 
+ #define GLR_CHECKV(x) \
+-    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingFatal("HRESULT 0x%08X failed at %s:%d", (unsigned)_hr, __FILE__, __LINE__); return; } } while (0)
++    do { HRESULT _hr = (x); if (FAILED(_hr)) { glRaytracingHandleFailure(_hr, #x, __FILE__, __LINE__); return; } } while (0)
+ 
+ // ============================================================
+ // Helpers
+@@ -108,6 +111,9 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ {
+ 	glRaytracingBuffer_t out;
+ 
++	if (glRaytracingShouldAbortWork() || !device || size == 0)
++		return out;
++
+ 	D3D12_HEAP_PROPERTIES hp = {};
+ 	hp.Type = heapType;
+ 
+@@ -132,7 +138,7 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ 
+ 	if (FAILED(hr))
+ 	{
+-		glRaytracingFatal("CreateCommittedResource failed 0x%08X", (unsigned)hr);
++		glRaytracingHandleFailure(hr, "CreateCommittedResource", __FILE__, __LINE__);
+ 		return out;
+ 	}
+ 
+@@ -143,11 +149,14 @@ static glRaytracingBuffer_t glRaytracingCreateBuffer(
+ 
+ static void glRaytracingMapCopy(ID3D12Resource* res, const void* src, size_t bytes)
+ {
++	if (glRaytracingShouldAbortWork() || !res || !src || bytes == 0)
++		return;
++
+ 	void* dst = nullptr;
+ 	HRESULT hr = res->Map(0, nullptr, &dst);
+-	if (FAILED(hr))
++	if (FAILED(hr) || !dst)
+ 	{
+-		glRaytracingFatal("Map failed 0x%08X", (unsigned)hr);
++		glRaytracingHandleFailure(FAILED(hr) ? hr : E_FAIL, "Map", __FILE__, __LINE__);
+ 		return;
+ 	}
+ 
+@@ -224,16 +233,126 @@ struct glRaytracingCmdContext_t
+ 
+ static glRaytracingCmdContext_t g_glRaytracingCmd;
+ 
++struct glRaytracingSafetyOptions_t
++{
++	int safeMode;
++	int errorLimit;
++	int fenceWaitMs;
++};
++
++struct glRaytracingPerformanceOptions_t
++{
++	int asyncSubmit;
++	int buildInterval;
++	int dispatchInterval;
++	uint32_t maxLights;
++};
++
++static glRaytracingSafetyOptions_t g_glRaytracingSafety = { 1, 4, 5000 };
++static glRaytracingPerformanceOptions_t g_glRaytracingPerformance = { 0, 1, 1, 24 };
++static volatile LONG g_glRaytracingDeviceLost = 0;
++static HRESULT g_glRaytracingDeviceLostHr = S_OK;
++static HRESULT g_glRaytracingDeviceRemovedReason = S_OK;
++static int g_glRaytracingErrorCount = 0;
++static int g_glRaytracingBuildFrame = 0;
++static int g_glRaytracingDispatchFrame = 0;
++static int g_glRaytracingHasValidOutput = 0;
++static ID3D12Resource* g_glRaytracingLastOutput = nullptr;
++
++static int glRaytracingIsDeviceRemovedLike(HRESULT hr)
++{
++	return hr == DXGI_ERROR_DEVICE_REMOVED ||
++		hr == DXGI_ERROR_DEVICE_RESET ||
++		hr == DXGI_ERROR_DEVICE_HUNG;
++}
++
++static int glRaytracingHandleFailure(HRESULT hr, const char* what, const char* file, int line)
++{
++	HRESULT removedReason = hr;
++	if (g_glRaytracingCmd.device)
++		removedReason = g_glRaytracingCmd.device->GetDeviceRemovedReason();
++
++	if (g_glRaytracingSafety.safeMode || glRaytracingIsDeviceRemovedLike(hr))
++	{
++		if (InterlockedCompareExchange(&g_glRaytracingDeviceLost, 1, 0) == 0)
++		{
++			g_glRaytracingDeviceLostHr = hr;
++			g_glRaytracingDeviceRemovedReason = removedReason;
++			Com_Printf(
++				"^1DXR disabled:^7 %s failed 0x%08X at %s:%d, removedReason=0x%08X. Use vid_restart to retry.\n",
++				what ? what : "D3D12 call", (unsigned)hr,
++				file ? file : "?", line, (unsigned)removedReason);
++		}
++		return 0;
++	}
++
++	if (g_glRaytracingErrorCount < (std::max)(g_glRaytracingSafety.errorLimit, 1))
++	{
++		++g_glRaytracingErrorCount;
++		glRaytracingFatal("%s failed 0x%08X at %s:%d",
++			what ? what : "D3D12 call", (unsigned)hr,
++			file ? file : "?", line);
++	}
++	return 0;
++}
++
++static int glRaytracingShouldAbortWork(void)
++{
++	return g_glRaytracingSafety.safeMode && g_glRaytracingDeviceLost;
++}
++
++void glRaytracingSetSafetyOptions(int safeMode, int errorLimit, int fenceWaitMs)
++{
++	g_glRaytracingSafety.safeMode = safeMode ? 1 : 0;
++	g_glRaytracingSafety.errorLimit = glRaytracingClamp(errorLimit, 1, 64);
++	g_glRaytracingSafety.fenceWaitMs = glRaytracingClamp(fenceWaitMs, 250, 30000);
++}
++
++void glRaytracingSetPerformanceOptions(int asyncSubmit, int buildInterval, int dispatchInterval)
++{
++	// Async resource lifetime is not safe yet: animated meshes can replace upload
++	// buffers or BLAS resources while the previous frame still references them.
++	// Keep the proven ordered path until deferred destruction/ring buffering exists.
++	(void)asyncSubmit;
++	(void)buildInterval;
++	(void)dispatchInterval;
++	g_glRaytracingPerformance.asyncSubmit = 0;
++	g_glRaytracingPerformance.buildInterval = 1;
++	g_glRaytracingPerformance.dispatchInterval = 1;
++}
++
++int glRaytracingHasDeviceLost(void)
++{
++	return g_glRaytracingDeviceLost ? 1 : 0;
++}
++
+ static void glRaytracingWaitFenceValue(UINT64 value)
+ {
++	if (glRaytracingShouldAbortWork())
++		return;
++
+ 	if (!value || !g_glRaytracingCmd.fence || !g_glRaytracingCmd.fenceEvent)
+ 		return;
+ 
+ 	if (g_glRaytracingCmd.fence->GetCompletedValue() >= value)
+ 		return;
+ 
+-	g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
+-	WaitForSingleObject(g_glRaytracingCmd.fenceEvent, INFINITE);
++	HRESULT hr = g_glRaytracingCmd.fence->SetEventOnCompletion(value, g_glRaytracingCmd.fenceEvent);
++	if (FAILED(hr))
++	{
++		glRaytracingHandleFailure(hr, "SetEventOnCompletion", __FILE__, __LINE__);
++		return;
++	}
++
++	const DWORD timeout = g_glRaytracingSafety.safeMode ? (DWORD)g_glRaytracingSafety.fenceWaitMs : INFINITE;
++	const DWORD result = WaitForSingleObject(g_glRaytracingCmd.fenceEvent, timeout);
++	if (result == WAIT_TIMEOUT)
++	{
++		glRaytracingHandleFailure(DXGI_ERROR_DEVICE_HUNG, "Fence wait timeout", __FILE__, __LINE__);
++		return;
++	}
++	if (result != WAIT_OBJECT_0)
++		glRaytracingHandleFailure(E_FAIL, "Fence wait failed", __FILE__, __LINE__);
+ }
+ 
+ static UINT64 glRaytracingSignalQueue(void)
+@@ -242,7 +361,12 @@ static UINT64 glRaytracingSignalQueue(void)
+ 		return 0;
+ 
+ 	const UINT64 value = ++g_glRaytracingCmd.nextFenceValue;
+-	g_glRaytracingCmd.queue->Signal(g_glRaytracingCmd.fence.Get(), value);
++	HRESULT hr = g_glRaytracingCmd.queue->Signal(g_glRaytracingCmd.fence.Get(), value);
++	if (FAILED(hr))
++	{
++		glRaytracingHandleFailure(hr, "CommandQueue::Signal", __FILE__, __LINE__);
++		return 0;
++	}
+ 	return value;
+ }
+ 
+@@ -257,6 +381,11 @@ static int glRaytracingInitCmdContext(void)
+ 	if (g_glRaytracingCmd.initialized)
+ 		return 1;
+ 
++	InterlockedExchange(&g_glRaytracingDeviceLost, 0);
++	g_glRaytracingDeviceLostHr = S_OK;
++	g_glRaytracingDeviceRemovedReason = S_OK;
++	g_glRaytracingErrorCount = 0;
++
+ 	ID3D12Device* baseDevice = QD3D12_GetDevice();
+ 	ID3D12CommandQueue* baseQueue = QD3D12_GetQueue();
+ 
+@@ -354,7 +483,12 @@ static void glRaytracingShutdownCmdContext(void)
+ 
+ static int glRaytracingBeginCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.cmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.cmdList->Reset(g_glRaytracingCmd.cmdAlloc.Get(), nullptr));
+@@ -369,13 +503,21 @@ static int glRaytracingEndCmd(void)
+ 	g_glRaytracingCmd.queue->ExecuteCommandLists(1, lists);
+ 
+ 	g_glRaytracingCmd.cmdLastFenceValue = glRaytracingSignalQueue();
+-	glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
+-	return 1;
++	if (!g_glRaytracingCmd.cmdLastFenceValue)
++		return 0;
++	if (!g_glRaytracingPerformance.asyncSubmit)
++		glRaytracingWaitFenceValue(g_glRaytracingCmd.cmdLastFenceValue);
++	return glRaytracingShouldAbortWork() ? 0 : 1;
+ }
+ 
+ static int glRaytracingBeginBlasCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.blasCmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.blasCmdList->Reset(g_glRaytracingCmd.blasCmdAlloc.Get(), nullptr));
+@@ -395,7 +537,12 @@ static UINT64 glRaytracingEndBlasCmd(void)
+ 
+ static int glRaytracingBeginTlasCmd(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	glRaytracingWaitFenceValue(g_glRaytracingCmd.tlasLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	GLR_CHECK(g_glRaytracingCmd.tlasCmdAlloc->Reset());
+ 	GLR_CHECK(g_glRaytracingCmd.tlasCmdList->Reset(g_glRaytracingCmd.tlasCmdAlloc.Get(), nullptr));
+@@ -1005,7 +1152,10 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 	if (!blasFenceValue)
+ 		return 0;
+ 
+-	glRaytracingWaitFenceValue(blasFenceValue);
++	if (!g_glRaytracingPerformance.asyncSubmit)
++		glRaytracingWaitFenceValue(blasFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	for (size_t i = 0; i < builds.size(); ++i)
+ 	{
+@@ -1213,7 +1363,10 @@ static int glRaytracingBuildSceneInternal(void)
+ 	glRaytracingBuffer_t* dstTLAS = glRaytracingGetBuildTLASBuffer();
+ 	const glRaytracingBuffer_t* srcTLAS = glRaytracingGetCurrentTLASBufferConst();
+ 
+-	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	if (!g_glRaytracingPerformance.asyncSubmit)
++		glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	if (!glRaytracingBeginTlasCmd())
+ 		return 0;
+@@ -1241,7 +1394,10 @@ static int glRaytracingBuildSceneInternal(void)
+ 	if (!tlasFenceValue)
+ 		return 0;
+ 
+-	glRaytracingWaitFenceValue(tlasFenceValue);
++	if (!g_glRaytracingPerformance.asyncSubmit)
++		glRaytracingWaitFenceValue(tlasFenceValue);
++	if (glRaytracingShouldAbortWork())
++		return 0;
+ 
+ 	g_glRaytracingScene.currentTLASIndex = glRaytracingGetInactiveTLASIndex();
+ 	g_glRaytracingScene.activeInstanceCount = activeCount;
+@@ -1268,6 +1424,8 @@ int glRaytracingInit(void)
+ 	if (g_glRaytracingScene.initialized)
+ 		return 1;
+ 
++	g_glRaytracingBuildFrame = 0;
++
+ 	if (!glRaytracingInitCmdContext())
+ 		return 0;
+ 
+@@ -1353,20 +1511,44 @@ int glRaytracingUpdateMesh(glRaytracingMeshHandle_t meshHandle, const glRaytraci
+ 	if (!desc->vertices || !desc->indices || desc->vertexCount == 0 || desc->indexCount == 0)
+ 		return 0;
+ 
++	const UINT64 newVertexBytes = UINT64(desc->vertexCount) * sizeof(glRaytracingVertex_t);
++	const UINT64 newIndexBytes = UINT64(desc->indexCount) * sizeof(uint32_t);
++	const bool canReuseGeometryBuffers =
++		mesh->vertexBuffer.resource && mesh->indexBuffer.resource &&
++		mesh->vertexBuffer.size >= newVertexBytes &&
++		mesh->indexBuffer.size >= newIndexBytes &&
++		mesh->descCpu.vertexCount == desc->vertexCount &&
++		mesh->descCpu.indexCount == desc->indexCount &&
++		mesh->descCpu.allowUpdate && desc->allowUpdate;
++
+ 	mesh->descCpu = *desc;
+ 	mesh->verticesCpu.assign(desc->vertices, desc->vertices + desc->vertexCount);
+ 	mesh->indicesCpu.assign(desc->indices, desc->indices + desc->indexCount);
+ 	mesh->descCpu.vertices = nullptr;
+ 	mesh->descCpu.indices = nullptr;
+ 
+-	mesh->vertexBuffer.resource.Reset();
+-	mesh->indexBuffer.resource.Reset();
+-	mesh->blasScratch.resource.Reset();
+-	mesh->blasResult[0].resource.Reset();
+-	mesh->blasResult[1].resource.Reset();
+-	mesh->blasBuilt = 0;
++	if (canReuseGeometryBuffers)
++	{
++		// Upload heaps are persistently CPU writable. Keep the existing BLAS
++		// allocations so BuildDirtyMeshes can use PERFORM_UPDATE and ping-pong
++		// results instead of allocating everything again.
++		glRaytracingMapCopy(mesh->vertexBuffer.resource.Get(), mesh->verticesCpu.data(), (size_t)newVertexBytes);
++		glRaytracingMapCopy(mesh->indexBuffer.resource.Get(), mesh->indicesCpu.data(), (size_t)newIndexBytes);
++	}
++	else
++	{
++		mesh->vertexBuffer.resource.Reset();
++		mesh->indexBuffer.resource.Reset();
++		mesh->blasScratch.resource.Reset();
++		mesh->blasResult[0].resource.Reset();
++		mesh->blasResult[1].resource.Reset();
++		mesh->blasScratchSize = 0;
++		mesh->blasResultSize = 0;
++		mesh->blasBuilt = 0;
++		mesh->currentBlasIndex = 0;
++	}
++
+ 	mesh->dirty = 1;
+-	mesh->currentBlasIndex = 0;
+ 
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+@@ -1377,10 +1559,18 @@ int glRaytracingUpdateMesh(glRaytracingMeshHandle_t meshHandle, const glRaytraci
+ 			g_glRaytracingScene.instances[i].dirty = 1;
+ 		}
+ 	}
+-	g_glRaytracingScene.tlasNeedsRebuild = 1;
+-	g_glRaytracingScene.tlasNeedsUpdate = 0;
+ 
+-	return 1;
++	if (canReuseGeometryBuffers && mesh->blasBuilt)
++	{
++		g_glRaytracingScene.tlasNeedsUpdate = 1;
++	}
++	else
++	{
++		g_glRaytracingScene.tlasNeedsRebuild = 1;
++		g_glRaytracingScene.tlasNeedsUpdate = 0;
++	}
++
++	return glRaytracingShouldAbortWork() ? 0 : 1;
+ }
+ 
+ void glRaytracingDeleteMesh(glRaytracingMeshHandle_t meshHandle)
+@@ -1497,9 +1687,19 @@ int glRaytracingBuildAllMeshes(void)
+ 
+ int glRaytracingBuildScene(void)
+ {
++	if (glRaytracingShouldAbortWork())
++		return 0;
++
+ 	if (!g_glRaytracingScene.initialized)
+ 		return 0;
+ 
++	if (g_glRaytracingScene.tlasBuilt && g_glRaytracingPerformance.buildInterval > 1)
++	{
++		++g_glRaytracingBuildFrame;
++		if ((g_glRaytracingBuildFrame % g_glRaytracingPerformance.buildInterval) != 0)
++			return 1;
++	}
++
+ 	if (!glRaytracingBuildAllMeshes())
+ 		return 0;
+ 
+@@ -1552,11 +1752,27 @@ struct glRaytracingLightingConstants_t
+ 	float exposure;
+ 	float legacyBlend;
+ 	uint32_t debugMode;
++	uint32_t shadowSamples;
++	uint32_t rectShadowSamples;
++	uint32_t aoSamples;
++	uint32_t skySamples;
++	float shadowStrength;
++	float legacyShadowStrength;
++	float shadowMinVisibility;
++	float contactShadowLength;
++	uint32_t contactShadows;
++	uint32_t frameIndex;
++	uint32_t qualityPad0;
++	uint32_t qualityPad1;
+ };
+ 
++static_assert(sizeof(glRaytracingLightingConstants_t) == 256,
++	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
++
+ struct glRaytracingLightingState_t
+ {
+ 	std::vector<glRaytracingLight_t> cpuLights;
++	std::vector<glRaytracingLight_t> selectedLights;
+ 	glRaytracingLightingConstants_t constants;
+ 
+ 	ComPtr<ID3D12DescriptorHeap> descriptorHeap;
+@@ -1630,6 +1846,18 @@ cbuffer LightingCB : register(b0)
+     float    gExposure;
+     float    gLegacyBlend;
+     uint     gDebugMode;
++    uint     gShadowSamples;
++    uint     gRectShadowSamples;
++    uint     gAOSamples;
++    uint     gSkySamples;
++    float    gShadowStrength;
++    float    gLegacyShadowStrength;
++    float    gShadowMinVisibility;
++    float    gContactShadowLength;
++    uint     gContactShadows;
++    uint     gFrameIndex;
++    uint     gQualityPad0;
++    uint     gQualityPad1;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -1683,7 +1911,7 @@ float TraceShadow(float3 origin, float3 dir, float maxT)
+ 
+     TraceRay(
+         gSceneBVH,
+-        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES,
++        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE,
+         0xFF,
+         0,
+         1,
+@@ -1754,22 +1982,36 @@ float3 CosineSampleHemisphere(float2 u)
+ 
+ float TraceSoftShadow(float3 worldPos, float3 N, Light Lgt, float3 toLight, float dist)
+ {
+-    const uint SHADOW_SAMPLES = 12;
++    uint sampleCount = clamp(gShadowSamples, 1u, 16u);
+ 
+     float3 L = toLight / max(dist, 1e-6);
+ 
+     float3 tangent, bitangent;
+     BuildOrthonormalBasis(L, tangent, bitangent);
+ 
+-    float areaRadius = max(Lgt.radius * 0.03, 0.12);
++    // Keep torch/fallback penumbrae compact. The old radius*0.03 made a
++    // radius-900 fallback act like a 27-unit area light and produced warped,
++    // camera-dependent shadows.
++    float areaRadius = min(max(Lgt.radius * 0.01, 0.10), 4.0);
++
++    if (sampleCount == 1u)
++    {
++        float NdotLRaw = saturate(dot(N, L));
++        float normalBias = lerp(gShadowBias * 3.0, gShadowBias, NdotLRaw);
++        float3 shadowOrigin = worldPos + N * normalBias + L * (gShadowBias * 0.5);
++        float shadowTMax = max(dist - gShadowBias, 0.001);
++        float visibility = TraceShadow(shadowOrigin, L, shadowTMax);
++        visibility = max(visibility, saturate(gShadowMinVisibility));
++        return lerp(1.0, visibility, saturate(gShadowStrength));
++    }
+ 
+     float shadowAccum = 0.0;
+     float rand = Hash12(worldPos.xy + float2(worldPos.z, dist));
+ 
+-    [unroll]
+-    for (uint s = 0; s < SHADOW_SAMPLES; ++s)
++    [loop]
++    for (uint s = 0; s < sampleCount; ++s)
+     {
+-        float2 xi = Hammersley2D(s, SHADOW_SAMPLES, rand);
++        float2 xi = Hammersley2D(s, sampleCount, rand);
+         float2 d  = ConcentricSampleDisk(xi) * areaRadius;
+ 
+         float3 sampleLightPos = Lgt.position + tangent * d.x + bitangent * d.y;
+@@ -1793,16 +2035,40 @@ float TraceSoftShadow(float3 worldPos, float3 N, Light Lgt, float3 toLight, floa
+         shadowAccum += TraceShadow(shadowOrigin, sampleDir, shadowTMax);
+     }
+ 
+-    return shadowAccum / (float)SHADOW_SAMPLES;
++    float visibility = shadowAccum / (float)sampleCount;
++
++    if (gContactShadows != 0 && gContactShadowLength > 0.0)
++    {
++        float3 centerOrigin = worldPos + N * max(gShadowBias * 0.65, 0.002) + L * (gShadowBias * 0.25);
++        float contact = TraceShadow(centerOrigin, L, min(max(dist - gShadowBias, 0.001), gContactShadowLength));
++        visibility = min(visibility, contact);
++    }
++
++    visibility = max(visibility, saturate(gShadowMinVisibility));
++    return lerp(1.0, visibility, saturate(gShadowStrength));
+ }
+ 
+ float RectLightShadow(float3 worldPos, float3 N, Light Lgt, uint2 pixel)
+ {
+-    uint sampleCount = max(Lgt.samples, 1u);
+-    sampleCount = min(sampleCount, 16u);
++    uint sampleCount = clamp(min(max(Lgt.samples, 1u), max(gRectShadowSamples, 1u)), 1u, 16u);
+ 
+     float visibility = 0.0;
+ 
++    if (sampleCount == 1u)
++    {
++        float3 toLight = Lgt.position - worldPos;
++        float distToLight = length(toLight);
++        if (distToLight <= 1e-4)
++            return 1.0;
++        float3 L = toLight / distToLight;
++        float NdotL = saturate(dot(N, L));
++        float normalBias = lerp(gShadowBias * 4.0, gShadowBias, NdotL);
++        float3 shadowOrigin = worldPos + N * normalBias + L * (gShadowBias * 0.5);
++        float visibilityCenter = TraceShadow(shadowOrigin, L, max(distToLight - gShadowBias, 0.001));
++        visibilityCenter = max(visibilityCenter, saturate(gShadowMinVisibility));
++        return lerp(1.0, visibilityCenter, saturate(gShadowStrength));
++    }
++
+     float rand = Hash12((float2)pixel + worldPos.xy + float2(worldPos.z, dot(N.xy, N.xy)));
+ 
+     float NoL_center = saturate(dot(N, normalize(Lgt.position - worldPos)));
+@@ -1852,12 +2118,17 @@ float RectLightShadow(float3 worldPos, float3 N, Light Lgt, uint2 pixel)
+         visibility += TraceShadow(shadowOrigin, L, shadowTMax);
+     }
+ 
+-    return visibility / (float)sampleCount;
++    visibility /= (float)sampleCount;
++    visibility = max(visibility, saturate(gShadowMinVisibility));
++    return lerp(1.0, visibility, saturate(gShadowStrength));
+ }
+ 
+ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ {
+-    const uint AO_SAMPLES = 24;
++    if (gAOSamples == 0u)
++        return 1.0;
++
++    uint sampleCount = clamp(gAOSamples, 1u, 32u);
+     const float AO_RADIUS = 32.0;
+ 
+     float3 tangent, bitangent;
+@@ -1867,10 +2138,10 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+     float visibility = 0.0;
+ 
+-    [unroll]
+-    for (uint i = 0; i < AO_SAMPLES; ++i)
++    [loop]
++    for (uint i = 0; i < sampleCount; ++i)
+     {
+-        float2 xi = Hammersley2D(i, AO_SAMPLES, rand);
++        float2 xi = Hammersley2D(i, sampleCount, rand);
+         float3 h  = CosineSampleHemisphere(xi);
+ 
+         float3 aoDir =
+@@ -1880,12 +2151,12 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+         aoDir = normalize(aoDir);
+ 
+-        float3 aoOrigin = worldPos + N * (gShadowBias * 0.15);
++        float3 aoOrigin = worldPos + N * max(gShadowBias * 1.5, 0.03);
+ 
+         visibility += TraceShadow(aoOrigin, aoDir, AO_RADIUS);
+     }
+ 
+-    visibility /= (float)AO_SAMPLES;
++    visibility /= (float)sampleCount;
+     visibility = saturate(pow(visibility, 1.5));
+ 
+     return visibility;
+@@ -1894,7 +2165,10 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+ {
+-    const uint SKY_SAMPLES = 8;
++    if (gSkySamples == 0u)
++        return 1.0;
++
++    uint sampleCount = clamp(gSkySamples, 1u, 16u);
+     const float SKY_TMAX   = 1000000.0;
+ 
+     float3 tangent, bitangent;
+@@ -1904,10 +2178,10 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+ 
+     float vis = 0.0;
+ 
+-    [unroll]
+-    for (uint i = 0; i < SKY_SAMPLES; ++i)
++    [loop]
++    for (uint i = 0; i < sampleCount; ++i)
+     {
+-        float2 xi = Hammersley2D(i, SKY_SAMPLES, rand);
++        float2 xi = Hammersley2D(i, sampleCount, rand);
+         float3 h  = CosineSampleHemisphere(xi);
+ 
+         float3 skyDir =
+@@ -1924,7 +2198,7 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+         vis += TraceShadow(skyOrigin, skyDir, SKY_TMAX);
+     }
+ 
+-    vis /= (float)SKY_SAMPLES;
++    vis /= (float)sampleCount;
+     return saturate(vis);
+ }
+ 
+@@ -2027,12 +2301,13 @@ void RayGen()
+     }
+ 
+     float3 baseAlbedo    = albedoSample.rgb;
+-    float3 worldPos      = LoadScenePosition(pixel);
++    float4 positionSample = gPositionTex.Load(int3(pixel, 0));
++    float3 worldPos      = positionSample.xyz;
+     float4 normalSample  = LoadSceneNormal(pixel);
+     float3 N             = normalize(normalSample.xyz);
+     float3 V             = normalize(gCameraPos.xyz - worldPos);
+ 
+-    float geoFlag = normalSample.w;
++    float geoFlag = positionSample.w;
+ 
+     float cavity = ComputeCavity(pixel, worldPos, N);
+     float microShadow = lerp(0.90, 1.0, cavity);
+@@ -2052,6 +2327,8 @@ void RayGen()
+ 
+     float3 lightingAccum = gAmbientColor.rgb * gAmbientColor.a;
+     float3 specularAccum = 0.0;
++    float strongestDirectWeight = 0.0;
++    float strongestDirectVisibility = 1.0;
+ 
+     lightingAccum += skyColor * (skyStrength * skyVis);
+ 
+@@ -2069,11 +2346,12 @@ void RayGen()
+         {
+             float3 toLight = Lgt.position - worldPos;
+             float  distSq  = dot(toLight, toLight);
++            float radius = max(Lgt.radius, 1e-4);
++            if (distSq >= radius * radius)
++                continue;
+             float  dist    = sqrt(max(distSq, 1e-6));
+             float3 L       = toLight / dist;
+ 
+-            float radius = max(Lgt.radius, 1e-4);
+-
+             float atten = saturate((radius - dist) / radius);
+             atten = atten * atten;
+ 
+@@ -2086,7 +2364,14 @@ void RayGen()
+                 shadow = TraceSoftShadow(worldPos, N, Lgt, toLight, dist);
+             }
+ 
+-            float3 diffuse = Lgt.color * (Lgt.intensity * atten * NdotLWrap * shadow);
++            float directInfluence = atten * NdotLWrap;
++            if (directInfluence > strongestDirectWeight)
++            {
++                strongestDirectWeight = directInfluence;
++                strongestDirectVisibility = shadow;
++            }
++
++            float3 diffuse = Lgt.color * (Lgt.intensity * directInfluence * shadow);
+             lightingAccum += diffuse;
+ 
+             specularAccum += ComputeSpecular(N, V, L, Lgt.color, Lgt.intensity, atten, shadow, baseAlbedo);
+@@ -2095,10 +2380,12 @@ void RayGen()
+         {
+             float3 toCenter = Lgt.position - worldPos;
+             float  centerDistSq = dot(toCenter, toCenter);
++            float attenRadius = max(Lgt.radius, 1e-4);
++            if (centerDistSq >= attenRadius * attenRadius)
++                continue;
+             float  centerDist = sqrt(max(centerDistSq, 1e-6));
+             float3 centerDir = toCenter / centerDist;
+ 
+-            float attenRadius = max(Lgt.radius, 1e-4);
+             float atten = saturate((attenRadius - centerDist) / attenRadius);
+             atten = atten * atten * atten * atten;
+ 
+@@ -2155,6 +2442,11 @@ void RayGen()
+             rectDiffuseAccum /= (float)sampleCount;
+             rectSpecAccum    /= (float)sampleCount;
+ 
++            if (atten > strongestDirectWeight)
++            {
++                strongestDirectWeight = atten;
++                strongestDirectVisibility = shadow;
++            }
+             lightingAccum += clamp(rectDiffuseAccum * atten * shadow, 0.0, 4.0);
+             specularAccum += rectSpecAccum * atten * shadow;
+         }
+@@ -2179,7 +2471,13 @@ void RayGen()
+         rtLitColor = max(rtLitColor, baseAlbedo * 0.15);
+ 
+         float legacyKeep = saturate(gLegacyBlend);
+-        float3 finalColor = lerp(rtLitColor, baseAlbedo, legacyKeep);
++        float legacyShadowInfluence = saturate(strongestDirectWeight * 1.50);
++        float legacyShadow = lerp(
++            1.0,
++            strongestDirectVisibility,
++            saturate(gLegacyShadowStrength) * legacyShadowInfluence);
++        legacyShadow = max(legacyShadow, saturate(gShadowMinVisibility));
++        float3 finalColor = lerp(rtLitColor, baseAlbedo * legacyShadow, legacyKeep);
+         finalColor *= max(gExposure, 0.001);
+ 
+         if (gDebugMode == 1)
+@@ -2199,6 +2497,10 @@ void RayGen()
+         {
+             finalColor = lightingAccum / (1.0 + lightingAccum);
+         }
++        else if (gDebugMode == 5)
++        {
++            finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
++        }
+ 
+         gOutputTex[pixel] = float4(finalColor, albedoSample.a);
+     }
+@@ -2378,15 +2680,65 @@ static void glRaytracingLightingUpdateConstants(void)
+ 		sizeof(g_glRaytracingLighting.constants));
+ }
+ 
+-static void glRaytracingLightingUpdateLights(void)
++static void glRaytracingLightingPrepareSelectedLights(void)
+ {
++	g_glRaytracingLighting.selectedLights.clear();
+ 	if (g_glRaytracingLighting.cpuLights.empty())
++	{
++		g_glRaytracingLighting.constants.lightCount = 0;
+ 		return;
++	}
+ 
+-	glRaytracingMapCopy(
+-		g_glRaytracingLighting.lightBuffer.resource.Get(),
+-		g_glRaytracingLighting.cpuLights.data(),
+-		g_glRaytracingLighting.cpuLights.size() * sizeof(glRaytracingLight_t));
++	struct ScoredLight
++	{
++		size_t index;
++		float score;
++	};
++
++	std::vector<ScoredLight> scored;
++	scored.reserve(g_glRaytracingLighting.cpuLights.size());
++	const float cx = g_glRaytracingLighting.constants.cameraPos[0];
++	const float cy = g_glRaytracingLighting.constants.cameraPos[1];
++	const float cz = g_glRaytracingLighting.constants.cameraPos[2];
++
++	for (size_t i = 0; i < g_glRaytracingLighting.cpuLights.size(); ++i)
++	{
++		const glRaytracingLight_t& light = g_glRaytracingLighting.cpuLights[i];
++		const float dx = light.position.x - cx;
++		const float dy = light.position.y - cy;
++		const float dz = light.position.z - cz;
++		const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
++		const float radius = (std::max)(light.radius, 1.0f);
++		const float inside = glRaytracingClamp(1.0f - distance / radius, 0.0f, 1.0f);
++		float score = (std::max)(light.intensity, 0.0f) * (0.25f + inside * 4.0f);
++		score += radius / (distance + 64.0f);
++		if (light.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
++			score *= 1.20f;
++		if (!light.persistant)
++			score += 1000000.0f; // keep the explicitly requested camera light
++		scored.push_back({ i, score });
++	}
++
++	std::stable_sort(scored.begin(), scored.end(), [](const ScoredLight& a, const ScoredLight& b)
++	{
++		return a.score > b.score;
++	});
++
++	const size_t limit = glRaytracingClamp<size_t>(
++		(size_t)g_glRaytracingPerformance.maxLights, 1, GL_RAYTRACING_MAX_LIGHTS);
++	const size_t selectedCount = (std::min)(limit, scored.size());
++	g_glRaytracingLighting.selectedLights.reserve(selectedCount);
++	for (size_t i = 0; i < selectedCount; ++i)
++		g_glRaytracingLighting.selectedLights.push_back(g_glRaytracingLighting.cpuLights[scored[i].index]);
++
++	g_glRaytracingLighting.constants.lightCount = (uint32_t)g_glRaytracingLighting.selectedLights.size();
++	if (!g_glRaytracingLighting.selectedLights.empty())
++	{
++		glRaytracingMapCopy(
++			g_glRaytracingLighting.lightBuffer.resource.Get(),
++			g_glRaytracingLighting.selectedLights.data(),
++			g_glRaytracingLighting.selectedLights.size() * sizeof(glRaytracingLight_t));
++	}
+ }
+ 
+ static void glRaytracingLightingCreatePersistentLightSRV(void)
+@@ -2623,6 +2975,10 @@ bool glRaytracingLightingInit(void)
+ 	if (g_glRaytracingLighting.initialized)
+ 		return true;
+ 
++	g_glRaytracingDispatchFrame = 0;
++	g_glRaytracingHasValidOutput = 0;
++	g_glRaytracingLastOutput = nullptr;
++
+ 	if (!glRaytracingInitCmdContext())
+ 		return false;
+ 
+@@ -2655,6 +3011,16 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.exposure = 1.15f;
+ 	g_glRaytracingLighting.constants.legacyBlend = 0.65f;
+ 	g_glRaytracingLighting.constants.debugMode = 0u;
++	g_glRaytracingLighting.constants.shadowSamples = 1u;
++	g_glRaytracingLighting.constants.rectShadowSamples = 1u;
++	g_glRaytracingLighting.constants.aoSamples = 0u;
++	g_glRaytracingLighting.constants.skySamples = 0u;
++	g_glRaytracingLighting.constants.shadowStrength = 1.0f;
++	g_glRaytracingLighting.constants.legacyShadowStrength = 0.35f;
++	g_glRaytracingLighting.constants.shadowMinVisibility = 0.12f;
++	g_glRaytracingLighting.constants.contactShadowLength = 96.0f;
++	g_glRaytracingLighting.constants.contactShadows = 0u;
++	g_glRaytracingLighting.constants.frameIndex = 0u;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -2669,6 +3035,9 @@ void glRaytracingLightingShutdown(void)
+ 		return;
+ 
+ 	g_glRaytracingLighting = glRaytracingLightingState_t();
++	g_glRaytracingDispatchFrame = 0;
++	g_glRaytracingHasValidOutput = 0;
++	g_glRaytracingLastOutput = nullptr;
+ }
+ 
+ bool glRaytracingLightingIsInitialized(void)
+@@ -2718,7 +3087,9 @@ bool glRaytracingLightingAddLight(const glRaytracingLight_t* light)
+ 	g_glRaytracingLighting.cpuLights.push_back(*light);
+ 	g_glRaytracingLighting.constants.lightCount = (uint32_t)g_glRaytracingLighting.cpuLights.size();
+ 
+-	glRaytracingLightingUpdateLights();
++	// Importance selection and the light-buffer upload are done once per
++	// rendered frame in glRaytracingLightingExecute(). Avoid sorting the whole
++	// light list after every individual map/dynamic-light insertion.
+ 	glRaytracingLightingUpdateConstants();
+ 	return true;
+ }
+@@ -2801,8 +3172,36 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetQualityOptions(
++	uint32_t maxLights,
++	uint32_t shadowSamples,
++	uint32_t rectShadowSamples,
++	uint32_t aoSamples,
++	uint32_t skySamples,
++	float shadowStrength,
++	float legacyShadowStrength,
++	float shadowMinVisibility,
++	uint32_t contactShadows,
++	float contactShadowLength)
++{
++	g_glRaytracingPerformance.maxLights = glRaytracingClamp<uint32_t>(maxLights, 1u, GL_RAYTRACING_MAX_LIGHTS);
++	g_glRaytracingLighting.constants.shadowSamples = glRaytracingClamp<uint32_t>(shadowSamples, 1u, 16u);
++	g_glRaytracingLighting.constants.rectShadowSamples = glRaytracingClamp<uint32_t>(rectShadowSamples, 1u, 16u);
++	g_glRaytracingLighting.constants.aoSamples = glRaytracingClamp<uint32_t>(aoSamples, 0u, 32u);
++	g_glRaytracingLighting.constants.skySamples = glRaytracingClamp<uint32_t>(skySamples, 0u, 16u);
++	g_glRaytracingLighting.constants.shadowStrength = glRaytracingClamp(shadowStrength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.legacyShadowStrength = glRaytracingClamp(legacyShadowStrength, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.shadowMinVisibility = glRaytracingClamp(shadowMinVisibility, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.contactShadows = contactShadows ? 1u : 0u;
++	g_glRaytracingLighting.constants.contactShadowLength = glRaytracingClamp(contactShadowLength, 0.0f, 4096.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ {
++	if (glRaytracingShouldAbortWork())
++		return false;
++
+ 	if (!g_glRaytracingLighting.initialized || !pass)
+ 		return false;
+ 
+@@ -2819,14 +3218,25 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	if (pass->width == 0 || pass->height == 0)
+ 		return false;
+ 
++	if (pass->outputTexture != g_glRaytracingLastOutput)
++	{
++		g_glRaytracingLastOutput = pass->outputTexture;
++		g_glRaytracingDispatchFrame = 0;
++		g_glRaytracingHasValidOutput = 0;
++	}
++	if (g_glRaytracingHasValidOutput && g_glRaytracingPerformance.dispatchInterval > 1)
++	{
++		++g_glRaytracingDispatchFrame;
++		if ((g_glRaytracingDispatchFrame % g_glRaytracingPerformance.dispatchInterval) != 0)
++			return true;
++	}
++
+ 	g_glRaytracingLighting.constants.screenSize[0] = (float)pass->width;
+ 	g_glRaytracingLighting.constants.screenSize[1] = (float)pass->height;
+ 	g_glRaytracingLighting.constants.screenSize[2] = 1.0f / (float)pass->width;
+ 	g_glRaytracingLighting.constants.screenSize[3] = 1.0f / (float)pass->height;
+-	g_glRaytracingLighting.constants.lightCount =
+-		(uint32_t)glRaytracingClamp<size_t>(g_glRaytracingLighting.cpuLights.size(), 0, GL_RAYTRACING_MAX_LIGHTS);
+-
+-	glRaytracingLightingUpdateLights();
++	++g_glRaytracingLighting.constants.frameIndex;
++	glRaytracingLightingPrepareSelectedLights();
+ 	glRaytracingLightingUpdateConstants();
+ 	glRaytracingLightingCreatePerPassDescriptors(pass);
+ 
+@@ -2897,6 +3307,7 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	if (!glRaytracingEndCmd())
+ 		return false;
+ 
++	g_glRaytracingHasValidOutput = 1;
+ 	return true;
+ }
+ 
+@@ -3004,3 +3415,7 @@ uint32_t glRaytracingLightingGetLightCount(void)
+ 	return (uint32_t)g_glRaytracingLighting.cpuLights.size();
+ }
+ 
++uint32_t glRaytracingLightingGetSelectedLightCount(void)
++{
++	return (uint32_t)g_glRaytracingLighting.selectedLights.size();
++}
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 2346afb..b17240e 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1695,6 +1695,9 @@ uint32_t                   glRaytracingGetInstanceCount(void);
+ bool                       glRaytracingLightingInit(void);
+ void                       glRaytracingLightingShutdown(void);
+ bool                       glRaytracingLightingIsInitialized(void);
++void                       glRaytracingSetSafetyOptions(int safeMode, int errorLimit, int fenceWaitMs);
++void                       glRaytracingSetPerformanceOptions(int asyncSubmit, int buildInterval, int dispatchInterval);
++int                        glRaytracingHasDeviceLost(void);
+ 
+ void                       glRaytracingLightingClearLights(bool clearPersistant);
+ bool                       glRaytracingLightingAddLight(const glRaytracingLight_t* light);
+@@ -1710,6 +1713,17 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
++void                       glRaytracingLightingSetQualityOptions(
++	uint32_t maxLights,
++	uint32_t shadowSamples,
++	uint32_t rectShadowSamples,
++	uint32_t aoSamples,
++	uint32_t skySamples,
++	float shadowStrength,
++	float legacyShadowStrength,
++	float shadowMinVisibility,
++	uint32_t contactShadows,
++	float contactShadowLength);
+ 
+ bool                       glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass);
+ 
+@@ -1731,6 +1745,7 @@ glRaytracingLight_t        glRaytracingLightingMakeRectLight(
+ 	uint32_t twoSided);
+ 
+ uint32_t                   glRaytracingLightingGetLightCount(void);
++uint32_t                   glRaytracingLightingGetSelectedLightCount(void);
+ 
+ void                       glLightScene(void);
+ 
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 1204b8e..55dd51c 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -901,6 +901,39 @@ static void RB_CopyModelMatrixToDXRTransform(const float* modelMatrix, float out
+ 	outTransform[11] = modelMatrix[14];
+ }
+ 
++static unsigned long long RB_HashDXRGeometry(
++	int startVertex, int endVertex,
++	int startIndex, int endIndex)
++{
++	const unsigned long long fnvOffset = 1469598103934665603ULL;
++	const unsigned long long fnvPrime = 1099511628211ULL;
++	unsigned long long h = fnvOffset;
++
++	auto hashU32 = [&](unsigned int value)
++	{
++		h ^= (unsigned long long)value;
++		h *= fnvPrime;
++	};
++
++	hashU32((unsigned int)(endVertex - startVertex));
++	hashU32((unsigned int)(endIndex - startIndex));
++
++	for (int i = startVertex; i < endVertex; ++i)
++	{
++		for (int c = 0; c < 3; ++c)
++		{
++			unsigned int bits = 0;
++			memcpy(&bits, &tess.xyz[i][c], sizeof(bits));
++			hashU32(bits);
++		}
++	}
++
++	for (int i = startIndex; i < endIndex; ++i)
++		hashU32((unsigned int)(tess.indexes[i] - startVertex));
++
++	return h ? h : 1ULL;
++}
++
+ void RB_UpdateDXRInstance(trDXRMesh_t* mesh, int surfaceId, uint32_t instanceID, const float* modelMatrix)
+ {
+ 	if (!mesh)
+@@ -927,6 +960,12 @@ void RB_UpdateDXRInstance(trDXRMesh_t* mesh, int surfaceId, uint32_t instanceID,
+ 
+ 	RB_CopyModelMatrixToDXRTransform(modelMatrix, desc.transform);
+ 
++	if (surf->dxrInstanceHandle && surf->cachedTransformValid &&
++		memcmp(surf->cachedTransform, desc.transform, sizeof(desc.transform)) == 0)
++	{
++		return;
++	}
++
+ 	if (!surf->dxrInstanceHandle)
+ 	{
+ 		surf->dxrInstanceHandle = glRaytracingCreateInstance(&desc);
+@@ -939,6 +978,12 @@ void RB_UpdateDXRInstance(trDXRMesh_t* mesh, int surfaceId, uint32_t instanceID,
+ 			surf->dxrInstanceHandle = glRaytracingCreateInstance(&desc);
+ 		}
+ 	}
++
++	if (surf->dxrInstanceHandle)
++	{
++		memcpy(surf->cachedTransform, desc.transform, sizeof(desc.transform));
++		surf->cachedTransformValid = 1;
++	}
+ }
+ 
+ #define MAC_EVENT_PUMP_MSEC     5
+@@ -992,6 +1037,8 @@ RB_UpdateDXRMesh
+ 
+ void RB_UpdateDXRMesh(trDXRMesh_t* mesh, int currentFrame, int surfaceId, int startVertex, int endVertex, int startIndex, int endIndex)
+ {
++	(void)currentFrame;
++
+ 	if (!mesh)
+ 	{
+ 		return;
+@@ -1029,6 +1076,16 @@ void RB_UpdateDXRMesh(trDXRMesh_t* mesh, int currentFrame, int surfaceId, int st
+ 	const int indexCount = endIndex - startIndex;
+ 
+ 	trDXRSurface_t* surf = &mesh->dxrSurfaces[surfaceId];
++	const unsigned long long geometryHash = RB_HashDXRGeometry(
++		startVertex, endVertex, startIndex, endIndex);
++
++	// Rigid brush entities (doors, lifts, gates) keep identical local geometry
++	// while only their instance transform changes. Avoid re-uploading vertices
++	// and rebuilding BLAS every frame. Animated geometry still changes the hash.
++	if (surf->dxrMeshHandle && surf->geometryHash == geometryHash)
++	{
++		return;
++	}
+ 
+ 	std::vector<glRaytracingVertex_t> vertices(vertexCount);
+ 	std::vector<uint32_t> indices(indexCount);
+@@ -1072,9 +1129,12 @@ void RB_UpdateDXRMesh(trDXRMesh_t* mesh, int currentFrame, int surfaceId, int st
+ 		{
+ 			glRaytracingDeleteMesh(surf->dxrMeshHandle);
+ 			surf->dxrMeshHandle = glRaytracingCreateMesh(&desc);
++			surf->cachedTransformValid = 0;
+ 		}
+ 	}
+ 
++	if (surf->dxrMeshHandle)
++		surf->geometryHash = geometryHash;
+ }
+ 
+ /*
+@@ -1110,6 +1170,11 @@ static qboolean RB_DXRShouldRenderLighting(void)
+ 		return qfalse;
+ 	}
+ 
++	if (glRaytracingHasDeviceLost())
++	{
++		return qfalse;
++	}
++
+ 	return qtrue;
+ }
+ 
+@@ -1151,6 +1216,28 @@ static void RB_RunRaytracedLightingPass(void)
+ 
+ 	backEnd.raytraceRendered = qtrue;
+ 
++	glRaytracingSetSafetyOptions(
++		r_dxrSafeMode ? r_dxrSafeMode->integer : 1,
++		r_dxrErrorLimit ? r_dxrErrorLimit->integer : 4,
++		r_dxrFenceWaitMs ? r_dxrFenceWaitMs->integer : 5000);
++
++	glRaytracingSetPerformanceOptions(
++		r_dxrAsyncSubmit ? r_dxrAsyncSubmit->integer : 0,
++		r_dxrBuildInterval ? r_dxrBuildInterval->integer : 1,
++		r_dxrDispatchInterval ? r_dxrDispatchInterval->integer : 1);
++
++	glRaytracingLightingSetQualityOptions(
++		r_dxrMaxLights ? (uint32_t)r_dxrMaxLights->integer : 24u,
++		r_dxrShadowSamples ? (uint32_t)r_dxrShadowSamples->integer : 1u,
++		r_dxrRectShadowSamples ? (uint32_t)r_dxrRectShadowSamples->integer : 1u,
++		r_dxrAOSamples ? (uint32_t)r_dxrAOSamples->integer : 0u,
++		r_dxrSkySamples ? (uint32_t)r_dxrSkySamples->integer : 0u,
++		r_dxrShadowStrength ? r_dxrShadowStrength->value : 1.0f,
++		r_dxrLegacyShadowStrength ? r_dxrLegacyShadowStrength->value : 0.35f,
++		r_dxrShadowMinVisibility ? r_dxrShadowMinVisibility->value : 0.12f,
++		r_dxrContactShadows ? (uint32_t)r_dxrContactShadows->integer : 0u,
++		r_dxrContactShadowLength ? r_dxrContactShadowLength->value : 96.0f);
++
+ 	if (r_dxrShadowBias)
+ 	{
+ 		glRaytracingLightingSetShadowBias(r_dxrShadowBias->value);
+@@ -1201,10 +1288,17 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR: meshes=%u instances=%u lights=%u fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.1 stable-clear: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
++				glRaytracingLightingGetSelectedLightCount(),
++				r_dxrAsyncSubmit ? r_dxrAsyncSubmit->integer : 0,
++				r_dxrCpuSync ? r_dxrCpuSync->integer : 1,
++				r_dxrShadowSamples ? r_dxrShadowSamples->integer : 1,
++				r_dxrRectShadowSamples ? r_dxrRectShadowSamples->integer : 1,
++				r_dxrAOSamples ? r_dxrAOSamples->integer : 0,
++				r_dxrSkySamples ? r_dxrSkySamples->integer : 0,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+ 				r_dxrFallbackLightIntensity ? r_dxrFallbackLightIntensity->value : 0.0f,
+@@ -1216,7 +1310,11 @@ static void RB_RunRaytracedLightingPass(void)
+ 		}
+ 	}
+ 
+-	glFinish();
++	// glLightScene submits the raster transitions before DXR. A global
++	// glFinish here forces the whole GPU idle every frame and was the largest
++	// avoidable source of stutter. Keep it only as an explicit diagnostic mode.
++	if (r_dxrCpuSync && r_dxrCpuSync->integer)
++		glFinish();
+ 	glLightScene();
+ 	glRaytracingLightingClearLights(false);
+ }
+diff --git a/src/renderer/tr_bsp.cpp b/src/renderer/tr_bsp.cpp
+index de497a2..4d9f98b 100644
+--- a/src/renderer/tr_bsp.cpp
++++ b/src/renderer/tr_bsp.cpp
+@@ -2455,7 +2455,13 @@ static void R_CreateRaytracingWorldMeshes(void) {
+ 			continue;
+ 		}
+ 
+-		if (surf->shader && (surf->shader->surfaceFlags & SURF_ALPHASHADOW)) {
++		// Grates and iron doors often carry SURF_ALPHASHADOW. The current
++		// shadow pipeline has no texture alpha any-hit shader, but excluding the
++		// surface entirely removes its shadow and makes moving doors invisible to
++		// DXR. Include its real triangle geometry by default; users can restore
++		// the old exclusion with r_dxrAlphaShadowGeometry 0.
++		if (surf->shader && (surf->shader->surfaceFlags & SURF_ALPHASHADOW) &&
++			(!r_dxrAlphaShadowGeometry || !r_dxrAlphaShadowGeometry->integer)) {
+ 			continue;
+ 		}
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index e85310b..8cf26ed 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -83,6 +83,24 @@ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
++cvar_t  *r_dxrSafeMode;
++cvar_t  *r_dxrErrorLimit;
++cvar_t  *r_dxrFenceWaitMs;
++cvar_t  *r_dxrAsyncSubmit;
++cvar_t  *r_dxrCpuSync;
++cvar_t  *r_dxrBuildInterval;
++cvar_t  *r_dxrDispatchInterval;
++cvar_t  *r_dxrMaxLights;
++cvar_t  *r_dxrShadowSamples;
++cvar_t  *r_dxrRectShadowSamples;
++cvar_t  *r_dxrAOSamples;
++cvar_t  *r_dxrSkySamples;
++cvar_t  *r_dxrShadowStrength;
++cvar_t  *r_dxrLegacyShadowStrength;
++cvar_t  *r_dxrShadowMinVisibility;
++cvar_t  *r_dxrContactShadows;
++cvar_t  *r_dxrContactShadowLength;
++cvar_t  *r_dxrAlphaShadowGeometry;
+ 
+ cvar_t  *r_waterFogColor;   //----(SA)	added
+ cvar_t  *r_mapFogColor;
+@@ -1002,6 +1020,24 @@ void R_Register( void ) {
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
++	r_dxrSafeMode = ri.Cvar_Get( "r_dxrSafeMode", "1", CVAR_ARCHIVE );
++	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "4", CVAR_ARCHIVE );
++	r_dxrFenceWaitMs = ri.Cvar_Get( "r_dxrFenceWaitMs", "5000", CVAR_ARCHIVE );
++	r_dxrAsyncSubmit = ri.Cvar_Get( "r_dxrAsyncSubmit", "0", CVAR_ARCHIVE );
++	r_dxrCpuSync = ri.Cvar_Get( "r_dxrCpuSync", "1", CVAR_ARCHIVE );
++	r_dxrBuildInterval = ri.Cvar_Get( "r_dxrBuildInterval", "1", CVAR_ARCHIVE );
++	r_dxrDispatchInterval = ri.Cvar_Get( "r_dxrDispatchInterval", "1", CVAR_ARCHIVE );
++	r_dxrMaxLights = ri.Cvar_Get( "r_dxrMaxLights", "24", CVAR_ARCHIVE );
++	r_dxrShadowSamples = ri.Cvar_Get( "r_dxrShadowSamples", "1", CVAR_ARCHIVE );
++	r_dxrRectShadowSamples = ri.Cvar_Get( "r_dxrRectShadowSamples", "1", CVAR_ARCHIVE );
++	r_dxrAOSamples = ri.Cvar_Get( "r_dxrAOSamples", "0", CVAR_ARCHIVE );
++	r_dxrSkySamples = ri.Cvar_Get( "r_dxrSkySamples", "0", CVAR_ARCHIVE );
++	r_dxrShadowStrength = ri.Cvar_Get( "r_dxrShadowStrength", "1.0", CVAR_ARCHIVE );
++	r_dxrLegacyShadowStrength = ri.Cvar_Get( "r_dxrLegacyShadowStrength", "0.35", CVAR_ARCHIVE );
++	r_dxrShadowMinVisibility = ri.Cvar_Get( "r_dxrShadowMinVisibility", "0.12", CVAR_ARCHIVE );
++	r_dxrContactShadows = ri.Cvar_Get( "r_dxrContactShadows", "0", CVAR_ARCHIVE );
++	r_dxrContactShadowLength = ri.Cvar_Get( "r_dxrContactShadowLength", "96", CVAR_ARCHIVE );
++	r_dxrAlphaShadowGeometry = ri.Cvar_Get( "r_dxrAlphaShadowGeometry", "0", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+ 	r_textureMode = ri.Cvar_Get( "r_textureMode", "GL_LINEAR_MIPMAP_NEAREST", CVAR_ARCHIVE );
+ 	r_swapInterval = ri.Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 1816efa..8baa2cc 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -67,6 +67,9 @@ long myftol( float f );
+ struct trDXRSurface_t {
+ 	glRaytracingInstanceHandle_t dxrInstanceHandle;
+ 	glRaytracingMeshHandle_t dxrMeshHandle;
++	unsigned long long geometryHash = 0;
++	float cachedTransform[12] = {};
++	int cachedTransformValid = 0;
+ };
+ 
+ struct trDXRMesh_t {
+@@ -1134,10 +1137,28 @@ extern cvar_t   *r_dxrAmbientIntensity; // global ambient lift for the DXR resol
+ extern cvar_t   *r_dxrLegacyBlend;      // how much of the original RTCW shading is preserved
+ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR resolve
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+-extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 occlusion, 3 albedo, 4 lighting heatmap
++extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;
++extern cvar_t   *r_dxrSafeMode;
++extern cvar_t   *r_dxrErrorLimit;
++extern cvar_t   *r_dxrFenceWaitMs;
++extern cvar_t   *r_dxrAsyncSubmit;
++extern cvar_t   *r_dxrCpuSync;
++extern cvar_t   *r_dxrBuildInterval;
++extern cvar_t   *r_dxrDispatchInterval;
++extern cvar_t   *r_dxrMaxLights;
++extern cvar_t   *r_dxrShadowSamples;
++extern cvar_t   *r_dxrRectShadowSamples;
++extern cvar_t   *r_dxrAOSamples;
++extern cvar_t   *r_dxrSkySamples;
++extern cvar_t   *r_dxrShadowStrength;
++extern cvar_t   *r_dxrLegacyShadowStrength;
++extern cvar_t   *r_dxrShadowMinVisibility;
++extern cvar_t   *r_dxrContactShadows;
++extern cvar_t   *r_dxrContactShadowLength;
++extern cvar_t   *r_dxrAlphaShadowGeometry;
+ 
+ extern cvar_t  *r_norefresh;            // bypasses the ref rendering
+ extern cvar_t  *r_drawentities;         // disable/enable entity rendering
