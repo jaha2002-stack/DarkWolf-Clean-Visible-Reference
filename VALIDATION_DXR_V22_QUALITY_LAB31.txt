@@ -1,0 +1,38 @@
+DarkWolf RTCW DXR v2.2 Quality Lab 3.1 Startup Safe - Static Validation
+============================================================================
+
+Input QL3 blobs:
+  src/opengl/gl_d3d12raylight.cpp  02fed812b77a58d8723efa21c6a0694ded1c88f5
+  src/renderer/tr_backend.cpp      2ae500d717f9096f55ec12c821d2a37df1debab2
+
+Expected QL3.1 blobs:
+  src/opengl/gl_d3d12raylight.cpp  6c0d0da0a91cadf1755fa6aacc2ccdaa43244e89
+  src/renderer/tr_backend.cpp      8bef35d4ecdb34b50323cb72c67240fe30e15396
+
+Safety design:
+  - history SRV/UAV declarations removed
+  - history texture allocation removed
+  - history transitions/barriers/swap removed
+  - descriptor heap restored to 7
+  - SRV range restored to 6
+  - UAV range restored to 1
+  - output UAV restored to descriptor slot 6
+  - temporal and spatial history hard-gated to 0
+  - QL3 source-size, light selection, hybrid BLAS and frame fixes retained
+
+Static checks performed:
+  PASS patch 61 applies to exact QL3 source
+  PASS patch 61 reverse-check after application
+  PASS git diff --check
+  PASS forbidden history markers absent
+  PASS proven descriptor/root-table markers present
+  PASS embedded QL3 HLSL chunks remain below 8000 bytes
+  PASS QL3.1 workflow YAML parses
+  PASS CFG dependencies and launcher mappings
+  PASS required runtime DLL packaging checks retained
+  PASS Upgrade/Full ZIP integrity
+
+Not performed in this environment:
+  - MSVC compilation
+  - DXC compilation
+  - GPU runtime test
