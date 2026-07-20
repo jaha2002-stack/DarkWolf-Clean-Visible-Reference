@@ -1,0 +1,500 @@
+From 005692ebcaa26b720968445e0f79f9c8d25dba2a Mon Sep 17 00:00:00 2001
+From: OpenAI <openai@example.com>
+Date: Mon, 20 Jul 2026 04:44:24 +0000
+Subject: [PATCH] Add QL2 shadow authority and dynamic BLAS rebuilds
+
+---
+ src/opengl/gl_d3d12raylight.cpp | 150 ++++++++++++++++++++++++++++----
+ src/opengl/opengl.h             |  10 ++-
+ src/renderer/tr_backend.cpp     |  16 +++-
+ src/renderer/tr_cmesh.cpp       |   9 ++
+ src/renderer/tr_init.cpp        |   6 ++
+ src/renderer/tr_local.h         |   5 +-
+ src/renderer/tr_mesh.cpp        |   9 ++
+ 7 files changed, 181 insertions(+), 24 deletions(-)
+
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 43213e6..eaf7b9a 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -586,6 +586,7 @@ struct glRaytracingMeshRecord_t
+ 	int blasBuilt;
+ 	int dirty;
+ 	int currentBlasIndex;
++	int forceFullRebuild;
+ 
+ 	glRaytracingMeshRecord_t()
+ 	{
+@@ -597,6 +598,7 @@ struct glRaytracingMeshRecord_t
+ 		blasBuilt = 0;
+ 		dirty = 0;
+ 		currentBlasIndex = 0;
++		forceFullRebuild = 0;
+ 	}
+ };
+ 
+@@ -665,6 +667,10 @@ struct glRaytracingSceneState_t
+ 	int tlasNeedsUpdate;
+ 	int currentTLASIndex;
+ 
++	uint64_t dynamicMeshUpdates;
++	uint64_t dynamicFullRebuilds;
++	uint64_t dynamicRefits;
++
+ 	glRaytracingSceneState_t()
+ 	{
+ 		nextMeshHandle = 1;
+@@ -679,10 +685,14 @@ struct glRaytracingSceneState_t
+ 		tlasNeedsRebuild = 1;
+ 		tlasNeedsUpdate = 1;
+ 		currentTLASIndex = 0;
++		dynamicMeshUpdates = 0;
++		dynamicFullRebuilds = 0;
++		dynamicRefits = 0;
+ 	}
+ };
+ 
+ static glRaytracingSceneState_t g_glRaytracingScene;
++static int g_glRaytracingDynamicFullRebuild = 1;
+ 
+ void glRaytracingClear(void);
+ 
+@@ -1064,6 +1074,7 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc;
+ 		ID3D12Resource* barrierResource;
+ 		int newBlasIndex;
++		int performedUpdate;
+ 	};
+ 
+ 	std::vector<glRaytracingMeshBuildInfo_t> builds;
+@@ -1099,14 +1110,23 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 		info.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+ 		info.inputs.NumDescs = 1;
+ 		info.inputs.pGeometryDescs = &info.geomDesc;
++		const bool isDynamicRebuild =
++			(mesh->blasBuilt != 0) && (mesh->descCpu.allowUpdate != 0) &&
++			(mesh->forceFullRebuild != 0);
++		const bool canUpdateInPlace =
++			(mesh->blasBuilt != 0) && (mesh->descCpu.allowUpdate != 0) &&
++			!isDynamicRebuild;
++
+ 		info.inputs.Flags = mesh->descCpu.allowUpdate
+-			? (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
++			? ((isDynamicRebuild
++				? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD
++				: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE) |
+ 				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+ 			: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+ 
+-		const bool canUpdateInPlace = (mesh->blasBuilt != 0) && (mesh->descCpu.allowUpdate != 0);
+ 		if (canUpdateInPlace)
+ 			info.inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
++		info.performedUpdate = canUpdateInPlace ? 1 : 0;
+ 
+ 		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
+ 		g_glRaytracingCmd.device->GetRaytracingAccelerationStructurePrebuildInfo(&info.inputs, &prebuild);
+@@ -1116,7 +1136,10 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 			return 0;
+ 		}
+ 
+-		if (!glRaytracingEnsureMeshScratch(mesh, prebuild.ScratchDataSizeInBytes))
++		const UINT64 scratchBytes = (canUpdateInPlace && prebuild.UpdateScratchDataSizeInBytes > 0)
++			? prebuild.UpdateScratchDataSizeInBytes
++			: prebuild.ScratchDataSizeInBytes;
++		if (!glRaytracingEnsureMeshScratch(mesh, scratchBytes))
+ 			return 0;
+ 		if (!glRaytracingEnsureMeshResultBuffers(mesh, prebuild.ResultDataMaxSizeInBytes))
+ 			return 0;
+@@ -1163,6 +1186,11 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 		mesh->currentBlasIndex = builds[i].newBlasIndex;
+ 		mesh->blasBuilt = 1;
+ 		mesh->dirty = 0;
++		if (mesh->forceFullRebuild)
++			++g_glRaytracingScene.dynamicFullRebuilds;
++		else if (builds[i].performedUpdate)
++			++g_glRaytracingScene.dynamicRefits;
++		mesh->forceFullRebuild = 0;
+ 	}
+ 
+ 	g_glRaytracingScene.tlasNeedsRebuild = 1;
+@@ -1471,6 +1499,9 @@ void glRaytracingClear(void)
+ 	g_glRaytracingScene.tlasNeedsRebuild = 1;
+ 	g_glRaytracingScene.tlasNeedsUpdate = 1;
+ 	g_glRaytracingScene.currentTLASIndex = 0;
++	g_glRaytracingScene.dynamicMeshUpdates = 0;
++	g_glRaytracingScene.dynamicFullRebuilds = 0;
++	g_glRaytracingScene.dynamicRefits = 0;
+ }
+ 
+ glRaytracingMeshHandle_t glRaytracingCreateMesh(const glRaytracingMeshDesc_t* desc)
+@@ -1549,6 +1580,9 @@ int glRaytracingUpdateMesh(glRaytracingMeshHandle_t meshHandle, const glRaytraci
+ 	}
+ 
+ 	mesh->dirty = 1;
++	mesh->forceFullRebuild = (canReuseGeometryBuffers && mesh->blasBuilt &&
++		g_glRaytracingDynamicFullRebuild) ? 1 : 0;
++	++g_glRaytracingScene.dynamicMeshUpdates;
+ 
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+@@ -1573,6 +1607,26 @@ int glRaytracingUpdateMesh(glRaytracingMeshHandle_t meshHandle, const glRaytraci
+ 	return glRaytracingShouldAbortWork() ? 0 : 1;
+ }
+ 
++void glRaytracingSetDynamicGeometryOptions(int fullRebuild)
++{
++	g_glRaytracingDynamicFullRebuild = fullRebuild ? 1 : 0;
++}
++
++uint64_t glRaytracingGetDynamicMeshUpdateCount(void)
++{
++	return g_glRaytracingScene.dynamicMeshUpdates;
++}
++
++uint64_t glRaytracingGetDynamicFullRebuildCount(void)
++{
++	return g_glRaytracingScene.dynamicFullRebuilds;
++}
++
++uint64_t glRaytracingGetDynamicRefitCount(void)
++{
++	return g_glRaytracingScene.dynamicRefits;
++}
++
+ void glRaytracingDeleteMesh(glRaytracingMeshHandle_t meshHandle)
+ {
+ 	glRaytracingMeshRecord_t* mesh = glRaytracingFindMesh(meshHandle);
+@@ -1764,9 +1818,11 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t frameIndex;
+ 	float fallbackDiffuseScale;
+ 	float highlightCompression;
++	float shadowRetention;
++	float shadowCompositeMinLight;
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 256,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 264,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1870,6 +1926,8 @@ cbuffer LightingCB : register(b0)
+     uint     gFrameIndex;
+     float    gFallbackDiffuseScale;
+     float    gHighlightCompression;
++    float    gShadowRetention;
++    float    gShadowCompositeMinLight;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -2399,6 +2457,8 @@ void RayGen()
+     float3 fillDiffuseAccum = 0.0;
+     float3 authoredSpecularAccum = 0.0;
+     float3 fillSpecularAccum = 0.0;
++    float strongestShadowLoss = 0.0;
++    float strongestShadowFraction = 0.0;
+ 
+     [loop]
+     for (uint i = 0; i < gLightCount; ++i)
+@@ -2452,6 +2512,11 @@ void RayGen()
+                 authoredDirectUnshadowed += unshadowedDiffuse;
+                 authoredDirectShadowed += unshadowedDiffuse * shadow;
+                 authoredSpecularAccum += unshadowedSpecular * shadow;
++
++                float pointLum = Luminance(unshadowedDiffuse);
++                float pointOcclusion = saturate(1.0 - shadow);
++                strongestShadowLoss = max(strongestShadowLoss, pointLum * pointOcclusion);
++                strongestShadowFraction = max(strongestShadowFraction, pointOcclusion);
+             }
+         }
+         else if (Lgt.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+@@ -2522,11 +2587,45 @@ void RayGen()
+             authoredDirectUnshadowed += rectDirect;
+             authoredDirectShadowed += rectDirect * shadow;
+             authoredSpecularAccum += rectSpecAccum * atten * shadow;
++
++            float rectLum = Luminance(rectDirect);
++            float rectOcclusion = saturate(1.0 - shadow);
++            strongestShadowLoss = max(strongestShadowLoss, rectLum * rectOcclusion);
++            strongestShadowFraction = max(strongestShadowFraction, rectOcclusion);
+         }
+     }
+ 
+-    float3 diffuseLighting = indirectLighting + fillDiffuseAccum + authoredDirectShadowed;
+-    float3 specularAccum = authoredSpecularAccum + fillSpecularAccum;
++    // Energy-weighted visibility remains the physically correct multi-light
++    // result.  Quality Lab 2 adds a separate local occluder-confidence term so
++    // a valid grille/character/cage silhouette is not erased merely because
++    // the old lightmap, ambient lift or camera fill is brighter than the local
++    // authored light.  The confidence is driven by actual lost direct energy,
++    // so it cannot recreate the old light-radius circles in empty space.
++    float authoredUnshadowedLum = Luminance(authoredDirectUnshadowed);
++    float authoredShadowedLum = Luminance(authoredDirectShadowed);
++    float multiLightVisibility = (authoredUnshadowedLum > 1e-5)
++        ? saturate(authoredShadowedLum / authoredUnshadowedLum)
++        : 1.0;
++
++    float physicalOcclusion = saturate(1.0 - multiLightVisibility);
++    float minShadowLight = max(gShadowCompositeMinLight, 0.0001);
++    float shadowEvidenceConfidence = smoothstep(
++        minShadowLight, minShadowLight * 5.0, strongestShadowLoss);
++    float retainedOcclusion = strongestShadowFraction *
++        shadowEvidenceConfidence * saturate(gShadowRetention);
++    float compositeOcclusion = saturate(max(physicalOcclusion, retainedOcclusion));
++    float compositeVisibility = max(1.0 - compositeOcclusion, saturate(gShadowMinVisibility));
++
++    // Preserve indirect/fill illumination, but do not let it completely wash
++    // out a ray-confirmed local silhouette.  This is deliberately partial: the
++    // room remains readable and multi-light fill still works.
++    float supportShadowWeight = 0.20 + 0.30 * saturate(gShadowRetention);
++    float supportShadow = lerp(1.0, compositeVisibility, supportShadowWeight);
++    float3 diffuseLighting =
++        authoredDirectShadowed + (indirectLighting + fillDiffuseAccum) * supportShadow;
++
++    float fillSpecularShadow = lerp(1.0, compositeVisibility, 0.20 * saturate(gShadowRetention));
++    float3 specularAccum = authoredSpecularAccum + fillSpecularAccum * fillSpecularShadow;
+ 
+     diffuseLighting *= ao;
+     specularAccum *= lerp(1.0, ao, 0.5);
+@@ -2537,24 +2636,14 @@ void RayGen()
+         specularAccum *= 1.05;
+     }
+ 
+-    // Energy-weighted visibility of all authored direct lights.  An unoccluded
+-    // second light correctly fills a shadow from the first; a camera fill never
+-    // enters this ratio and therefore cannot rotate or erase world shadows.
+-    float authoredUnshadowedLum = Luminance(authoredDirectUnshadowed);
+-    float authoredShadowedLum = Luminance(authoredDirectShadowed);
+-    float multiLightVisibility = (authoredUnshadowedLum > 1e-5)
+-        ? saturate(authoredShadowedLum / authoredUnshadowedLum)
+-        : 1.0;
+-
+     float supportLum = Luminance(indirectLighting + fillDiffuseAccum);
+     float authoredDirectShare = (authoredUnshadowedLum > 1e-5)
+         ? saturate(authoredUnshadowedLum / (authoredUnshadowedLum + supportLum + 0.15))
+         : 0.0;
+ 
+-    float legacyShadowTarget = max(multiLightVisibility, saturate(gShadowMinVisibility));
+     float legacyShadowWeight = saturate(gLegacyShadowStrength) *
+-        smoothstep(0.05, 0.65, authoredDirectShare);
+-    float legacyShadow = lerp(1.0, legacyShadowTarget, legacyShadowWeight);
++        shadowEvidenceConfidence;
++    float legacyShadow = lerp(1.0, compositeVisibility, legacyShadowWeight);
+ 
+     if (geoFlag == GEOMETRY_FLAG_UNLIT)
+     {
+@@ -2607,6 +2696,19 @@ void RayGen()
+         {
+             finalColor = float3(authoredDirectShare, authoredDirectShare, authoredDirectShare);
+         }
++        else if (gDebugMode == 11)
++        {
++            float evidenceView = saturate(strongestShadowLoss / max(gShadowCompositeMinLight * 5.0, 0.0001));
++            finalColor = float3(evidenceView, evidenceView, evidenceView);
++        }
++        else if (gDebugMode == 12)
++        {
++            finalColor = float3(compositeVisibility, compositeVisibility, compositeVisibility);
++        }
++        else if (gDebugMode == 13)
++        {
++            finalColor = float3(supportShadow, supportShadow, supportShadow);
++        }
+ 
+         gOutputTex[pixel] = float4(finalColor, albedoSample.a);
+     }
+@@ -3149,6 +3251,8 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.frameIndex = 0u;
+ 	g_glRaytracingLighting.constants.fallbackDiffuseScale = 0.35f;
+ 	g_glRaytracingLighting.constants.highlightCompression = 1.0f;
++	g_glRaytracingLighting.constants.shadowRetention = 0.60f;
++	g_glRaytracingLighting.constants.shadowCompositeMinLight = 0.025f;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -3300,12 +3404,20 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
+-void glRaytracingLightingSetCompositeOptions(float fallbackDiffuseScale, float highlightCompression)
++void glRaytracingLightingSetCompositeOptions(
++	float fallbackDiffuseScale,
++	float highlightCompression,
++	float shadowRetention,
++	float shadowCompositeMinLight)
+ {
+ 	g_glRaytracingLighting.constants.fallbackDiffuseScale =
+ 		glRaytracingClamp(fallbackDiffuseScale, 0.0f, 1.0f);
+ 	g_glRaytracingLighting.constants.highlightCompression =
+ 		glRaytracingClamp(highlightCompression, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.shadowRetention =
++		glRaytracingClamp(shadowRetention, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.shadowCompositeMinLight =
++		glRaytracingClamp(shadowCompositeMinLight, 0.0001f, 2.0f);
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index fe7e3f5..4bd9935 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1691,6 +1691,10 @@ int                        glRaytracingBuildSceneIfDirty(void);
+ 
+ uint32_t                   glRaytracingGetMeshCount(void);
+ uint32_t                   glRaytracingGetInstanceCount(void);
++void                       glRaytracingSetDynamicGeometryOptions(int fullRebuild);
++uint64_t                   glRaytracingGetDynamicMeshUpdateCount(void);
++uint64_t                   glRaytracingGetDynamicFullRebuildCount(void);
++uint64_t                   glRaytracingGetDynamicRefitCount(void);
+ 
+ bool                       glRaytracingLightingInit(void);
+ void                       glRaytracingLightingShutdown(void);
+@@ -1713,7 +1717,11 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
+-void                       glRaytracingLightingSetCompositeOptions(float fallbackDiffuseScale, float highlightCompression);
++void                       glRaytracingLightingSetCompositeOptions(
++	float fallbackDiffuseScale,
++	float highlightCompression,
++	float shadowRetention,
++	float shadowCompositeMinLight);
+ void                       glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index f569695..e1e5ebf 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1288,7 +1288,11 @@ static void RB_RunRaytracedLightingPass(void)
+ 
+ 	glRaytracingLightingSetCompositeOptions(
+ 		r_dxrFallbackDiffuseScale ? r_dxrFallbackDiffuseScale->value : 0.35f,
+-		r_dxrHighlightCompression ? r_dxrHighlightCompression->value : 1.0f);
++		r_dxrHighlightCompression ? r_dxrHighlightCompression->value : 1.0f,
++		r_dxrShadowRetention ? r_dxrShadowRetention->value : 0.60f,
++		r_dxrShadowCompositeMinLight ? r_dxrShadowCompositeMinLight->value : 0.025f);
++	glRaytracingSetDynamicGeometryOptions(
++		r_dxrDynamicBLASFullRebuild ? r_dxrDynamicBLASFullRebuild->integer : 1);
+ 
+ 	RB_AddDXRFallbackLightIfNeeded();
+ 
+@@ -1308,7 +1312,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 Quality Lab 1: meshes=%u instances=%u lights=%u selected=%u dropped=%u point=%u rect=%u fill=%u maxRadius=%.1f maxIntensity=%.2f async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d fillScale=%.2f highlight=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.2 Quality Lab 2: meshes=%u instances=%u lights=%u selected=%u dropped=%u point=%u rect=%u fill=%u maxRadius=%.1f maxIntensity=%.2f async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d fillScale=%.2f highlight=%.2f retention=%.2f minLight=%.3f dynFull=%d dynUpdates=%llu dynRebuilds=%llu dynRefits=%llu bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1329,6 +1333,12 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrFallbackCastsShadows ? r_dxrFallbackCastsShadows->integer : 0,
+ 				r_dxrFallbackDiffuseScale ? r_dxrFallbackDiffuseScale->value : 0.35f,
+ 				r_dxrHighlightCompression ? r_dxrHighlightCompression->value : 1.0f,
++				r_dxrShadowRetention ? r_dxrShadowRetention->value : 0.60f,
++				r_dxrShadowCompositeMinLight ? r_dxrShadowCompositeMinLight->value : 0.025f,
++				r_dxrDynamicBLASFullRebuild ? r_dxrDynamicBLASFullRebuild->integer : 1,
++				(unsigned long long)glRaytracingGetDynamicMeshUpdateCount(),
++				(unsigned long long)glRaytracingGetDynamicFullRebuildCount(),
++				(unsigned long long)glRaytracingGetDynamicRefitCount(),
+ 				r_dxrShadowBias ? r_dxrShadowBias->value : 0.0f,
+ 				r_dxrAmbientIntensity ? r_dxrAmbientIntensity->value : 0.0f,
+ 				r_dxrLegacyBlend ? r_dxrLegacyBlend->value : 0.0f,
+@@ -1344,7 +1354,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 				if (!glRaytracingLightingGetSelectedLight((uint32_t)i, &light))
+ 					break;
+ 				ri.Printf(PRINT_ALL,
+-					"  QL1 light[%d] type=%s fill=%d persistent=%d pos=(%.1f %.1f %.1f) radius=%.1f intensity=%.2f color=(%.2f %.2f %.2f)\n",
++					"  QL2 light[%d] type=%s fill=%d persistent=%d pos=(%.1f %.1f %.1f) radius=%.1f intensity=%.2f color=(%.2f %.2f %.2f)\n",
+ 					i,
+ 					(light.type == GL_RAYTRACING_LIGHT_TYPE_RECT) ? "rect" : "point",
+ 					(light.pad1 >= 0.5f) ? 1 : 0,
+diff --git a/src/renderer/tr_cmesh.cpp b/src/renderer/tr_cmesh.cpp
+index 82b1771..28d6a44 100644
+--- a/src/renderer/tr_cmesh.cpp
++++ b/src/renderer/tr_cmesh.cpp
+@@ -316,6 +316,15 @@ void R_AddMDCSurfaces( trRefEntity_t *ent ) {
+ 		ent->e.oldframe %= tr.currentModel->mdc[0]->numFrames;
+ 	}
+ 
++	// Some looping map models (notably torture/cage1 and cage2) submit the
++	// transition numFrames-1 -> numFrames without RF_WRAP_FRAMES.  Preserve the
++	// last-to-first interpolation instead of resetting both frames to zero.
++	const int dxrNumFrames = tr.currentModel->mdc[0]->numFrames;
++	if ( dxrNumFrames > 0 && ent->e.oldframe == dxrNumFrames - 1 &&
++		ent->e.frame == dxrNumFrames ) {
++		ent->e.frame = 0;
++	}
++
+ 	//
+ 	// Validate the frames so there is no chance of a crash.
+ 	// This will write directly into the entity structure, so
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 2bfd3d3..90039d1 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -86,6 +86,9 @@ cvar_t  *r_dxrFallbackLightIntensity;
+ cvar_t  *r_dxrFallbackCastsShadows;
+ cvar_t  *r_dxrFallbackDiffuseScale;
+ cvar_t  *r_dxrHighlightCompression;
++cvar_t  *r_dxrShadowRetention;
++cvar_t  *r_dxrShadowCompositeMinLight;
++cvar_t  *r_dxrDynamicBLASFullRebuild;
+ cvar_t  *r_dxrDebugLights;
+ cvar_t  *r_dxrSafeMode;
+ cvar_t  *r_dxrErrorLimit;
+@@ -1027,6 +1030,9 @@ void R_Register( void ) {
+ 	r_dxrFallbackCastsShadows = ri.Cvar_Get( "r_dxrFallbackCastsShadows", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackDiffuseScale = ri.Cvar_Get( "r_dxrFallbackDiffuseScale", "0.35", CVAR_ARCHIVE );
+ 	r_dxrHighlightCompression = ri.Cvar_Get( "r_dxrHighlightCompression", "1.0", CVAR_ARCHIVE );
++	r_dxrShadowRetention = ri.Cvar_Get( "r_dxrShadowRetention", "0.60", CVAR_ARCHIVE );
++	r_dxrShadowCompositeMinLight = ri.Cvar_Get( "r_dxrShadowCompositeMinLight", "0.025", CVAR_ARCHIVE );
++	r_dxrDynamicBLASFullRebuild = ri.Cvar_Get( "r_dxrDynamicBLASFullRebuild", "1", CVAR_ARCHIVE );
+ 	r_dxrDebugLights = ri.Cvar_Get( "r_dxrDebugLights", "0", CVAR_ARCHIVE );
+ 	r_dxrSafeMode = ri.Cvar_Get( "r_dxrSafeMode", "1", CVAR_ARCHIVE );
+ 	r_dxrErrorLimit = ri.Cvar_Get( "r_dxrErrorLimit", "4", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 6bfa988..7c92580 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1137,13 +1137,16 @@ extern cvar_t   *r_dxrAmbientIntensity; // global ambient lift for the DXR resol
+ extern cvar_t   *r_dxrLegacyBlend;      // how much of the original RTCW shading is preserved
+ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR resolve
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+-extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 RT, 2 AO/sky, 3 albedo, 4 lighting, 5/8 multi-light visibility, 6 unshadowed direct, 7 shadowed direct, 9 fill, 10 direct share
++extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 RT, 2 AO/sky, 3 albedo, 4 lighting, 5/8 physical visibility, 6/7 direct, 9 fill, 10 share, 11 evidence, 12 retained visibility, 13 support shadow
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;
+ extern cvar_t   *r_dxrFallbackCastsShadows; // camera fill should not move world shadows
+ extern cvar_t   *r_dxrFallbackDiffuseScale; // diffuse contribution of the camera-following fill
+ extern cvar_t   *r_dxrHighlightCompression; // ACES highlight shoulder blend, 0=off 1=full
++extern cvar_t   *r_dxrShadowRetention;      // retain ray-confirmed local silhouettes through legacy/ambient composite
++extern cvar_t   *r_dxrShadowCompositeMinLight; // minimum lost authored light required for retained shadow evidence
++extern cvar_t   *r_dxrDynamicBLASFullRebuild; // rebuild animated vertex BLAS instead of relying on stale refits
+ extern cvar_t   *r_dxrDebugLights;          // dump this many selected lights once per second
+ extern cvar_t   *r_dxrSafeMode;
+ extern cvar_t   *r_dxrErrorLimit;
+diff --git a/src/renderer/tr_mesh.cpp b/src/renderer/tr_mesh.cpp
+index 11b6ed7..d47ecaf 100644
+--- a/src/renderer/tr_mesh.cpp
++++ b/src/renderer/tr_mesh.cpp
+@@ -332,6 +332,15 @@ void R_AddMD3Surfaces( trRefEntity_t *ent ) {
+ 		ent->e.oldframe %= tr.currentModel->md3[0]->numFrames;
+ 	}
+ 
++	// Some looping map models (notably torture/cage1 and cage2) submit the
++	// transition numFrames-1 -> numFrames without RF_WRAP_FRAMES.  Preserve the
++	// last-to-first interpolation instead of resetting both frames to zero.
++	const int dxrNumFrames = tr.currentModel->md3[0]->numFrames;
++	if ( dxrNumFrames > 0 && ent->e.oldframe == dxrNumFrames - 1 &&
++		ent->e.frame == dxrNumFrames ) {
++		ent->e.frame = 0;
++	}
++
+ 	//
+ 	// Validate the frames so there is no chance of a crash.
+ 	// This will write directly into the entity structure, so
+-- 
+2.47.3
+
