@@ -1,0 +1,623 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 0f77986..b58b548 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1764,9 +1764,39 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t frameIndex;
+ 	uint32_t qualityPad0;
+ 	uint32_t qualityPad1;
++
++	uint32_t castShadows;
++	uint32_t giEnabled;
++	uint32_t giSamples;
++	uint32_t reflectionsEnabled;
++
++	uint32_t reflectionSamples;
++	uint32_t contactAOEnabled;
++	uint32_t effectsPad0;
++	uint32_t effectsPad1;
++
++	float aoRadius;
++	float aoStrength;
++	float cavityStrength;
++	float contactAORadius;
++
++	float contactAOStrength;
++	float skyStrength;
++	float skyMaxDistance;
++	float giStrength;
++
++	float giMaxDistance;
++	float reflectionStrength;
++	float reflectionMaxDistance;
++	float reflectionRoughness;
++
++	float specularStrength;
++	float specularPower;
++	float indirectClamp;
++	float reflectionClamp;
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 256,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 352,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1858,6 +1888,36 @@ cbuffer LightingCB : register(b0)
+     uint     gFrameIndex;
+     uint     gQualityPad0;
+     uint     gQualityPad1;
++
++    uint     gCastShadows;
++    uint     gGIEnabled;
++    uint     gGISamples;
++    uint     gReflectionsEnabled;
++
++    uint     gReflectionSamples;
++    uint     gContactAOEnabled;
++    uint     gEffectsPad0;
++    uint     gEffectsPad1;
++
++    float    gAORadius;
++    float    gAOStrength;
++    float    gCavityStrength;
++    float    gContactAORadius;
++
++    float    gContactAOStrength;
++    float    gSkyStrength;
++    float    gSkyMaxDistance;
++    float    gGIStrength;
++
++    float    gGIMaxDistance;
++    float    gReflectionStrength;
++    float    gReflectionMaxDistance;
++    float    gReflectionRoughness;
++
++    float    gSpecularStrength;
++    float    gSpecularPower;
++    float    gIndirectClamp;
++    float    gReflectionClamp;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -2133,7 +2193,7 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+         return 1.0;
+ 
+     uint sampleCount = clamp(gAOSamples, 1u, 32u);
+-    const float AO_RADIUS = 32.0;
++    float aoRadius = max(gAORadius, 1.0);
+ 
+     float3 tangent, bitangent;
+     BuildOrthonormalBasis(N, tangent, bitangent);
+@@ -2157,7 +2217,7 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+ 
+         float3 aoOrigin = worldPos + N * max(gShadowBias * 1.5, 0.03);
+ 
+-        visibility += TraceShadow(aoOrigin, aoDir, AO_RADIUS);
++        visibility += TraceShadow(aoOrigin, aoDir, aoRadius);
+     }
+ 
+     visibility /= (float)sampleCount;
+@@ -2173,7 +2233,7 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+         return 1.0;
+ 
+     uint sampleCount = clamp(gSkySamples, 1u, 16u);
+-    const float SKY_TMAX   = 1000000.0;
++    float skyTMax = max(gSkyMaxDistance, 64.0);
+ 
+     float3 tangent, bitangent;
+     BuildOrthonormalBasis(N, tangent, bitangent);
+@@ -2199,7 +2259,7 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+             continue;
+ 
+         float3 skyOrigin = worldPos + N * (gShadowBias * 2.0) + skyDir * (gShadowBias * 2.0);
+-        vis += TraceShadow(skyOrigin, skyDir, SKY_TMAX);
++        vis += TraceShadow(skyOrigin, skyDir, skyTMax);
+     }
+ 
+     vis /= (float)sampleCount;
+@@ -2261,7 +2321,113 @@ float ComputeCavity(uint2 pixel, float3 worldPos, float3 N)
+     float cavity = (weightSum > 0.0) ? (accum / weightSum) : 0.0;
+     cavity = saturate(cavity * 2.0);
+ 
+-    return 1.0 - cavity * 0.10;
++    return 1.0 - cavity * saturate(gCavityStrength);
++}
++
++)"
++R"(
++float ComputeContactAO(float3 worldPos, float3 N, uint2 pixel)
++{
++    if (gContactAOEnabled == 0 || gContactAOStrength <= 0.0)
++        return 1.0;
++
++    const uint sampleCount = 4u;
++    float3 tangent, bitangent;
++    BuildOrthonormalBasis(N, tangent, bitangent);
++    float rand = Hash12((float2)pixel * 1.91 + worldPos.xy + worldPos.zz);
++    float visibility = 0.0;
++
++    [unroll]
++    for (uint i = 0; i < sampleCount; ++i)
++    {
++        float2 xi = Hammersley2D(i, sampleCount, rand);
++        float3 h = CosineSampleHemisphere(xi);
++        // Bias toward grazing/local directions so this behaves as grounding,
++        // not as another long-range cast-shadow system.
++        h.z = lerp(0.20, 0.75, h.z);
++        float3 dir = normalize(tangent * h.x + bitangent * h.y + N * h.z);
++        float3 origin = worldPos + N * max(gShadowBias * 1.25, 0.025);
++        visibility += TraceShadow(origin, dir, max(gContactAORadius, 1.0));
++    }
++
++    visibility /= (float)sampleCount;
++    return lerp(1.0, visibility, saturate(gContactAOStrength));
++}
++
++float3 SkyColorForDirection(float3 dir)
++{
++    float up = saturate(dir.z * 0.5 + 0.5);
++    float horizon = 1.0 - abs(dir.z);
++    float3 low = float3(0.22, 0.24, 0.28);
++    float3 high = float3(0.48, 0.53, 0.62);
++    float3 sky = lerp(low, high, up);
++    sky += float3(0.08, 0.06, 0.04) * horizon;
++    return sky;
++}
++
++float3 ComputeGI(float3 worldPos, float3 N, float3 baseAlbedo, uint2 pixel)
++{
++    if (gGIEnabled == 0 || gGIStrength <= 0.0)
++        return 0.0;
++
++    uint sampleCount = clamp(gGISamples, 1u, 4u);
++    float3 tangent, bitangent;
++    BuildOrthonormalBasis(N, tangent, bitangent);
++    float rand = Hash12((float2)pixel * 0.61 + worldPos.xy + worldPos.zz);
++    float3 accum = 0.0;
++
++    [loop]
++    for (uint i = 0; i < sampleCount; ++i)
++    {
++        float2 xi = Hammersley2D(i, sampleCount, rand);
++        float3 h = CosineSampleHemisphere(xi);
++        float3 dir = normalize(tangent * h.x + bitangent * h.y + N * h.z);
++        float3 origin = worldPos + N * max(gShadowBias * 1.5, 0.03);
++        float visibility = TraceShadow(origin, dir, max(gGIMaxDistance, 8.0));
++        float3 openColor = SkyColorForDirection(dir) * 0.55 + gAmbientColor.rgb * 0.45;
++        float3 blockedBounce = gAmbientColor.rgb * 0.18;
++        accum += lerp(blockedBounce, openColor, visibility);
++    }
++
++    float3 gi = baseAlbedo * (accum / (float)sampleCount) * max(gGIStrength, 0.0);
++    float indirectLimit = max(gIndirectClamp, 0.0);
++    return min(gi, float3(indirectLimit, indirectLimit, indirectLimit));
++}
++
++)"
++R"(
++float3 ComputeReflection(float3 worldPos, float3 N, float3 V, float3 baseAlbedo, uint2 pixel)
++{
++    if (gReflectionsEnabled == 0 || gReflectionStrength <= 0.0)
++        return 0.0;
++
++    uint sampleCount = clamp(gReflectionSamples, 1u, 4u);
++    float3 R = normalize(reflect(-V, N));
++    float3 tangent, bitangent;
++    BuildOrthonormalBasis(R, tangent, bitangent);
++    float roughness = saturate(gReflectionRoughness);
++    float rand = Hash12((float2)pixel * 1.17 + worldPos.xy + worldPos.zz);
++    float3 accum = 0.0;
++
++    [loop]
++    for (uint i = 0; i < sampleCount; ++i)
++    {
++        float2 xi = Hammersley2D(i, sampleCount, rand);
++        float2 disk = ConcentricSampleDisk(xi) * roughness * 0.55;
++        float3 dir = normalize(R + tangent * disk.x + bitangent * disk.y);
++        float3 origin = worldPos + N * max(gShadowBias * 1.5, 0.03) + dir * max(gShadowBias * 0.25, 0.002);
++        float visibility = TraceShadow(origin, dir, max(gReflectionMaxDistance, 16.0));
++        float3 sceneTint = gAmbientColor.rgb * 0.12 + baseAlbedo * 0.03;
++        accum += lerp(sceneTint, SkyColorForDirection(dir), visibility);
++    }
++
++    float NdotV = saturate(dot(N, V));
++    float metalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.70) * 1.6);
++    float3 F0 = lerp(float3(0.035, 0.035, 0.035), baseAlbedo, metalHint);
++    float3 fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
++    float3 reflection = (accum / (float)sampleCount) * fresnel * max(gReflectionStrength, 0.0);
++    float reflectionLimit = max(gReflectionClamp, 0.0);
++    return min(reflection, float3(reflectionLimit, reflectionLimit, reflectionLimit));
+ }
+ 
+ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float lightIntensity, float atten, float shadow, float3 baseAlbedo)
+@@ -2279,7 +2445,7 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+     if (NdotL <= 0.0 || NdotV <= 0.0)
+         return 0.0;
+ 
+-    float shininess = 48.0;
++    float shininess = clamp(gSpecularPower, 8.0, 192.0);
+     float specPow = pow(NdotH, shininess);
+ 
+     float3 dielectricF0 = float3(0.04, 0.04, 0.04);
+@@ -2292,7 +2458,7 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+     float energyNorm = (shininess + 8.0) * 0.125;
+     float3 spec = fresnel * specPow * energyNorm;
+ 
+-    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec;
++    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec * max(gSpecularStrength, 0.0);
+ }
+ )"
+ R"(
+@@ -2346,7 +2512,8 @@ void RayGen()
+     albedo *= microShadow;
+ 
+     float aoRay = ComputeAmbientOcclusion(worldPos, N, pixel);
+-    float ao    = lerp(1.0, aoRay, 0.70);
++    float ao = lerp(1.0, aoRay, saturate(gAOStrength));
++    float contactAO = ComputeContactAO(worldPos, N, pixel);
+     float skyVis = ComputeSkyVisibility(worldPos, N, pixel);
+ 
+     float upness = saturate(N.z * 0.5 + 0.5);
+@@ -2354,7 +2521,7 @@ void RayGen()
+     float3 skyColor =
+         float3(0.5, 0.5, 0.5) * (0.35 + 0.65 * upness);
+ 
+-    float skyStrength = 1.35 + gAmbientColor.a * 0.65;
++    float skyStrength = (1.35 + gAmbientColor.a * 0.65) * max(gSkyStrength, 0.0);
+ 
+     float3 lightingAccum = gAmbientColor.rgb * gAmbientColor.a;
+     float3 specularAccum = 0.0;
+@@ -2391,13 +2558,13 @@ void RayGen()
+ 
+             const bool fillOnly = (Lgt.pad1 >= GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY);
+             float shadow = 1.0;
+-            if (!fillOnly && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
++            if (gCastShadows != 0 && !fillOnly && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
+             {
+                 shadow = TraceSoftShadow(worldPos, N, Lgt, toLight, dist);
+             }
+ 
+             float directInfluence = atten * NdotLWrap;
+-            if (!fillOnly && directInfluence > strongestDirectWeight)
++            if (gCastShadows != 0 && !fillOnly && directInfluence > strongestDirectWeight)
+             {
+                 strongestDirectWeight = directInfluence;
+                 strongestDirectVisibility = shadow;
+@@ -2422,7 +2589,7 @@ void RayGen()
+             atten = atten * atten * atten * atten;
+ 
+             float shadow = 1.0;
+-            if (atten > 0.0 && centerDist > 0.01)
++            if (gCastShadows != 0 && atten > 0.0 && centerDist > 0.01)
+             {
+                 shadow = RectLightShadow(worldPos, N, Lgt, pixel);
+             }
+@@ -2474,7 +2641,7 @@ void RayGen()
+             rectDiffuseAccum /= (float)sampleCount;
+             rectSpecAccum    /= (float)sampleCount;
+ 
+-            if (atten > strongestDirectWeight)
++            if (gCastShadows != 0 && atten > strongestDirectWeight)
+             {
+                 strongestDirectWeight = atten;
+                 strongestDirectVisibility = shadow;
+@@ -2484,8 +2651,12 @@ void RayGen()
+         }
+     }
+ 
+-    lightingAccum *= ao;
+-    specularAccum *= lerp(1.0, ao, 0.5);
++    float combinedOcclusion = ao * contactAO;
++    lightingAccum *= combinedOcclusion;
++    specularAccum *= lerp(1.0, combinedOcclusion, 0.45);
++
++    float3 giContribution = ComputeGI(worldPos, N, baseAlbedo, pixel) * lerp(1.0, ao, 0.35);
++    float3 reflectionContribution = ComputeReflection(worldPos, N, V, baseAlbedo, pixel);
+ 
+     if (geoFlag == GEOMETRY_FLAG_SKELETAL)
+     {
+@@ -2499,11 +2670,11 @@ void RayGen()
+     }
+     else
+     {
+-        float3 rtLitColor = albedo * lightingAccum + specularAccum;
++        float3 rtLitColor = albedo * lightingAccum + giContribution + specularAccum + reflectionContribution;
+         rtLitColor = max(rtLitColor, baseAlbedo * 0.15);
+ 
+         float legacyKeep = saturate(gLegacyBlend);
+-        float legacyShadowInfluence = saturate(strongestDirectWeight * 1.50);
++        float legacyShadowInfluence = (gCastShadows != 0) ? saturate(strongestDirectWeight * 1.50) : 0.0;
+         float legacyShadow = lerp(
+             1.0,
+             strongestDirectVisibility,
+@@ -2533,6 +2704,30 @@ void RayGen()
+         {
+             finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
+         }
++        else if (gDebugMode == 6)
++        {
++            finalColor = float3(ao, ao, ao);
++        }
++        else if (gDebugMode == 7)
++        {
++            finalColor = float3(contactAO, contactAO, contactAO);
++        }
++        else if (gDebugMode == 8)
++        {
++            finalColor = float3(skyVis, skyVis, skyVis);
++        }
++        else if (gDebugMode == 9)
++        {
++            finalColor = giContribution / (1.0 + giContribution);
++        }
++        else if (gDebugMode == 10)
++        {
++            finalColor = reflectionContribution / (1.0 + reflectionContribution);
++        }
++        else if (gDebugMode == 11)
++        {
++            finalColor = specularAccum / (1.0 + specularAccum);
++        }
+ 
+         gOutputTex[pixel] = float4(finalColor, albedoSample.a);
+     }
+@@ -3229,6 +3424,57 @@ void glRaytracingLightingSetQualityOptions(
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetEffectsOptions(
++	uint32_t castShadows,
++	float aoRadius,
++	float aoStrength,
++	float cavityStrength,
++	uint32_t contactAOEnabled,
++	float contactAORadius,
++	float contactAOStrength,
++	float skyStrength,
++	float skyMaxDistance,
++	uint32_t giEnabled,
++	uint32_t giSamples,
++	float giStrength,
++	float giMaxDistance,
++	uint32_t reflectionsEnabled,
++	uint32_t reflectionSamples,
++	float reflectionStrength,
++	float reflectionMaxDistance,
++	float reflectionRoughness,
++	uint32_t specularEnabled,
++	float specularStrength,
++	float specularPower,
++	float indirectClamp,
++	float reflectionClamp)
++{
++	g_glRaytracingLighting.constants.castShadows = castShadows ? 1u : 0u;
++	g_glRaytracingLighting.constants.aoRadius = glRaytracingClamp(aoRadius, 1.0f, 256.0f);
++	g_glRaytracingLighting.constants.aoStrength = glRaytracingClamp(aoStrength, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.cavityStrength = glRaytracingClamp(cavityStrength, 0.0f, 0.50f);
++	g_glRaytracingLighting.constants.contactAOEnabled = contactAOEnabled ? 1u : 0u;
++	g_glRaytracingLighting.constants.contactAORadius = glRaytracingClamp(contactAORadius, 1.0f, 64.0f);
++	g_glRaytracingLighting.constants.contactAOStrength = glRaytracingClamp(contactAOStrength, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.skyStrength = glRaytracingClamp(skyStrength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.skyMaxDistance = glRaytracingClamp(skyMaxDistance, 64.0f, 65536.0f);
++	g_glRaytracingLighting.constants.giEnabled = giEnabled ? 1u : 0u;
++	g_glRaytracingLighting.constants.giSamples = glRaytracingClamp<uint32_t>(giSamples, 1u, 4u);
++	g_glRaytracingLighting.constants.giStrength = glRaytracingClamp(giStrength, 0.0f, 0.35f);
++	g_glRaytracingLighting.constants.giMaxDistance = glRaytracingClamp(giMaxDistance, 8.0f, 2048.0f);
++	g_glRaytracingLighting.constants.reflectionsEnabled = reflectionsEnabled ? 1u : 0u;
++	g_glRaytracingLighting.constants.reflectionSamples = glRaytracingClamp<uint32_t>(reflectionSamples, 1u, 4u);
++	g_glRaytracingLighting.constants.reflectionStrength = glRaytracingClamp(reflectionStrength, 0.0f, 0.35f);
++	g_glRaytracingLighting.constants.reflectionMaxDistance = glRaytracingClamp(reflectionMaxDistance, 16.0f, 8192.0f);
++	g_glRaytracingLighting.constants.reflectionRoughness = glRaytracingClamp(reflectionRoughness, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.enableSpecular = specularEnabled ? 1u : 0u;
++	g_glRaytracingLighting.constants.specularStrength = glRaytracingClamp(specularStrength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.specularPower = glRaytracingClamp(specularPower, 8.0f, 192.0f);
++	g_glRaytracingLighting.constants.indirectClamp = glRaytracingClamp(indirectClamp, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.reflectionClamp = glRaytracingClamp(reflectionClamp, 0.0f, 2.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ {
+ 	if (glRaytracingShouldAbortWork())
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index b17240e..af31ec3 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1724,6 +1724,30 @@ void                       glRaytracingLightingSetQualityOptions(
+ 	float shadowMinVisibility,
+ 	uint32_t contactShadows,
+ 	float contactShadowLength);
++void                       glRaytracingLightingSetEffectsOptions(
++	uint32_t castShadows,
++	float aoRadius,
++	float aoStrength,
++	float cavityStrength,
++	uint32_t contactAOEnabled,
++	float contactAORadius,
++	float contactAOStrength,
++	float skyStrength,
++	float skyMaxDistance,
++	uint32_t giEnabled,
++	uint32_t giSamples,
++	float giStrength,
++	float giMaxDistance,
++	uint32_t reflectionsEnabled,
++	uint32_t reflectionSamples,
++	float reflectionStrength,
++	float reflectionMaxDistance,
++	float reflectionRoughness,
++	uint32_t specularEnabled,
++	float specularStrength,
++	float specularPower,
++	float indirectClamp,
++	float reflectionClamp);
+ 
+ bool                       glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass);
+ 
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index ab8a8a7..d6707c9 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1245,6 +1245,31 @@ static void RB_RunRaytracedLightingPass(void)
+ 		r_dxrContactShadows ? (uint32_t)r_dxrContactShadows->integer : 0u,
+ 		r_dxrContactShadowLength ? r_dxrContactShadowLength->value : 96.0f);
+ 
++	glRaytracingLightingSetEffectsOptions(
++		r_dxrCastShadows ? (uint32_t)r_dxrCastShadows->integer : 0u,
++		r_dxrAORadius ? r_dxrAORadius->value : 24.0f,
++		r_dxrAOStrength ? r_dxrAOStrength->value : 0.70f,
++		r_dxrCavityStrength ? r_dxrCavityStrength->value : 0.10f,
++		r_dxrContactAO ? (uint32_t)r_dxrContactAO->integer : 0u,
++		r_dxrContactAORadius ? r_dxrContactAORadius->value : 8.0f,
++		r_dxrContactAOStrength ? r_dxrContactAOStrength->value : 0.30f,
++		r_dxrSkyStrength ? r_dxrSkyStrength->value : 1.0f,
++		r_dxrSkyMaxDistance ? r_dxrSkyMaxDistance->value : 4096.0f,
++		r_dxrGI ? (uint32_t)r_dxrGI->integer : 0u,
++		r_dxrGISamples ? (uint32_t)r_dxrGISamples->integer : 1u,
++		r_dxrGIStrength ? r_dxrGIStrength->value : 0.05f,
++		r_dxrGIMaxDistance ? r_dxrGIMaxDistance->value : 160.0f,
++		r_dxrReflections ? (uint32_t)r_dxrReflections->integer : 0u,
++		r_dxrReflectionSamples ? (uint32_t)r_dxrReflectionSamples->integer : 1u,
++		r_dxrReflectionStrength ? r_dxrReflectionStrength->value : 0.055f,
++		r_dxrReflectionMaxDistance ? r_dxrReflectionMaxDistance->value : 640.0f,
++		r_dxrReflectionRoughness ? r_dxrReflectionRoughness->value : 0.45f,
++		r_dxrSpecular ? (uint32_t)r_dxrSpecular->integer : 1u,
++		r_dxrSpecularStrength ? r_dxrSpecularStrength->value : 0.75f,
++		r_dxrSpecularPower ? r_dxrSpecularPower->value : 56.0f,
++		r_dxrIndirectClamp ? r_dxrIndirectClamp->value : 0.30f,
++		r_dxrReflectionClamp ? r_dxrReflectionClamp->value : 0.22f);
++
+ 	if (r_dxrShadowBias)
+ 	{
+ 		glRaytracingLightingSetShadowBias(r_dxrShadowBias->value);
+@@ -1295,17 +1320,28 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.2 Effects L3-L6 Safe: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d shadows=%d samples=%d/%d ao=%d/%.2f sky=%d/%.2f gi=%d/%d/%.3f refl=%d/%d/%.3f spec=%d/%.2f fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+ 				glRaytracingLightingGetSelectedLightCount(),
+ 				r_dxrAsyncSubmit ? r_dxrAsyncSubmit->integer : 0,
+ 				r_dxrCpuSync ? r_dxrCpuSync->integer : 1,
++				r_dxrCastShadows ? r_dxrCastShadows->integer : 0,
+ 				r_dxrShadowSamples ? r_dxrShadowSamples->integer : 1,
+ 				r_dxrRectShadowSamples ? r_dxrRectShadowSamples->integer : 1,
+ 				r_dxrAOSamples ? r_dxrAOSamples->integer : 0,
++				r_dxrAOStrength ? r_dxrAOStrength->value : 0.0f,
+ 				r_dxrSkySamples ? r_dxrSkySamples->integer : 0,
++				r_dxrSkyStrength ? r_dxrSkyStrength->value : 0.0f,
++				r_dxrGI ? r_dxrGI->integer : 0,
++				r_dxrGISamples ? r_dxrGISamples->integer : 0,
++				r_dxrGIStrength ? r_dxrGIStrength->value : 0.0f,
++				r_dxrReflections ? r_dxrReflections->integer : 0,
++				r_dxrReflectionSamples ? r_dxrReflectionSamples->integer : 0,
++				r_dxrReflectionStrength ? r_dxrReflectionStrength->value : 0.0f,
++				r_dxrSpecular ? r_dxrSpecular->integer : 0,
++				r_dxrSpecularStrength ? r_dxrSpecularStrength->value : 0.0f,
+ 				r_dxrFallbackLight ? r_dxrFallbackLight->integer : 0,
+ 				r_dxrFallbackCastsShadows ? r_dxrFallbackCastsShadows->integer : 0,
+ 				r_dxrFallbackLightRadius ? r_dxrFallbackLightRadius->value : 0.0f,
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 8258b2d..5f07174 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -102,6 +102,29 @@ cvar_t  *r_dxrShadowMinVisibility;
+ cvar_t  *r_dxrContactShadows;
+ cvar_t  *r_dxrContactShadowLength;
+ cvar_t  *r_dxrAlphaShadowGeometry;
++cvar_t  *r_dxrCastShadows;
++cvar_t  *r_dxrAORadius;
++cvar_t  *r_dxrAOStrength;
++cvar_t  *r_dxrCavityStrength;
++cvar_t  *r_dxrContactAO;
++cvar_t  *r_dxrContactAORadius;
++cvar_t  *r_dxrContactAOStrength;
++cvar_t  *r_dxrSkyStrength;
++cvar_t  *r_dxrSkyMaxDistance;
++cvar_t  *r_dxrGI;
++cvar_t  *r_dxrGISamples;
++cvar_t  *r_dxrGIStrength;
++cvar_t  *r_dxrGIMaxDistance;
++cvar_t  *r_dxrReflections;
++cvar_t  *r_dxrReflectionSamples;
++cvar_t  *r_dxrReflectionStrength;
++cvar_t  *r_dxrReflectionMaxDistance;
++cvar_t  *r_dxrReflectionRoughness;
++cvar_t  *r_dxrSpecular;
++cvar_t  *r_dxrSpecularStrength;
++cvar_t  *r_dxrSpecularPower;
++cvar_t  *r_dxrIndirectClamp;
++cvar_t  *r_dxrReflectionClamp;
+ 
+ cvar_t  *r_waterFogColor;   //----(SA)	added
+ cvar_t  *r_mapFogColor;
+@@ -1040,6 +1063,31 @@ void R_Register( void ) {
+ 	r_dxrContactShadows = ri.Cvar_Get( "r_dxrContactShadows", "0", CVAR_ARCHIVE );
+ 	r_dxrContactShadowLength = ri.Cvar_Get( "r_dxrContactShadowLength", "96", CVAR_ARCHIVE );
+ 	r_dxrAlphaShadowGeometry = ri.Cvar_Get( "r_dxrAlphaShadowGeometry", "0", CVAR_ARCHIVE );
++	// Effects-only branch: all additions use the proven v2.2 descriptor/root-signature path.
++	// Cast shadows are deliberately disabled by default; AO/sky/GI/reflections are opt-in.
++	r_dxrCastShadows = ri.Cvar_Get( "r_dxrCastShadows", "0", CVAR_ARCHIVE );
++	r_dxrAORadius = ri.Cvar_Get( "r_dxrAORadius", "24", CVAR_ARCHIVE );
++	r_dxrAOStrength = ri.Cvar_Get( "r_dxrAOStrength", "0.70", CVAR_ARCHIVE );
++	r_dxrCavityStrength = ri.Cvar_Get( "r_dxrCavityStrength", "0.10", CVAR_ARCHIVE );
++	r_dxrContactAO = ri.Cvar_Get( "r_dxrContactAO", "0", CVAR_ARCHIVE );
++	r_dxrContactAORadius = ri.Cvar_Get( "r_dxrContactAORadius", "8", CVAR_ARCHIVE );
++	r_dxrContactAOStrength = ri.Cvar_Get( "r_dxrContactAOStrength", "0.30", CVAR_ARCHIVE );
++	r_dxrSkyStrength = ri.Cvar_Get( "r_dxrSkyStrength", "1.0", CVAR_ARCHIVE );
++	r_dxrSkyMaxDistance = ri.Cvar_Get( "r_dxrSkyMaxDistance", "4096", CVAR_ARCHIVE );
++	r_dxrGI = ri.Cvar_Get( "r_dxrGI", "0", CVAR_ARCHIVE );
++	r_dxrGISamples = ri.Cvar_Get( "r_dxrGISamples", "1", CVAR_ARCHIVE );
++	r_dxrGIStrength = ri.Cvar_Get( "r_dxrGIStrength", "0.05", CVAR_ARCHIVE );
++	r_dxrGIMaxDistance = ri.Cvar_Get( "r_dxrGIMaxDistance", "160", CVAR_ARCHIVE );
++	r_dxrReflections = ri.Cvar_Get( "r_dxrReflections", "0", CVAR_ARCHIVE );
++	r_dxrReflectionSamples = ri.Cvar_Get( "r_dxrReflectionSamples", "1", CVAR_ARCHIVE );
++	r_dxrReflectionStrength = ri.Cvar_Get( "r_dxrReflectionStrength", "0.055", CVAR_ARCHIVE );
++	r_dxrReflectionMaxDistance = ri.Cvar_Get( "r_dxrReflectionMaxDistance", "640", CVAR_ARCHIVE );
++	r_dxrReflectionRoughness = ri.Cvar_Get( "r_dxrReflectionRoughness", "0.45", CVAR_ARCHIVE );
++	r_dxrSpecular = ri.Cvar_Get( "r_dxrSpecular", "1", CVAR_ARCHIVE );
++	r_dxrSpecularStrength = ri.Cvar_Get( "r_dxrSpecularStrength", "0.75", CVAR_ARCHIVE );
++	r_dxrSpecularPower = ri.Cvar_Get( "r_dxrSpecularPower", "56", CVAR_ARCHIVE );
++	r_dxrIndirectClamp = ri.Cvar_Get( "r_dxrIndirectClamp", "0.30", CVAR_ARCHIVE );
++	r_dxrReflectionClamp = ri.Cvar_Get( "r_dxrReflectionClamp", "0.22", CVAR_ARCHIVE );
+ 	r_finish = ri.Cvar_Get( "r_finish", "0", CVAR_ARCHIVE );
+ 	r_textureMode = ri.Cvar_Get( "r_textureMode", "GL_LINEAR_MIPMAP_NEAREST", CVAR_ARCHIVE );
+ 	r_swapInterval = ri.Cvar_Get( "r_swapInterval", "0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 0ae7354..f0ba1e9 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1160,6 +1160,29 @@ extern cvar_t   *r_dxrShadowMinVisibility;
+ extern cvar_t   *r_dxrContactShadows;
+ extern cvar_t   *r_dxrContactShadowLength;
+ extern cvar_t   *r_dxrAlphaShadowGeometry;
++extern cvar_t   *r_dxrCastShadows;      // effects-only branch: skip all direct shadow rays when zero
++extern cvar_t   *r_dxrAORadius;
++extern cvar_t   *r_dxrAOStrength;
++extern cvar_t   *r_dxrCavityStrength;
++extern cvar_t   *r_dxrContactAO;
++extern cvar_t   *r_dxrContactAORadius;
++extern cvar_t   *r_dxrContactAOStrength;
++extern cvar_t   *r_dxrSkyStrength;
++extern cvar_t   *r_dxrSkyMaxDistance;
++extern cvar_t   *r_dxrGI;
++extern cvar_t   *r_dxrGISamples;
++extern cvar_t   *r_dxrGIStrength;
++extern cvar_t   *r_dxrGIMaxDistance;
++extern cvar_t   *r_dxrReflections;
++extern cvar_t   *r_dxrReflectionSamples;
++extern cvar_t   *r_dxrReflectionStrength;
++extern cvar_t   *r_dxrReflectionMaxDistance;
++extern cvar_t   *r_dxrReflectionRoughness;
++extern cvar_t   *r_dxrSpecular;
++extern cvar_t   *r_dxrSpecularStrength;
++extern cvar_t   *r_dxrSpecularPower;
++extern cvar_t   *r_dxrIndirectClamp;
++extern cvar_t   *r_dxrReflectionClamp;
+ 
+ extern cvar_t  *r_norefresh;            // bypasses the ref rendering
+ extern cvar_t  *r_drawentities;         // disable/enable entity rendering

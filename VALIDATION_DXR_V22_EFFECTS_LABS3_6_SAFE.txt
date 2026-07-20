@@ -1,0 +1,36 @@
+DarkWolf RTCW DXR v2.2 Effects Labs 3-6 Safe - validation
+================================================================
+
+BASE
+- User-supplied stable v2.2 repository snapshot used.
+- Applied patch chain: 10 -> 20 -> 30.
+- Patch 70 generated only against that exact v2.2 result.
+
+PASSED
+- git apply --check --whitespace=error-all for patch 70.
+- git apply patch 70 to a clean v2.2 worktree.
+- git apply --reverse --check for patch 70.
+- git diff --check after application.
+- Byte-for-byte comparison of all five changed source files.
+- C++ constant structure size independently checked: 352 bytes.
+- Existing constant-buffer allocation remains aligned by glRaytracingAlignUp(..., 256).
+- Existing descriptor heap remains 7 descriptors.
+- Existing root table remains 6 SRV + 1 UAV.
+- No temporal-history textures, history UAVs, velocity history, or ping-pong resources added.
+- No hybrid BLAS or BLAS/TLAS update-path changes added.
+- No async/fence/order changes added.
+- Embedded HLSL raw-literal chunk maximum: 13673 bytes.
+- Embedded HLSL brace/parenthesis balance checked.
+- Workflow YAML parsed successfully.
+- All CFG references in build script resolve to packaged files.
+- Workflow applies only patches 10, 20, 30 and 70.
+- Upgrade and Full Kit ZIP contents checked.
+
+NOT PERFORMED
+- MSVC compilation on Windows.
+- DXC compilation of embedded HLSL.
+- Runtime GPU test.
+
+The package is therefore a release candidate. Its architectural risk is much
+lower than QL3/QL3.1 because it preserves the proven v2.2 resource/binding path,
+but only GitHub Actions and the user's GPU can confirm compilation/runtime.
