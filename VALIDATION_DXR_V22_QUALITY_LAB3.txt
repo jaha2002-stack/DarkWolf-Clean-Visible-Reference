@@ -1,0 +1,52 @@
+DarkWolf RTCW DXR v2.2 Quality Lab 3 - Static Validation
+========================================================
+
+Base stable commit:
+  229cd5d93b4c24ba705c9821a871cccf31b34b96
+
+Validated patch chain:
+  10 -> 20 -> 30 -> 40 -> 50 -> 60
+
+Checks completed:
+  PASS  git apply --check for patch 60 over exact QL2 source
+  PASS  git apply --reverse --check for patch 60
+  PASS  git diff --check
+  PASS  full patch chain from supplied stable source ZIP
+  PASS  byte comparison of all 8 patched source files
+  PASS  expected QL2 Git blob hashes in apply script
+  PASS  C++/HLSL constant-buffer marker and 320-byte C++ layout
+  PASS  10 SRV + 2 UAV descriptor/root-table layout
+  PASS  embedded HLSL split into 6 literals, each below 8000 bytes
+  PASS  temporal history ping-pong resource/binding markers
+  PASS  velocity/previous position/previous normal pass bindings
+  PASS  all QL3 CFG exec dependencies
+  PASS  all 12 QL3 CFG files have matching BAT launchers
+  PASS  workflow YAML parse and referenced script paths
+  PASS  Upgrade/Full Kit content checks before and after packaging
+
+Expected QL2 blobs before patch 60:
+  eaf7b9ae5d952d0596a1ea2b502b4bab805a94dd  src/opengl/gl_d3d12raylight.cpp
+  c1883ead4fe7bd840f26d1fa96cce0a12ae77142  src/opengl/gl_d3d12shim.cpp
+  4bd993568149b86b8a02e5c6d48e36e1d16aaefe  src/opengl/opengl.h
+  e1e5ebf39ff0e5dca0658719686868a87b0a697d  src/renderer/tr_backend.cpp
+  28d6a4462df60bcaa9181a268be1491ff55b35b5  src/renderer/tr_cmesh.cpp
+  90039d1a2159504078a8421646e466778b3dbd70  src/renderer/tr_init.cpp
+  7c925803f3739cb1ca9723796b581b44beab4bda  src/renderer/tr_local.h
+  d47ecaf1c4eba9e5399343e2c1e74b4b2cf3fda7  src/renderer/tr_mesh.cpp
+
+Resulting QL3 blobs:
+  02fed812b77a58d8723efa21c6a0694ded1c88f5  src/opengl/gl_d3d12raylight.cpp
+  2061fd912aee3925caad8324b9c328bc2256fb12  src/opengl/gl_d3d12shim.cpp
+  b16d55c1cec19f96ea3bf90f997d5ca55f1b27b7  src/opengl/opengl.h
+  2ae500d717f9096f55ec12c821d2a37df1debab2  src/renderer/tr_backend.cpp
+  352c0ef15f5a93f810878a6c339259f33545a07d  src/renderer/tr_cmesh.cpp
+  6b42cf4f984d5acd2214c8d0aef5a5ea7ca235df  src/renderer/tr_init.cpp
+  739d249bfcb3625492fe2bfc81a89f0584f3e76f  src/renderer/tr_local.h
+  61ca830114ca2a2bbfaf0745b005547d6791cb61  src/renderer/tr_mesh.cpp
+
+Not available in the preparation environment:
+  - Microsoft MSVC/Windows SDK compilation
+  - DXC compilation and DXIL validation
+  - DXR GPU runtime testing
+
+Therefore QL3 remains a release candidate until GitHub Actions and hardware testing.
