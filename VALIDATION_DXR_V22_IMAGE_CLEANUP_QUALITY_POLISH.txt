@@ -1,0 +1,15 @@
+Validation notes:
+- Base overlay: Effects Labs 3-6 Safe
+- New patch: 71-dxr-v2.2-image-cleanup-quality-polish.patch
+- New workflow: .github/workflows/darkwolf-dxr-v2.2-image-cleanup-quality-polish.yml
+- New build script: scripts/build-windows-v2.2-image-cleanup-quality-polish.ps1
+- New apply script: scripts/apply-dxr-v2.2-image-cleanup-quality-polish.ps1
+- New runtime presets:
+  * dxr_v22_cleanup_soft.cfg
+  * dxr_v22_cleanup_balanced.cfg
+  * dxr_v22_cleanup_quality.cfg
+  * dxr_v22_cleanup_maxclean.cfg
+  * dxr_v22_cleanup_no_gi.cfg
+  * dxr_v22_cleanup_no_reflections.cfg
+  * dxr_v22_cleanup_debug_gi.cfg
+  * dxr_v22_cleanup_debug_reflections.cfg
