@@ -136,6 +136,7 @@ try {
         'dxr_v22_fx_l4_ao.cfg',
         'dxr_v22_fx_l5_sky.cfg',
         'dxr_v22_fx_l6_indirect.cfg',
+        'dxr_v22_cleanup_safe_start.cfg',
         'dxr_v22_cleanup_soft.cfg',
         'dxr_v22_cleanup_balanced.cfg',
         'dxr_v22_cleanup_quality.cfg',
@@ -154,6 +155,7 @@ try {
     }
 
     $launchers = [ordered]@{
+        'RUN_DXR_V22_CLEANUP_SAFE_START.bat'        = 'dxr_v22_cleanup_safe_start.cfg'
         'RUN_DXR_V22_CLEANUP_SOFT.bat'              = 'dxr_v22_cleanup_soft.cfg'
         'RUN_DXR_V22_CLEANUP_BALANCED.bat'          = 'dxr_v22_cleanup_balanced.cfg'
         'RUN_DXR_V22_CLEANUP_QUALITY.bat'           = 'dxr_v22_cleanup_quality.cfg'
@@ -199,6 +201,9 @@ It does NOT add temporal history, new UAV ping-pong buffers, hybrid BLAS,
 or a new D3D12 resource model. Stability remains aligned with the v2.2 safe path.
 
 Recommended first run:
+  RUN_DXR_V22_CLEANUP_SAFE_START.bat
+
+Then:
   RUN_DXR_V22_CLEANUP_BALANCED.bat
 
 If you still see grain / stripes:

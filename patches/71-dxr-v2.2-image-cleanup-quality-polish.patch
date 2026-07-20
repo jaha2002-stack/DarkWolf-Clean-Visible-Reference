@@ -1,129 +1,106 @@
 diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
-index b58b548..58224b2 100644
+index b58b548..941c60f 100644
 --- a/src/opengl/gl_d3d12raylight.cpp
 +++ b/src/opengl/gl_d3d12raylight.cpp
-@@ -2205,8 +2205,9 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
+@@ -2008,6 +2008,14 @@ float2 Hammersley2D(uint i, uint N, float rand)
+     return float2(e1, e2);
+ }
+ 
++float2 DecorrelateSample2D(float2 xi, float seed)
++{
++    // Cranley-Patterson rotation of both dimensions. The old Hammersley helper
++    // shifted only X, which left stable Y-aligned bands at very low sample counts.
++    float2 shift = float2(seed, frac(seed * 0.7548776662466927 + 0.5698402909980532));
++    return frac(xi + shift);
++}
++
+ float2 ConcentricSampleDisk(float2 u)
+ {
+     float2 uOffset = 2.0 * u - 1.0;
+@@ -2205,7 +2213,7 @@ float ComputeAmbientOcclusion(float3 worldPos, float3 N, uint2 pixel)
      [loop]
      for (uint i = 0; i < sampleCount; ++i)
      {
 -        float2 xi = Hammersley2D(i, sampleCount, rand);
--        float3 h  = CosineSampleHemisphere(xi);
-+        float2 xi = Hammersley2D(i, sampleCount, frac(rand + (float)i * 0.41421356));
-+        float rotation = (rand + (float)i * 0.61803399) * 6.2831853;
-+        float3 h  = StableCosineHemisphereSample(xi, rotation);
++        float2 xi = DecorrelateSample2D(Hammersley2D(i, sampleCount, 0.0), rand);
+         float3 h  = CosineSampleHemisphere(xi);
  
          float3 aoDir =
-             tangent   * h.x +
-@@ -2245,8 +2246,9 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
+@@ -2245,7 +2253,7 @@ float ComputeSkyVisibility(float3 worldPos, float3 N, uint2 pixel)
      [loop]
      for (uint i = 0; i < sampleCount; ++i)
      {
 -        float2 xi = Hammersley2D(i, sampleCount, rand);
--        float3 h  = CosineSampleHemisphere(xi);
-+        float2 xi = Hammersley2D(i, sampleCount, frac(rand + (float)i * 0.73205081));
-+        float rotation = (rand + (float)i * 0.38196601) * 6.2831853;
-+        float3 h  = StableCosineHemisphereSample(xi, rotation);
++        float2 xi = DecorrelateSample2D(Hammersley2D(i, sampleCount, 0.0), rand);
+         float3 h  = CosineSampleHemisphere(xi);
  
          float3 skyDir =
-             tangent   * h.x +
-@@ -2340,8 +2342,9 @@ float ComputeContactAO(float3 worldPos, float3 N, uint2 pixel)
+@@ -2340,7 +2348,7 @@ float ComputeContactAO(float3 worldPos, float3 N, uint2 pixel)
      [unroll]
      for (uint i = 0; i < sampleCount; ++i)
      {
 -        float2 xi = Hammersley2D(i, sampleCount, rand);
--        float3 h = CosineSampleHemisphere(xi);
-+        float2 xi = Hammersley2D(i, sampleCount, frac(rand + (float)i * 0.57721566));
-+        float rotation = (rand + (float)i * 0.86602540) * 6.2831853;
-+        float3 h = StableCosineHemisphereSample(xi, rotation);
++        float2 xi = DecorrelateSample2D(Hammersley2D(i, sampleCount, 0.0), rand);
+         float3 h = CosineSampleHemisphere(xi);
          // Bias toward grazing/local directions so this behaves as grounding,
          // not as another long-range cast-shadow system.
-         h.z = lerp(0.20, 0.75, h.z);
-@@ -2365,6 +2368,20 @@ float3 SkyColorForDirection(float3 dir)
-     return sky;
- }
- 
-+float2 Rotate2D(float2 v, float angle)
-+{
-+    float s = sin(angle);
-+    float c = cos(angle);
-+    return float2(v.x * c - v.y * s, v.x * s + v.y * c);
-+}
-+
-+float3 StableCosineHemisphereSample(float2 xi, float angle)
-+{
-+    float2 disk = Rotate2D(ConcentricSampleDisk(xi), angle);
-+    float z = sqrt(saturate(1.0 - dot(disk, disk)));
-+    return float3(disk.x, disk.y, z);
-+}
-+
- float3 ComputeGI(float3 worldPos, float3 N, float3 baseAlbedo, uint2 pixel)
- {
-     if (gGIEnabled == 0 || gGIStrength <= 0.0)
-@@ -2379,17 +2396,21 @@ float3 ComputeGI(float3 worldPos, float3 N, float3 baseAlbedo, uint2 pixel)
+@@ -2379,14 +2387,15 @@ float3 ComputeGI(float3 worldPos, float3 N, float3 baseAlbedo, uint2 pixel)
      [loop]
      for (uint i = 0; i < sampleCount; ++i)
      {
 -        float2 xi = Hammersley2D(i, sampleCount, rand);
--        float3 h = CosineSampleHemisphere(xi);
-+        float2 xi = Hammersley2D(i, sampleCount, frac(rand + (float)i * 0.41421356));
-+        float rotation = (rand + (float)i * 0.61803399) * 6.2831853;
-+        float3 h = StableCosineHemisphereSample(xi, rotation);
++        float2 xi = DecorrelateSample2D(Hammersley2D(i, sampleCount, 0.0), rand);
+         float3 h = CosineSampleHemisphere(xi);
          float3 dir = normalize(tangent * h.x + bitangent * h.y + N * h.z);
          float3 origin = worldPos + N * max(gShadowBias * 1.5, 0.03);
          float visibility = TraceShadow(origin, dir, max(gGIMaxDistance, 8.0));
 -        float3 openColor = SkyColorForDirection(dir) * 0.55 + gAmbientColor.rgb * 0.45;
 -        float3 blockedBounce = gAmbientColor.rgb * 0.18;
 -        accum += lerp(blockedBounce, openColor, visibility);
-+        float visSoft = smoothstep(0.08, 0.92, visibility);
-+        float horizon = saturate(dir.z * 0.5 + 0.5);
-+        float3 openColor = SkyColorForDirection(dir) * lerp(0.48, 0.58, horizon) + gAmbientColor.rgb * lerp(0.52, 0.42, horizon);
-+        float3 blockedBounce = gAmbientColor.rgb * 0.16;
-+        accum += lerp(blockedBounce, openColor, visSoft);
++        float visibilitySoft = smoothstep(0.10, 0.90, visibility);
++        float3 openColor = SkyColorForDirection(dir) * 0.52 + gAmbientColor.rgb * 0.48;
++        float3 blockedBounce = gAmbientColor.rgb * 0.17;
++        accum += lerp(blockedBounce, openColor, visibilitySoft);
      }
  
      float3 gi = baseAlbedo * (accum / (float)sampleCount) * max(gGIStrength, 0.0);
-+    gi *= 0.96;
-     float indirectLimit = max(gIndirectClamp, 0.0);
-     return min(gi, float3(indirectLimit, indirectLimit, indirectLimit));
- }
-@@ -2412,12 +2433,13 @@ float3 ComputeReflection(float3 worldPos, float3 N, float3 V, float3 baseAlbedo,
+@@ -2412,20 +2421,23 @@ float3 ComputeReflection(float3 worldPos, float3 N, float3 V, float3 baseAlbedo,
      [loop]
      for (uint i = 0; i < sampleCount; ++i)
      {
 -        float2 xi = Hammersley2D(i, sampleCount, rand);
 -        float2 disk = ConcentricSampleDisk(xi) * roughness * 0.55;
-+        float2 xi = Hammersley2D(i, sampleCount, frac(rand + (float)i * 0.31830989));
-+        float rotation = (rand + (float)i * 0.75487767) * 6.2831853;
-+        float2 disk = Rotate2D(ConcentricSampleDisk(xi), rotation) * roughness * 0.42;
++        float2 xi = DecorrelateSample2D(Hammersley2D(i, sampleCount, 0.0), rand);
++        float2 disk = ConcentricSampleDisk(xi) * roughness * 0.46;
          float3 dir = normalize(R + tangent * disk.x + bitangent * disk.y);
          float3 origin = worldPos + N * max(gShadowBias * 1.5, 0.03) + dir * max(gShadowBias * 0.25, 0.002);
--        float visibility = TraceShadow(origin, dir, max(gReflectionMaxDistance, 16.0));
+         float visibility = TraceShadow(origin, dir, max(gReflectionMaxDistance, 16.0));
 -        float3 sceneTint = gAmbientColor.rgb * 0.12 + baseAlbedo * 0.03;
-+        float visibility = smoothstep(0.05, 0.95, TraceShadow(origin, dir, max(gReflectionMaxDistance, 16.0)));
-+        float3 sceneTint = gAmbientColor.rgb * 0.10 + baseAlbedo * 0.02;
-         accum += lerp(sceneTint, SkyColorForDirection(dir), visibility);
+-        accum += lerp(sceneTint, SkyColorForDirection(dir), visibility);
++        float visibilitySoft = smoothstep(0.10, 0.90, visibility);
++        float3 sceneTint = gAmbientColor.rgb * 0.11 + baseAlbedo * 0.025;
++        accum += lerp(sceneTint, SkyColorForDirection(dir), visibilitySoft);
      }
  
-@@ -2425,7 +2447,9 @@ float3 ComputeReflection(float3 worldPos, float3 N, float3 V, float3 baseAlbedo,
+     float NdotV = saturate(dot(N, V));
      float metalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.70) * 1.6);
      float3 F0 = lerp(float3(0.035, 0.035, 0.035), baseAlbedo, metalHint);
      float3 fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
 -    float3 reflection = (accum / (float)sampleCount) * fresnel * max(gReflectionStrength, 0.0);
-+    float grazingSuppression = lerp(0.72, 1.0, NdotV);
-+    float roughnessSuppression = lerp(1.0, 0.78, roughness);
-+    float3 reflection = (accum / (float)sampleCount) * fresnel * max(gReflectionStrength, 0.0) * grazingSuppression * roughnessSuppression;
++    float grazingStability = lerp(0.72, 1.0, NdotV);
++    float roughnessStability = lerp(1.0, 0.82, roughness);
++    float3 reflection = (accum / (float)sampleCount) * fresnel * max(gReflectionStrength, 0.0) * grazingStability * roughnessStability;
      float reflectionLimit = max(gReflectionClamp, 0.0);
      return min(reflection, float3(reflectionLimit, reflectionLimit, reflectionLimit));
  }
-@@ -2457,8 +2481,10 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+@@ -2457,8 +2469,9 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
  
      float energyNorm = (shininess + 8.0) * 0.125;
      float3 spec = fresnel * specPow * energyNorm;
-+    float glintSuppression = saturate((NdotL * NdotV) * 4.0);
-+    float antiAlias = lerp(0.85, 1.0, saturate(1.0 - shininess / 192.0));
++    float antiGlint = saturate((NdotL * NdotV) * 4.0);
  
 -    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec * max(gSpecularStrength, 0.0);
-+    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec * max(gSpecularStrength, 0.0) * glintSuppression * antiAlias;
++    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec * max(gSpecularStrength, 0.0) * antiGlint;
  }
  )"
  R"(

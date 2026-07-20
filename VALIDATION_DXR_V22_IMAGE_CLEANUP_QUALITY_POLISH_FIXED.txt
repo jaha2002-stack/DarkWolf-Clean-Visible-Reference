@@ -1,0 +1,20 @@
+DarkWolf RTCW DXR v2.2 Image Cleanup / Quality Polish - corrected patch 71
+
+Validated:
+- Original patch 71 reviewed in full.
+- Root source defect found: StableCosineHemisphereSample was called before declaration in embedded HLSL.
+- Corrected patch applies to exact patch-70 result with git apply --check --whitespace=error-all.
+- Reverse application check passed.
+- Corrected helper DecorrelateSample2D is declared before every use.
+- Rotate2D and StableCosineHemisphereSample are absent from corrected HLSL.
+- Embedded HLSL delimiter counts match.
+- Workflow YAML parses successfully.
+- Exactly one workflow exists in the corrected Overlay.
+- Every CFG referenced by the build script exists.
+- SAFE_START, SOFT, BALANCED, QUALITY, MAXCLEAN and A/B profiles are packaged.
+- No temporal history resources, extra UAV ping-pong resources, hybrid BLAS, or descriptor-layout changes are introduced by corrected patch 71.
+
+Not validated in this environment:
+- Windows DXC runtime compile using the exact packaged dxcompiler.dll.
+- MSVC build in GitHub Actions.
+- GPU runtime on the user's hardware.

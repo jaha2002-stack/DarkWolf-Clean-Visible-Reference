@@ -1,68 +1,60 @@
-# DarkWolf RTCW DXR v2.2 — Image Cleanup / Quality Polish Fix
+# DarkWolf RTCW DXR v2.2 — Image Cleanup / Quality Polish Fix (исправленный patch 71)
 
-Это безопасный фикс поверх уже проверенной цепочки:
+Этот комплект заменяет ошибочный первый вариант patch 71.
 
-- patch 10 — Clean Visible Reference Rebase
-- patch 20 — Stable Clear v2.1
-- patch 30 — Stable Clear v2.2
-- patch 70 — Effects Labs 3-6 Safe
-- patch 71 — Image Cleanup / Quality Polish
+Цепочка сборки:
 
-## Что делает patch 71
+```text
+patch 10 → patch 20 → patch 30 → patch 70 → исправленный patch 71
+```
 
-Фикс специально направлен на визуальную очистку картинки:
+## Что было неверно в первом patch 71
 
-- уменьшает структурное зерно и «рисованные» полосы/линии;
-- делает паттерн семплирования менее регулярным в AO / Sky / Contact AO / GI / Reflections;
-- чуть смягчает отражения, чтобы меньше было полос на полу и стенах;
-- подавляет излишне «искрящийся» specular;
-- добавляет готовые пресеты для аккуратного A/B теста.
+Первый вариант вызывал новую HLSL-функцию `StableCosineHemisphereSample` раньше её объявления. Embedded HLSL компилируется DXC уже при запуске игры, поэтому GitHub Actions мог собрать EXE, но игра закрывалась сразу при DXR initialization.
 
-## Что фикс НЕ делает
+CFG-hotfix не мог это исправить: ошибка находилась в shader source.
 
-Этот фикс **не** добавляет:
+## Что сделано теперь
 
-- temporal accumulation;
-- новые history textures;
-- hybrid BLAS path;
-- новую D3D12 resource model;
-- тяжёлый post-process denoiser.
+- проблемные `Rotate2D` и `StableCosineHemisphereSample` полностью удалены;
+- новый лёгкий `DecorrelateSample2D` объявлен до всех вызовов;
+- pattern AO/Sky/Contact AO/GI/reflections декоррелируется по двум координатам;
+- не используются дополнительные `sin/cos` для каждого ray sample;
+- reflection cone и grazing contribution сделаны спокойнее;
+- GI/reflection shaping стал консервативнее;
+- specular получил простое anti-glint подавление;
+- не добавляются history textures, temporal accumulation, extra UAV или hybrid BLAS.
 
-То есть он остаётся в безопасной архитектуре v2.2 safe chain.
+## Первый запуск
 
-## Рекомендуемый старт
+Сначала обязательно:
 
-Сначала запускай:
+```text
+RUN_DXR_V22_CLEANUP_SAFE_START.bat
+```
 
-- `RUN_DXR_V22_CLEANUP_BALANCED.bat`
+Этот режим оставляет DXR и исправленный shader включёнными, но отключает AO, Sky rays, GI и reflections. Его задача — подтвердить, что embedded HLSL теперь компилируется и DXR запускается.
 
-Если зерно/полоски ещё заметны:
+Затем:
 
-- `RUN_DXR_V22_CLEANUP_MAXCLEAN.bat`
+```text
+RUN_DXR_V22_CLEANUP_SOFT.bat
+RUN_DXR_V22_CLEANUP_BALANCED.bat
+RUN_DXR_V22_CLEANUP_QUALITY.bat
+RUN_DXR_V22_CLEANUP_MAXCLEAN.bat
+```
 
-## Полезные A/B режимы
+Не переходите к следующему режиму, пока предыдущий не запускается стабильно.
 
-- `RUN_DXR_V22_CLEANUP_NO_GI.bat`
-- `RUN_DXR_V22_CLEANUP_NO_REFLECTIONS.bat`
-- `RUN_DXR_V22_CLEANUP_DEBUG_GI.bat`
-- `RUN_DXR_V22_CLEANUP_DEBUG_REFLECTIONS.bat`
+## A/B режимы
 
-## Что сравнивать визуально
+```text
+RUN_DXR_V22_CLEANUP_NO_GI.bat
+RUN_DXR_V22_CLEANUP_NO_REFLECTIONS.bat
+RUN_DXR_V22_CLEANUP_DEBUG_GI.bat
+RUN_DXR_V22_CLEANUP_DEBUG_REFLECTIONS.bat
+```
 
-Смотри в первую очередь на:
+## Ограничение
 
-1. Пол и стены под острым углом камеры.
-2. Тёмные углы и коридоры.
-3. Места, где раньше были горизонтальные/диагональные полоски.
-4. Блики на оружии и мокрых/глянцевых поверхностях.
-5. Насколько «спокойнее» стала картинка при движении.
-
-## Ожидаемый эффект
-
-По идее этот фикс должен дать:
-
-- более чистую картинку;
-- меньше зернистости;
-- меньше полос на отдельных участках пола/стен;
-- более спокойные reflections/specular;
-- минимум риска по стабильности.
+Это не temporal denoiser и не полноценный edge-aware post-process. Исправленный patch 71 уменьшает регулярное зерно/полосы за счёт более правильного low-discrepancy sample pattern и консервативного shaping. Полностью убрать stochastic noise без temporal/spatial accumulation невозможно, но этот вариант не возвращает опасную QL3 history-архитектуру.
