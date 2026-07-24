@@ -1,0 +1,3 @@
+43e7f4e25502ac00c41f71c219b5b4dad4df9119e1f336c5e5630b9966ef315e  ci/exp19_1/payload/patches/271-d3d12-transient-muzzle-light-isolation-exp19_1.patch
+2d4532817e4171d0f209d990e29663c910aa5dcd07197665ae96866175a478ae  ci/exp19_1/payload-sha256.txt
+9b661e20b7c1474bbefef3673bd6e83b0e342b9d5c41087ce60a3d990b75c781  README_FIX_V4_RU.txt

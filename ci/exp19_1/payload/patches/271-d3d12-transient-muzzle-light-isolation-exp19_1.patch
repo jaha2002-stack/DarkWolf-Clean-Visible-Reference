@@ -186,7 +186,7 @@ diff --git a/src/renderer/tr_scene.cpp b/src/renderer/tr_scene.cpp
 index 2d93272..c7d2375 100644
 --- a/src/renderer/tr_scene.cpp
 +++ b/src/renderer/tr_scene.cpp
-@@ -1,3 +1,78 @@
+@@ -248,3 +248,78 @@
 +typedef struct exp191TrackedLight_s
 +{
 +	qboolean used;
@@ -265,7 +265,7 @@ index 2d93272..c7d2375 100644
  void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b, int overdraw ) {
  	dlight_t *dl;
  	if ( !tr.registered ) {
-@@ -12,12 +87,10 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
+@@ -259,12 +334,10 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
  		return;
  	}
  
@@ -278,7 +278,7 @@ index 2d93272..c7d2375 100644
  	if ( !( overdraw & REF_FORCE_DLIGHT ) ) {
  		if ( r_dynamiclight->integer == 0 ) {
  			return;
-@@ -27,66 +100,107 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
+@@ -274,66 +347,107 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
  		}
  	}
  
