@@ -1,0 +1,30 @@
+version: '19.1.{build}'
+
+image: Visual Studio 2022
+clone_depth: 1
+max_jobs: 1
+
+configuration: Release
+platform: x64
+
+environment:
+  APPVEYOR_ARTIFACT_UPLOAD_TIMEOUT: 1800
+
+build_script:
+  - ps: >-
+      pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass
+      -File .\ci\appveyor-exp19_1.ps1
+      -Configuration $env:CONFIGURATION
+
+test: off
+
+after_build:
+  - ps: >-
+      if (Test-Path -LiteralPath .\APPVEYOR_EXP19_1_BUILD.log) {
+        Push-AppveyorArtifact .\APPVEYOR_EXP19_1_BUILD.log -FileName APPVEYOR_EXP19_1_BUILD.log
+      }
+
+artifacts:
+  - path: DarkWolf-D3D12-Game-Dynamic-Lights-Exp19.1-Compact-$(configuration).zip
+    name: DarkWolf-Exp19.1-Compact
+    type: zip
