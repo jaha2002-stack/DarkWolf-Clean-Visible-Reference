@@ -803,21 +803,309 @@ try {
       'src/opengl/gl_d3d12raylight.cpp',
       'src/opengl/opengl.h',
       'src/renderer/tr_init.cpp',
-      'src/renderer/tr_local.h',
-      'src/renderer/tr_scene.cpp'
+      'src/renderer/tr_local.h'
     ) | Sort-Object
     if (($actualPaths -join '|') -ne ($expectedPaths -join '|')) {
       throw "Unexpected Experiment 19.1 patch scope: $($actualPaths -join ', ')"
     }
 
     git apply --ignore-space-change --check $patch
-    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 patch check failed.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 four-file patch check failed.' }
     git apply --ignore-space-change $patch
-    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 patch apply failed.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 four-file patch apply failed.' }
     git apply --reverse --ignore-space-change --check $patch
-    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 reverse-check failed.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Experiment 19.1 four-file patch reverse-check failed.' }
 
-    $scene = Get-Content -LiteralPath 'src/renderer/tr_scene.cpp' -Raw
+    # tr_scene.cpp is transformed from the exact post-Experiment-19 file rather
+    # than relying on a fragile pre-generated hunk. The script then generates an
+    # exact patch from the real source, restores the source, applies that patch,
+    # and reverse-checks it before continuing.
+    $scenePath = 'src/renderer/tr_scene.cpp'
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    $sceneOriginalText = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($scenePath))
+    $sceneLf = $sceneOriginalText.Replace("`r`n", "`n").Replace("`r", "`n")
+
+    $functionMarker = 'void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b, int overdraw ) {'
+    $functionCount = ([regex]::Matches($sceneLf, [regex]::Escape($functionMarker))).Count
+    if ($functionCount -ne 1) {
+      throw "Expected exactly one RE_AddLightToScene function, found $functionCount."
+    }
+    if ($sceneLf.Contains('EXP191_FindTrackedLight') -or $sceneLf.Contains('GAME_DYNAMIC_LIGHTS_EXP19_1')) {
+      throw 'Experiment 19.1 tr_scene transformation appears to be already applied.'
+    }
+    foreach ($requiredExp19Marker in @(
+      'GAME_DYNAMIC_LIGHTS_EXP19: retain the legacy bridge defaults',
+      'static int exp19WindowStart = 0;',
+      'glRaytracingLightingMakePointLight(',
+      'exp19Accepted++'
+    )) {
+      if (-not $sceneLf.Contains($requiredExp19Marker)) {
+        throw "Post-Experiment-19 tr_scene marker is missing: $requiredExp19Marker"
+      }
+    }
+
+    $helperBlock = @'
+typedef struct exp191TrackedLight_s
+{
+	qboolean used;
+	vec3_t origin;
+	vec3_t color;
+	float radius;
+	int firstFrame;
+	int lastFrame;
+	int seenFrames;
+} exp191TrackedLight_t;
+
+static exp191TrackedLight_t s_exp191TrackedLights[256];
+
+static exp191TrackedLight_t *EXP191_FindTrackedLight(
+	const vec3_t org, float radius, float r, float g, float b, qboolean *firstThisFrame )
+{
+	const int frame = tr.frameCount;
+	int freeIndex = -1;
+	int oldestIndex = 0;
+	int oldestFrame = 0x7fffffff;
+	int bestIndex = -1;
+	float bestDistanceSq = 24.0f * 24.0f;
+
+	for ( int i = 0; i < 256; ++i ) {
+		exp191TrackedLight_t *track = &s_exp191TrackedLights[i];
+		if ( !track->used || frame - track->lastFrame > 120 ) {
+			if ( freeIndex < 0 ) freeIndex = i;
+			continue;
+		}
+		if ( track->lastFrame < oldestFrame ) {
+			oldestFrame = track->lastFrame;
+			oldestIndex = i;
+		}
+		const float dx = org[0] - track->origin[0];
+		const float dy = org[1] - track->origin[1];
+		const float dz = org[2] - track->origin[2];
+		const float distanceSq = dx * dx + dy * dy + dz * dz;
+		const float radiusTolerance = ( radius * 0.25f > 24.0f ) ? radius * 0.25f : 24.0f;
+		const float colorDelta = fabsf( r - track->color[0] ) + fabsf( g - track->color[1] ) + fabsf( b - track->color[2] );
+		if ( distanceSq <= bestDistanceSq && fabsf( radius - track->radius ) <= radiusTolerance && colorDelta <= 0.80f ) {
+			bestDistanceSq = distanceSq;
+			bestIndex = i;
+		}
+	}
+
+	if ( bestIndex < 0 ) {
+		bestIndex = ( freeIndex >= 0 ) ? freeIndex : oldestIndex;
+		exp191TrackedLight_t *track = &s_exp191TrackedLights[bestIndex];
+		memset( track, 0, sizeof( *track ) );
+		track->used = qtrue;
+		track->firstFrame = frame;
+		track->lastFrame = frame;
+		track->seenFrames = 1;
+		*firstThisFrame = qtrue;
+	} else {
+		exp191TrackedLight_t *track = &s_exp191TrackedLights[bestIndex];
+		*firstThisFrame = ( track->lastFrame != frame ) ? qtrue : qfalse;
+		if ( frame - track->lastFrame > 3 ) {
+			track->firstFrame = frame;
+			track->seenFrames = 1;
+		} else if ( track->lastFrame != frame ) {
+			track->seenFrames++;
+		}
+		track->lastFrame = frame;
+	}
+
+	exp191TrackedLight_t *result = &s_exp191TrackedLights[bestIndex];
+	VectorCopy( org, result->origin );
+	result->color[0] = r;
+	result->color[1] = g;
+	result->color[2] = b;
+	result->radius = radius;
+	return result;
+}
+'@
+    $helperBlock = $helperBlock.TrimEnd([char[]]"`r`n")
+    $functionIndex = $sceneLf.IndexOf($functionMarker, [StringComparison]::Ordinal)
+    if ($functionIndex -lt 0) { throw 'RE_AddLightToScene insertion point was not found.' }
+    $sceneLf = $sceneLf.Insert($functionIndex, $helperBlock + "`n`n")
+
+    $bridgeStartMarker = '// GAME_DYNAMIC_LIGHTS_EXP19: retain the legacy bridge defaults while'
+    $bridgeStart = $sceneLf.IndexOf($bridgeStartMarker, [StringComparison]::Ordinal)
+    if ($bridgeStart -lt 0) { throw 'Experiment 19 bridge start marker was not found.' }
+    $bridgeEnd = $sceneLf.IndexOf('#if 0', $bridgeStart, [StringComparison]::Ordinal)
+    if ($bridgeEnd -lt 0) { throw 'Experiment 19 bridge end marker was not found.' }
+
+    $newBridgeBlock = @'
+const int bridgeEnabled = r_dxrGameDynamicLights ? r_dxrGameDynamicLights->integer : 1;
+	const int bridgeShadows = r_dxrGameDynamicLightShadows ? r_dxrGameDynamicLightShadows->integer : 1;
+	const int bridgeDebug = r_dxrGameDynamicLightDebug ? r_dxrGameDynamicLightDebug->integer : 0;
+	const int filterMode = r_dxrGameLightFilterMode ? r_dxrGameLightFilterMode->integer : 0;
+	const int transientShadows = r_dxrTransientLightShadows ? r_dxrTransientLightShadows->integer : 0;
+	int transientLifetimeFrames = r_dxrTransientLightLifetimeFrames ? r_dxrTransientLightLifetimeFrames->integer : 10;
+	int transientReservedSlots = r_dxrTransientLightReservedSlots ? r_dxrTransientLightReservedSlots->integer : 2;
+	float bridgeStrength = r_dxrGameDynamicLightStrength ? r_dxrGameDynamicLightStrength->value : 1.0f;
+	float bridgeRadiusScale = r_dxrGameDynamicLightRadiusScale ? r_dxrGameDynamicLightRadiusScale->value : 1.0f;
+	float transientStrength = r_dxrTransientLightStrength ? r_dxrTransientLightStrength->value : 1.0f;
+	float transientRadiusScale = r_dxrTransientLightRadiusScale ? r_dxrTransientLightRadiusScale->value : 1.0f;
+	float transientMaxDistance = r_dxrTransientLightMaxDistance ? r_dxrTransientLightMaxDistance->value : 224.0f;
+	float transientMaxRadius = r_dxrTransientLightMaxRadius ? r_dxrTransientLightMaxRadius->value : 512.0f;
+
+	if ( bridgeStrength < 0.0f ) bridgeStrength = 0.0f;
+	if ( bridgeStrength > 8.0f ) bridgeStrength = 8.0f;
+	if ( bridgeRadiusScale < 0.05f ) bridgeRadiusScale = 0.05f;
+	if ( bridgeRadiusScale > 4.0f ) bridgeRadiusScale = 4.0f;
+	if ( transientStrength < 0.0f ) transientStrength = 0.0f;
+	if ( transientStrength > 12.0f ) transientStrength = 12.0f;
+	if ( transientRadiusScale < 0.05f ) transientRadiusScale = 0.05f;
+	if ( transientRadiusScale > 4.0f ) transientRadiusScale = 4.0f;
+	if ( transientMaxDistance < 32.0f ) transientMaxDistance = 32.0f;
+	if ( transientMaxDistance > 1024.0f ) transientMaxDistance = 1024.0f;
+	if ( transientMaxRadius < 32.0f ) transientMaxRadius = 32.0f;
+	if ( transientMaxRadius > 2048.0f ) transientMaxRadius = 2048.0f;
+	if ( transientLifetimeFrames < 1 ) transientLifetimeFrames = 1;
+	if ( transientLifetimeFrames > 60 ) transientLifetimeFrames = 60;
+	if ( transientReservedSlots < 0 ) transientReservedSlots = 0;
+	if ( transientReservedSlots > 8 ) transientReservedSlots = 8;
+	glRaytracingLightingSetTransientReservedSlots( (uint32_t)transientReservedSlots );
+
+	qboolean firstThisFrame = qfalse;
+	exp191TrackedLight_t *track = EXP191_FindTrackedLight( org, intensity, r, g, b, &firstThisFrame );
+	const float dx = org[0] - tr.refdef.vieworg[0];
+	const float dy = org[1] - tr.refdef.vieworg[1];
+	const float dz = org[2] - tr.refdef.vieworg[2];
+	const float cameraDistance = sqrtf( dx * dx + dy * dy + dz * dz );
+	const float maxColor = ( r > g ) ? ( ( r > b ) ? r : b ) : ( ( g > b ) ? g : b );
+	const qboolean transientCandidate =
+		track && track->seenFrames <= transientLifetimeFrames &&
+		cameraDistance <= transientMaxDistance && intensity <= transientMaxRadius && maxColor >= 0.20f;
+
+	static int exp191WindowStart = 0;
+	static int exp191Calls = 0;
+	static int exp191Unique = 0;
+	static int exp191CandidateCalls = 0;
+	static int exp191SubmittedRegular = 0;
+	static int exp191SubmittedTransient = 0;
+	static float exp191NearestCandidate = 999999.0f;
+	static float exp191LargestCandidateRadius = 0.0f;
+	const int exp191Now = ri.Milliseconds();
+	if ( exp191WindowStart == 0 ) exp191WindowStart = exp191Now;
+	exp191Calls++;
+	if ( firstThisFrame ) exp191Unique++;
+	if ( transientCandidate ) {
+		exp191CandidateCalls++;
+		if ( cameraDistance < exp191NearestCandidate ) exp191NearestCandidate = cameraDistance;
+		if ( intensity > exp191LargestCandidateRadius ) exp191LargestCandidateRadius = intensity;
+	}
+
+	const qboolean filterAllows =
+		filterMode == 0 ||
+		( filterMode == 1 && !transientCandidate ) ||
+		( filterMode == 2 && transientCandidate );
+
+	if ( bridgeEnabled && bridgeStrength > 0.0f && filterAllows ) {
+		const float localStrength = bridgeStrength * ( transientCandidate ? transientStrength : 1.0f );
+		const float localRadiusScale = bridgeRadiusScale * ( transientCandidate ? transientRadiusScale : 1.0f );
+		const float submittedRadius = intensity * localRadiusScale;
+		glRaytracingLight_t light = glRaytracingLightingMakePointLight(
+			org[0], org[1], org[2], submittedRadius,
+			r, g, b, localStrength );
+		light.samples = transientCandidate ? ( transientShadows ? 1u : 0u ) : ( bridgeShadows ? 1u : 0u );
+		light.pad1 = transientCandidate ? 0.25f : 0.0f;
+		if ( glRaytracingLightingAddLight( &light ) ) {
+			if ( transientCandidate ) exp191SubmittedTransient++;
+			else exp191SubmittedRegular++;
+		}
+	}
+
+	if ( bridgeDebug && exp191Now - exp191WindowStart >= 1000 ) {
+		ri.Printf( PRINT_ALL,
+			"GAME_DYNAMIC_LIGHTS_EXP19_1 filter=%d calls=%d unique=%d candidates=%d submittedRegular=%d submittedTransient=%d cpuTransient=%u selected=%u selectedTransient=%u reserve=%d transientStrength=%.2f transientRadius=%.2f maxDistance=%.1f maxRadius=%.1f lifetimeFrames=%d shadows=%d nearestCandidate=%.1f largestCandidateRadius=%.1f\n",
+			filterMode, exp191Calls, exp191Unique, exp191CandidateCalls,
+			exp191SubmittedRegular, exp191SubmittedTransient,
+			glRaytracingLightingGetTransientLightCount(),
+			glRaytracingLightingGetSelectedLightCount(),
+			glRaytracingLightingGetSelectedTransientLightCount(),
+			transientReservedSlots, transientStrength, transientRadiusScale,
+			transientMaxDistance, transientMaxRadius, transientLifetimeFrames,
+			transientShadows ? 1 : 0,
+			exp191NearestCandidate < 999998.0f ? exp191NearestCandidate : -1.0f,
+			exp191LargestCandidateRadius );
+		exp191WindowStart = exp191Now;
+		exp191Calls = 0;
+		exp191Unique = 0;
+		exp191CandidateCalls = 0;
+		exp191SubmittedRegular = 0;
+		exp191SubmittedTransient = 0;
+		exp191NearestCandidate = 999999.0f;
+		exp191LargestCandidateRadius = 0.0f;
+	}
+'@
+    $newBridgeBlock = "`t" + $newBridgeBlock.TrimEnd([char[]]"`r`n")
+    $sceneLf = $sceneLf.Substring(0, $bridgeStart) + $newBridgeBlock + "`n" + $sceneLf.Substring($bridgeEnd)
+
+    foreach ($sceneMarker in @(
+      'EXP191_FindTrackedLight',
+      'GAME_DYNAMIC_LIGHTS_EXP19_1',
+      'glRaytracingLightingSetTransientReservedSlots',
+      'glRaytracingLightingGetSelectedTransientLightCount'
+    )) {
+      if (-not $sceneLf.Contains($sceneMarker)) { throw "Generated tr_scene source marker is missing: $sceneMarker" }
+    }
+    if ($sceneLf.Contains('static int exp19WindowStart = 0;') -or $sceneLf.Contains('exp19Accepted++')) {
+      throw 'Legacy Experiment 19 diagnostics remained in transformed tr_scene.cpp.'
+    }
+
+    $beforeBytes = $utf8NoBom.GetBytes($sceneOriginalText.Replace("`r`n", "`n").Replace("`r", "`n"))
+    $afterBytes = $utf8NoBom.GetBytes($sceneLf)
+    $tempRoot = Join-Path $env:RUNNER_TEMP 'darkwolf-exp19_1'
+    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+    $beforeScene = Join-Path $tempRoot 'tr_scene_before_exp19_1.cpp'
+    $afterScene = Join-Path $tempRoot 'tr_scene_after_exp19_1.cpp'
+    [IO.File]::WriteAllBytes($beforeScene, $beforeBytes)
+    [IO.File]::WriteAllBytes($afterScene, $afterBytes)
+    [IO.File]::WriteAllBytes($scenePath, $afterBytes)
+
+    $generatedScenePatch = 'patches/272-d3d12-transient-muzzle-light-tr-scene-exp19_1.patch'
+    $diffOutput = @(& git diff --no-index --no-ext-diff --unified=8 -- $beforeScene $afterScene 2>&1)
+    $diffExitCode = $LASTEXITCODE
+    if ($diffExitCode -ne 1 -or $diffOutput.Count -eq 0) {
+      throw "Unable to generate exact tr_scene patch; git diff exit code=$diffExitCode."
+    }
+    $firstDiffLine = -1
+    for ($i = 0; $i -lt $diffOutput.Count; $i++) {
+      if (([string]$diffOutput[$i]) -like 'diff --git *') { $firstDiffLine = $i; break }
+    }
+    if ($firstDiffLine -lt 0) { throw 'Generated tr_scene diff does not contain a diff header.' }
+    $generatedPatchText = (($diffOutput[$firstDiffLine..($diffOutput.Count - 1)]) -join "`n") + "`n"
+    $generatedPatchText = [regex]::Replace(
+      $generatedPatchText,
+      '(?m)^diff --git .+$',
+      'diff --git a/src/renderer/tr_scene.cpp b/src/renderer/tr_scene.cpp'
+    )
+    $generatedPatchText = [regex]::Replace(
+      $generatedPatchText,
+      '(?m)^--- .+$',
+      '--- a/src/renderer/tr_scene.cpp'
+    )
+    $generatedPatchText = [regex]::Replace(
+      $generatedPatchText,
+      '(?m)^\+\+\+ .+$',
+      '+++ b/src/renderer/tr_scene.cpp'
+    )
+    [IO.File]::WriteAllText($generatedScenePatch, $generatedPatchText, $utf8NoBom)
+
+    $expectedAfterHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $afterScene).Hash
+    [IO.File]::WriteAllBytes($scenePath, $beforeBytes)
+    git apply --check $generatedScenePatch
+    if ($LASTEXITCODE -ne 0) { throw 'Generated Experiment 19.1 tr_scene patch check failed.' }
+    git apply $generatedScenePatch
+    if ($LASTEXITCODE -ne 0) { throw 'Generated Experiment 19.1 tr_scene patch apply failed.' }
+    git apply --reverse --check $generatedScenePatch
+    if ($LASTEXITCODE -ne 0) { throw 'Generated Experiment 19.1 tr_scene patch reverse-check failed.' }
+    $actualAfterHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $scenePath).Hash
+    if ($actualAfterHash -ne $expectedAfterHash) {
+      throw "Generated tr_scene patch output hash mismatch: expected=$expectedAfterHash actual=$actualAfterHash"
+    }
+    git diff --check
+    if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed after Experiment 19.1.' }
+
+    $scene = Get-Content -LiteralPath $scenePath -Raw
     $ray = Get-Content -LiteralPath 'src/opengl/gl_d3d12raylight.cpp' -Raw
     $api = Get-Content -LiteralPath 'src/opengl/opengl.h' -Raw
     $init = Get-Content -LiteralPath 'src/renderer/tr_init.cpp' -Raw
@@ -837,7 +1125,8 @@ try {
     if ($ray.Contains('D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS') -and -not $patchText.Contains('D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS')) {
       Write-Host 'Existing Bloom UAV resources preserved; Experiment 19.1 adds no resource model changes.'
     }
-    Write-Host 'Experiment 19.1 patch scope, apply and reverse-check: PASSED'
+    Write-Host 'Experiment 19.1 four-file patch and generated exact tr_scene patch: PASSED'
+
 
     Write-Stage 'Validate Bloom 18.2 shaders with native x64 DXC'
     $ErrorActionPreference = 'Stop'
@@ -1149,6 +1438,7 @@ try {
     Copy-Item -LiteralPath 'main/game_dynamic_lights_exp19_1.cfg' -Destination (Join-Path $release 'main') -Force
     Copy-Item -LiteralPath 'patches/270-d3d12-game-dynamic-lights-bridge-exp19.patch' -Destination (Join-Path $release 'SOURCE_PATCH') -Force
     Copy-Item -LiteralPath 'patches/271-d3d12-transient-muzzle-light-isolation-exp19_1.patch' -Destination (Join-Path $release 'SOURCE_PATCH') -Force
+    Copy-Item -LiteralPath 'patches/272-d3d12-transient-muzzle-light-tr-scene-exp19_1.patch' -Destination (Join-Path $release 'SOURCE_PATCH') -Force
 
     $manifest = @(
       'DarkWolf Game Dynamic Lights Experiment 19.1 - Compact Test Overlay',
@@ -1170,7 +1460,8 @@ try {
       'README.txt',
       'main/game_dynamic_lights_exp19_1.cfg',
       'SOURCE_PATCH/270-d3d12-game-dynamic-lights-bridge-exp19.patch',
-      'SOURCE_PATCH/271-d3d12-transient-muzzle-light-isolation-exp19_1.patch'
+      'SOURCE_PATCH/271-d3d12-transient-muzzle-light-isolation-exp19_1.patch',
+      'SOURCE_PATCH/272-d3d12-transient-muzzle-light-tr-scene-exp19_1.patch'
     )) {
       if (-not (Test-Path -LiteralPath (Join-Path $release $required))) {
         throw "Required compact test file is missing: $required"
