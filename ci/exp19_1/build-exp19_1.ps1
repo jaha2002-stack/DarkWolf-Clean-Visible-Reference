@@ -56,7 +56,49 @@ foreach ($line in $manifestLines) {
     }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
     if ($actual -ne $expected) {
-        throw "Payload hash mismatch: $relative"
+        # Git for Windows may convert repository text files from LF to CRLF.
+        # The manifest stores hashes of the canonical LF payload. Normalize only
+        # CRLF byte pairs and accept the file only when the normalized hash matches.
+        $rawBytes = [IO.File]::ReadAllBytes($source)
+        $normalizedStream = [IO.MemoryStream]::new()
+        try {
+            for ($i = 0; $i -lt $rawBytes.Length; $i++) {
+                if (
+                    $rawBytes[$i] -eq 13 -and
+                    ($i + 1) -lt $rawBytes.Length -and
+                    $rawBytes[$i + 1] -eq 10
+                ) {
+                    $normalizedStream.WriteByte(10)
+                    $i++
+                }
+                else {
+                    $normalizedStream.WriteByte($rawBytes[$i])
+                }
+            }
+            $normalizedBytes = $normalizedStream.ToArray()
+        }
+        finally {
+            $normalizedStream.Dispose()
+        }
+
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $normalizedHash = ([BitConverter]::ToString(
+                $sha256.ComputeHash($normalizedBytes)
+            )).Replace('-', '')
+        }
+        finally {
+            $sha256.Dispose()
+        }
+
+        if ($normalizedHash -eq $expected) {
+            [IO.File]::WriteAllBytes($source, $normalizedBytes)
+            Write-Host "Normalized CRLF to LF: $relative"
+            $actual = $normalizedHash
+        }
+        else {
+            throw "Payload hash mismatch: $relative (expected=$expected raw=$actual normalized=$normalizedHash)"
+        }
     }
 }
 Write-Host "Verified $($manifestLines.Count) external payload files."
