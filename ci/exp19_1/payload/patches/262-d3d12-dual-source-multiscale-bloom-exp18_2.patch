@@ -1,0 +1,897 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index c337804..83f0465 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -3116,10 +3116,11 @@ void RayGen()
+         {
+             finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
+         }
+-        else
++        else if (gBloomMode == 0u)
+         {
+-            // Bloom 18.1 is a final-scene pass in the D3D12 shim after transparent
+-            // particles and before 2D UI. Keep tone mapping here for every mode.
++            // Bloom 18.2 keeps the unclipped opaque DXR scene in FP16 when Bloom
++            // is active. The post compute pass tone-maps the normal game output,
++            // while the final-scene pass reuses the FP16 texture as HDR source A.
+             finalColor = ApplyHDRLikeToneMapping(finalColor);
+         }
+ 
+@@ -3329,49 +3330,10 @@ void BloomCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         return;
+     }
+ 
+-    uint mode = min(gBloomMode, 6u);
+-    float threshold = max(gBloomThreshold, 0.0);
+-    float strength = max(gBloomStrength, 0.0);
+-    float radius = clamp(gBloomRadius, 0.5, 32.0);
+-    float softKnee = clamp(gBloomSoftKnee, 0.0, 1.0);
+-
+-    if (mode == 1u)
+-    {
+-        threshold *= 1.25;
+-        strength *= 0.55;
+-        radius *= 0.75;
+-    }
+-    else if (mode == 2u)
+-    {
+-        threshold *= 0.95;
+-        strength *= 0.85;
+-    }
+-    else if (mode == 3u)
+-    {
+-        threshold *= 1.65;
+-        strength *= 1.20;
+-        radius *= 0.85;
+-    }
+-    else if (mode == 4u)
+-    {
+-        threshold *= 0.80;
+-        strength *= 0.85;
+-        radius *= 1.80;
+-    }
+-    else if (mode == 5u)
+-    {
+-        radius *= 1.25;
+-    }
+-    else if (mode == 6u)
+-    {
+-        threshold *= 0.70;
+-        strength *= 1.55;
+-        radius *= 2.20;
+-    }
+-
+-    float3 bloom = SampleBloom(int2(pixel), threshold, radius, softKnee);
+-    float3 combinedHdr = hdrColor + bloom * strength;
+-    gFinalOut[pixel] = float4(ApplyHDRLikeToneMapping(combinedHdr), hdrSample.a);
++    // Bloom 18.2 disables the rejected pre-transparent blur. This compute pass
++    // only converts the stored FP16 opaque scene to the normal tone-mapped output.
++    // The FP16 texture remains available for the later dual-source final Bloom.
++    gFinalOut[pixel] = float4(ApplyHDRLikeToneMapping(hdrColor), hdrSample.a);
+ }
+ )";
+ 
+@@ -3865,7 +3827,7 @@ static int glRaytracingLightingEnsureBloomHdrTexture(UINT width, UINT height)
+ 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+ 	HRESULT hr = g_glRaytracingCmd.device->CreateCommittedResource(
+ 		&heap, D3D12_HEAP_FLAG_NONE, &desc,
+-		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+ 		nullptr, IID_PPV_ARGS(&g_glRaytracingLighting.bloomHdrTexture));
+ 	if (FAILED(hr))
+ 	{
+@@ -3990,9 +3952,9 @@ static void glRaytracingLightingCreatePerPassDescriptors(const glRaytracingLight
+ 		&tlasSrv,
+ 		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 5));
+ 
+-	// Bloom 18.1 runs on the final native scene after transparent particles.
+-	// The old pre-transparent DXR bloom path is intentionally disabled.
+-	const bool useBloom = false;
++	// Bloom 18.2 stores the unclipped opaque scene in FP16. The old blur is still
++	// disabled; this texture is source A for the later dual-source final Bloom.
++	const bool useBloom = g_glRaytracingLighting.constants.bloomMode != 0u;
+ 	ID3D12Resource* rayOutput = useBloom
+ 		? g_glRaytracingLighting.bloomHdrTexture.Get()
+ 		: pass->outputTexture;
+@@ -4306,6 +4268,17 @@ void glRaytracingLightingSetBloomOptions(
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++ID3D12Resource* glRaytracingLightingGetBloomHdrTexture(uint32_t* width, uint32_t* height)
++{
++	if (width)
++		*width = g_glRaytracingLighting.bloomHdrWidth;
++	if (height)
++		*height = g_glRaytracingLighting.bloomHdrHeight;
++	if (g_glRaytracingLighting.constants.bloomMode == 0u)
++		return nullptr;
++	return g_glRaytracingLighting.bloomHdrTexture.Get();
++}
++
+ void glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+@@ -4408,9 +4381,9 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	++g_glRaytracingLighting.constants.frameIndex;
+ 	glRaytracingLightingPrepareSelectedLights();
+ 	glRaytracingLightingUpdateConstants();
+-	// Bloom 18.1 runs on the final native scene after transparent particles.
+-	// The old pre-transparent DXR bloom path is intentionally disabled.
+-	const bool useBloom = false;
++	// Bloom 18.2 stores the unclipped opaque scene in FP16. The old blur is still
++	// disabled; this texture is source A for the later dual-source final Bloom.
++	const bool useBloom = g_glRaytracingLighting.constants.bloomMode != 0u;
+ 	if (useBloom && !glRaytracingLightingEnsureBloomHdrTexture(pass->width, pass->height))
+ 		return false;
+ 	glRaytracingLightingCreatePerPassDescriptors(pass);
+@@ -4424,7 +4397,7 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	glRaytracingTransition(
+ 		g_glRaytracingCmd.cmdList.Get(),
+ 		rayOutput,
+-		useBloom ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+ 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ 
+ 	ID3D12DescriptorHeap* heaps[] = { g_glRaytracingLighting.descriptorHeap.Get() };
+@@ -4500,6 +4473,13 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 		finalUav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+ 		finalUav.UAV.pResource = pass->outputTexture;
+ 		g_glRaytracingCmd.cmdList->ResourceBarrier(1, &finalUav);
++
++		// The final-scene graphics pass samples source A in a pixel shader.
++		glRaytracingTransition(
++			g_glRaytracingCmd.cmdList.Get(),
++			g_glRaytracingLighting.bloomHdrTexture.Get(),
++			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+ 	}
+ 
+ 	// The shim composites the lighting texture later in glLightScene().
+diff --git a/src/opengl/gl_d3d12shim.cpp b/src/opengl/gl_d3d12shim.cpp
+index 6a3ec8b..06d6d04 100644
+--- a/src/opengl/gl_d3d12shim.cpp
++++ b/src/opengl/gl_d3d12shim.cpp
+@@ -636,6 +636,8 @@ struct QueuedBatch
+ 	size_t vertexCount;
+ };
+ 
++static const UINT QD3D12_FinalBloomLevelCount = 4;
++
+ struct QD3D12Window
+ {
+ 	HWND hwnd = nullptr;
+@@ -680,37 +682,41 @@ struct QD3D12Window
+ 	ComPtr<ID3D12Resource> nativeDepthBuffer;
+ 	D3D12_RESOURCE_STATES nativeDepthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+ 
+-	// Bloom 18.1 final-scene resources. The full-resolution copy includes
+-	// transparent particles because this pass runs in the native post-upscale phase.
++	// Bloom 18.2 combines source A (opaque FP16 HDR from the DXR pass) with
++	// source B (the final SDR scene containing transparent fire and particles).
+ 	ComPtr<ID3D12Resource> finalBloomSceneCopy;
+-	ComPtr<ID3D12Resource> finalBloomBright;
+-	ComPtr<ID3D12Resource> finalBloomBlurA;
+-	ComPtr<ID3D12Resource> finalBloomBlurB;
++	ComPtr<ID3D12Resource> finalBloomSceneBright;
++	ComPtr<ID3D12Resource> finalBloomPyramid[QD3D12_FinalBloomLevelCount];
++	ComPtr<ID3D12Resource> finalBloomTemp[QD3D12_FinalBloomLevelCount];
++	ComPtr<ID3D12Resource> finalBloomHdrSource;
+ 	D3D12_RESOURCE_STATES finalBloomSceneCopyState = D3D12_RESOURCE_STATE_COMMON;
+-	D3D12_RESOURCE_STATES finalBloomBrightState = D3D12_RESOURCE_STATE_COMMON;
+-	D3D12_RESOURCE_STATES finalBloomBlurAState = D3D12_RESOURCE_STATE_COMMON;
+-	D3D12_RESOURCE_STATES finalBloomBlurBState = D3D12_RESOURCE_STATE_COMMON;
++	D3D12_RESOURCE_STATES finalBloomSceneBrightState = D3D12_RESOURCE_STATE_COMMON;
++	D3D12_RESOURCE_STATES finalBloomPyramidState[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_RESOURCE_STATES finalBloomTempState[QD3D12_FinalBloomLevelCount] = {};
+ 	ComPtr<ID3D12DescriptorHeap> finalBloomRtvHeap;
+ 	UINT finalBloomRtvStride = 0;
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBrightRtv{};
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBlurARtv{};
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBlurBRtv{};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomSceneBrightRtv{};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomPyramidRtv[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomTempRtv[QD3D12_FinalBloomLevelCount] = {};
+ 	UINT finalBloomSceneCopySrvIndex = UINT_MAX;
+-	UINT finalBloomBrightSrvIndex = UINT_MAX;
+-	UINT finalBloomBlurASrvIndex = UINT_MAX;
+-	UINT finalBloomBlurBSrvIndex = UINT_MAX;
++	UINT finalBloomSceneBrightSrvIndex = UINT_MAX;
++	UINT finalBloomPyramidSrvIndex[QD3D12_FinalBloomLevelCount] = { UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX };
++	UINT finalBloomTempSrvIndex[QD3D12_FinalBloomLevelCount] = { UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX };
++	UINT finalBloomHdrSourceSrvIndex = UINT_MAX;
+ 	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomSceneCopySrvCpu{};
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBrightSrvCpu{};
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBlurASrvCpu{};
+-	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomBlurBSrvCpu{};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomSceneBrightSrvCpu{};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomPyramidSrvCpu[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomTempSrvCpu[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_CPU_DESCRIPTOR_HANDLE finalBloomHdrSourceSrvCpu{};
+ 	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomSceneCopySrvGpu{};
+-	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomBrightSrvGpu{};
+-	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomBlurASrvGpu{};
+-	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomBlurBSrvGpu{};
++	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomSceneBrightSrvGpu{};
++	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomPyramidSrvGpu[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomTempSrvGpu[QD3D12_FinalBloomLevelCount] = {};
++	D3D12_GPU_DESCRIPTOR_HANDLE finalBloomHdrSourceSrvGpu{};
+ 	UINT finalBloomWidth = 0;
+ 	UINT finalBloomHeight = 0;
+-	UINT finalBloomDownWidth = 0;
+-	UINT finalBloomDownHeight = 0;
++	UINT finalBloomLevelWidth[QD3D12_FinalBloomLevelCount] = {};
++	UINT finalBloomLevelHeight[QD3D12_FinalBloomLevelCount] = {};
+ 
+ 	UINT sceneColorSrvIndex[QD3D12_FrameCount] = { UINT_MAX, UINT_MAX };
+ 	D3D12_CPU_DESCRIPTOR_HANDLE sceneColorSrvCpu[QD3D12_FrameCount]{};
+@@ -1008,17 +1014,25 @@ struct GLState
+ 	ComPtr<ID3D12PipelineState> postAdditivePSO;
+ 	ComPtr<ID3D12PipelineState> postDepthCopyPSO;
+ 
+-	// Bloom 18.1 final-scene graphics passes.
++	// Bloom 18.2 dual-source, four-level final-scene graphics passes.
+ 	ComPtr<ID3D12RootSignature> finalBloomRootSig;
+ 	ComPtr<ID3D12PipelineState> finalBloomBrightPSO;
++	ComPtr<ID3D12PipelineState> finalBloomBrightAddPSO;
++	ComPtr<ID3D12PipelineState> finalBloomDownsamplePSO;
+ 	ComPtr<ID3D12PipelineState> finalBloomBlurPSO;
+ 	ComPtr<ID3DBlob> finalBloomBrightBlob;
++	ComPtr<ID3DBlob> finalBloomDownsampleBlob;
+ 	ComPtr<ID3DBlob> finalBloomBlurBlob;
+ 	uint32_t finalBloomMode = 0;
+-	float finalBloomThreshold = 0.72f;
+-	float finalBloomStrength = 0.26f;
+-	float finalBloomRadius = 10.0f;
+-	float finalBloomSoftKnee = 0.35f;
++	float finalBloomHdrThreshold = 1.00f;
++	float finalBloomTransparentThreshold = 0.68f;
++	float finalBloomStrength = 0.36f;
++	float finalBloomRadius = 14.0f;
++	float finalBloomSoftKnee = 0.45f;
++	float finalBloomSourceGain = 2.20f;
++	float finalBloomScatter = 0.72f;
++	float finalBloomHdrWeight = 1.00f;
++	float finalBloomTransparentWeight = 1.20f;
+ 	bool finalBloomAppliedThisFrame = false;
+ 
+ 	ComPtr<ID3DBlob> vsMainBlob;
+@@ -1751,16 +1765,17 @@ float PSDepthCopy(VSOut i) : SV_Depth
+ }
+ )HLSL";
+ 
+-// Bloom 18.1 intentionally reads the final native SDR scene. This captures
+-// alpha-blended fire, smoke, muzzle flashes and explosions rendered after DXR.
++// Bloom 18.2 uses one reusable pixel-shader family for source extraction,
++// pyramid downsampling and separable blur. Source A is linear FP16 HDR; source B
++// is the final SDR scene after transparent 3D effects and before the HUD.
+ static const char* kQD3D12FinalBloomHLSL = R"HLSL(
+ Texture2D<float4> gInput : register(t0);
+ SamplerState gLinearClamp : register(s0);
+ 
+ cbuffer BloomParams : register(b0)
+ {
+-    float4 gP0; // x/y texel size, z threshold or direction.x, w softKnee or direction.y
+-    float4 gP1; // x radius, y final strength, z diagnostic scale, w reserved
++    float4 gP0; // x/y input texel size, z threshold or direction.x, w softKnee or direction.y
++    float4 gP1; // x sourceGain or blur radius, y outputScale, z/w reserved
+ };
+ 
+ struct VSOut
+@@ -1779,24 +1794,29 @@ float3 ExtractBloom(float3 color, float threshold, float softKnee)
+     return max(color * contribution, 0.0);
+ }
+ 
++float3 Box4(float2 uv, float2 texel)
++{
++    return 0.25 * (
++        gInput.Sample(gLinearClamp, uv + texel * float2(-0.5, -0.5)).rgb +
++        gInput.Sample(gLinearClamp, uv + texel * float2( 0.5, -0.5)).rgb +
++        gInput.Sample(gLinearClamp, uv + texel * float2(-0.5,  0.5)).rgb +
++        gInput.Sample(gLinearClamp, uv + texel * float2( 0.5,  0.5)).rgb);
++}
++
+ float4 PSBright(VSOut i) : SV_Target0
+ {
+-    float2 t = gP0.xy;
+-    float3 c = 0.25 * (
+-        gInput.Sample(gLinearClamp, i.uv + t * float2(-0.5, -0.5)).rgb +
+-        gInput.Sample(gLinearClamp, i.uv + t * float2( 0.5, -0.5)).rgb +
+-        gInput.Sample(gLinearClamp, i.uv + t * float2(-0.5,  0.5)).rgb +
+-        gInput.Sample(gLinearClamp, i.uv + t * float2( 0.5,  0.5)).rgb);
+-    return float4(ExtractBloom(c, gP0.z, gP0.w) * max(gP1.z, 1.0), 1.0);
++    float3 c = Box4(i.uv, gP0.xy);
++    return float4(ExtractBloom(c, gP0.z, gP0.w) * max(gP1.x, 0.0), 1.0);
+ }
+ 
+-float4 PSBlur(VSOut i) : SV_Target0
++float4 PSDownsample(VSOut i) : SV_Target0
+ {
+-    float2 texel = gP0.xy;
+-    float2 direction = gP0.zw;
+-    float radius = max(gP1.x, 0.5);
+-    float2 stepUv = texel * direction * radius;
++    return float4(Box4(i.uv, gP0.xy) * max(gP1.y, 0.0), 1.0);
++}
+ 
++float4 PSBlur(VSOut i) : SV_Target0
++{
++    float2 stepUv = gP0.xy * gP0.zw * max(gP1.x, 0.5);
+     float3 result = gInput.Sample(gLinearClamp, i.uv).rgb * 0.2270270270;
+     result += gInput.Sample(gLinearClamp, i.uv + stepUv * 1.3846153846).rgb * 0.3162162162;
+     result += gInput.Sample(gLinearClamp, i.uv - stepUv * 1.3846153846).rgb * 0.3162162162;
+@@ -4003,6 +4023,7 @@ static void QD3D12_CompileShaders()
+ 	g_gl.postPsAddBlob = CompileShaderSourceVariant(kQD3D12PostHLSL, "PSAdd", "ps_5_0");
+ 	g_gl.postPsDepthCopyBlob = CompileShaderSourceVariant(kQD3D12PostHLSL, "PSDepthCopy", "ps_5_0");
+ 	g_gl.finalBloomBrightBlob = CompileShaderSourceVariant(kQD3D12FinalBloomHLSL, "PSBright", "ps_5_0");
++	g_gl.finalBloomDownsampleBlob = CompileShaderSourceVariant(kQD3D12FinalBloomHLSL, "PSDownsample", "ps_5_0");
+ 	g_gl.finalBloomBlurBlob = CompileShaderSourceVariant(kQD3D12FinalBloomHLSL, "PSBlur", "ps_5_0");
+ }
+ 
+@@ -4177,6 +4198,19 @@ static void QD3D12_CreatePSOs()
+ 	bloomDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+ 	bloomDesc.PS = { g_gl.finalBloomBrightBlob->GetBufferPointer(), g_gl.finalBloomBrightBlob->GetBufferSize() };
+ 	QD3D12_CHECK(g_gl.device->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&g_gl.finalBloomBrightPSO)));
++
++	D3D12_GRAPHICS_PIPELINE_STATE_DESC bloomAddDesc = bloomDesc;
++	bloomAddDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
++	bloomAddDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
++	bloomAddDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
++	bloomAddDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
++	bloomAddDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
++	bloomAddDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
++	bloomAddDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
++	QD3D12_CHECK(g_gl.device->CreateGraphicsPipelineState(&bloomAddDesc, IID_PPV_ARGS(&g_gl.finalBloomBrightAddPSO)));
++
++	bloomDesc.PS = { g_gl.finalBloomDownsampleBlob->GetBufferPointer(), g_gl.finalBloomDownsampleBlob->GetBufferSize() };
++	QD3D12_CHECK(g_gl.device->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&g_gl.finalBloomDownsamplePSO)));
+ 	bloomDesc.PS = { g_gl.finalBloomBlurBlob->GetBufferPointer(), g_gl.finalBloomBlurBlob->GetBufferSize() };
+ 	QD3D12_CHECK(g_gl.device->CreateGraphicsPipelineState(&bloomDesc, IID_PPV_ARGS(&g_gl.finalBloomBlurPSO)));
+ 
+@@ -8291,18 +8325,22 @@ void QD3D12_ReleaseWindowSizeResources(QD3D12Window& w)
+ 	w.nativeDepthState = D3D12_RESOURCE_STATE_COMMON;
+ 
+ 	w.finalBloomSceneCopy.Reset();
+-	w.finalBloomBright.Reset();
+-	w.finalBloomBlurA.Reset();
+-	w.finalBloomBlurB.Reset();
++	w.finalBloomSceneBright.Reset();
++	w.finalBloomHdrSource.Reset();
+ 	w.finalBloomSceneCopyState = D3D12_RESOURCE_STATE_COMMON;
+-	w.finalBloomBrightState = D3D12_RESOURCE_STATE_COMMON;
+-	w.finalBloomBlurAState = D3D12_RESOURCE_STATE_COMMON;
+-	w.finalBloomBlurBState = D3D12_RESOURCE_STATE_COMMON;
++	w.finalBloomSceneBrightState = D3D12_RESOURCE_STATE_COMMON;
++	for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++	{
++		w.finalBloomPyramid[level].Reset();
++		w.finalBloomTemp[level].Reset();
++		w.finalBloomPyramidState[level] = D3D12_RESOURCE_STATE_COMMON;
++		w.finalBloomTempState[level] = D3D12_RESOURCE_STATE_COMMON;
++		w.finalBloomLevelWidth[level] = 0;
++		w.finalBloomLevelHeight[level] = 0;
++	}
+ 	w.finalBloomRtvHeap.Reset();
+ 	w.finalBloomWidth = 0;
+ 	w.finalBloomHeight = 0;
+-	w.finalBloomDownWidth = 0;
+-	w.finalBloomDownHeight = 0;
+ 
+ 	w.rtvHeap.Reset();
+ 	w.dsvHeap.Reset();
+@@ -10080,22 +10118,53 @@ static uint32_t QD3D12_FinalBloomFloatBits(float value)
+     return bits;
+ }
+ 
++static D3D12_VIEWPORT QD3D12_FinalBloomViewport(UINT width, UINT height)
++{
++    D3D12_VIEWPORT viewport{};
++    viewport.Width = (float)width;
++    viewport.Height = (float)height;
++    viewport.MinDepth = 0.0f;
++    viewport.MaxDepth = 1.0f;
++    return viewport;
++}
++
++static D3D12_RECT QD3D12_FinalBloomScissor(UINT width, UINT height)
++{
++    D3D12_RECT scissor{ 0, 0, (LONG)width, (LONG)height };
++    return scissor;
++}
++
+ static void QD3D12_EnsureFinalBloomResources(QD3D12Window& w)
+ {
+-    const UINT width = std::max<UINT>(w.width, 1u);
+-    const UINT height = std::max<UINT>(w.height, 1u);
+-    const UINT downWidth = std::max<UINT>((width + 3u) / 4u, 1u);
+-    const UINT downHeight = std::max<UINT>((height + 3u) / 4u, 1u);
+-    if (w.finalBloomSceneCopy && w.finalBloomWidth == width && w.finalBloomHeight == height &&
+-        w.finalBloomDownWidth == downWidth && w.finalBloomDownHeight == downHeight)
++    const UINT width = (std::max)(w.width, 1u);
++    const UINT height = (std::max)(w.height, 1u);
++    UINT levelWidth[QD3D12_FinalBloomLevelCount] = {};
++    UINT levelHeight[QD3D12_FinalBloomLevelCount] = {};
++    levelWidth[0] = (std::max)((width + 1u) / 2u, 1u);
++    levelHeight[0] = (std::max)((height + 1u) / 2u, 1u);
++    for (UINT level = 1; level < QD3D12_FinalBloomLevelCount; ++level)
+     {
+-        return;
++        levelWidth[level] = (std::max)((levelWidth[level - 1] + 1u) / 2u, 1u);
++        levelHeight[level] = (std::max)((levelHeight[level - 1] + 1u) / 2u, 1u);
++    }
++
++    bool dimensionsMatch = w.finalBloomSceneCopy && w.finalBloomWidth == width && w.finalBloomHeight == height;
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount && dimensionsMatch; ++level)
++    {
++        dimensionsMatch = w.finalBloomPyramid[level] && w.finalBloomTemp[level] &&
++            w.finalBloomLevelWidth[level] == levelWidth[level] &&
++            w.finalBloomLevelHeight[level] == levelHeight[level];
+     }
++    if (dimensionsMatch && w.finalBloomSceneBright)
++        return;
+ 
+     w.finalBloomSceneCopy.Reset();
+-    w.finalBloomBright.Reset();
+-    w.finalBloomBlurA.Reset();
+-    w.finalBloomBlurB.Reset();
++    w.finalBloomSceneBright.Reset();
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        w.finalBloomPyramid[level].Reset();
++        w.finalBloomTemp[level].Reset();
++    }
+     w.finalBloomRtvHeap.Reset();
+ 
+     D3D12_HEAP_PROPERTIES hp{};
+@@ -10123,30 +10192,37 @@ static void QD3D12_EnsureFinalBloomResources(QD3D12Window& w)
+     createTexture(w.finalBloomSceneCopy, w.finalBloomSceneCopyState,
+         width, height, QD3D12_SceneColorFormat, D3D12_RESOURCE_FLAG_NONE,
+         D3D12_RESOURCE_STATE_COPY_DEST);
+-    createTexture(w.finalBloomBright, w.finalBloomBrightState,
+-        downWidth, downHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
+-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+-    createTexture(w.finalBloomBlurA, w.finalBloomBlurAState,
+-        downWidth, downHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
+-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+-    createTexture(w.finalBloomBlurB, w.finalBloomBlurBState,
+-        downWidth, downHeight, DXGI_FORMAT_R16G16B16A16_FLOAT,
++    createTexture(w.finalBloomSceneBright, w.finalBloomSceneBrightState,
++        levelWidth[0], levelHeight[0], DXGI_FORMAT_R16G16B16A16_FLOAT,
+         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        createTexture(w.finalBloomPyramid[level], w.finalBloomPyramidState[level],
++            levelWidth[level], levelHeight[level], DXGI_FORMAT_R16G16B16A16_FLOAT,
++            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
++        createTexture(w.finalBloomTemp[level], w.finalBloomTempState[level],
++            levelWidth[level], levelHeight[level], DXGI_FORMAT_R16G16B16A16_FLOAT,
++            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    }
+ 
+     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
+-    rtvDesc.NumDescriptors = 3;
++    rtvDesc.NumDescriptors = 1 + QD3D12_FinalBloomLevelCount * 2;
+     rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+     QD3D12_CHECK(g_gl.device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&w.finalBloomRtvHeap)));
+     w.finalBloomRtvStride = g_gl.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv = w.finalBloomRtvHeap->GetCPUDescriptorHandleForHeapStart();
+-    w.finalBloomBrightRtv = rtv;
+-    g_gl.device->CreateRenderTargetView(w.finalBloomBright.Get(), nullptr, rtv);
++    w.finalBloomSceneBrightRtv = rtv;
++    g_gl.device->CreateRenderTargetView(w.finalBloomSceneBright.Get(), nullptr, rtv);
+     rtv.ptr += w.finalBloomRtvStride;
+-    w.finalBloomBlurARtv = rtv;
+-    g_gl.device->CreateRenderTargetView(w.finalBloomBlurA.Get(), nullptr, rtv);
+-    rtv.ptr += w.finalBloomRtvStride;
+-    w.finalBloomBlurBRtv = rtv;
+-    g_gl.device->CreateRenderTargetView(w.finalBloomBlurB.Get(), nullptr, rtv);
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        w.finalBloomPyramidRtv[level] = rtv;
++        g_gl.device->CreateRenderTargetView(w.finalBloomPyramid[level].Get(), nullptr, rtv);
++        rtv.ptr += w.finalBloomRtvStride;
++        w.finalBloomTempRtv[level] = rtv;
++        g_gl.device->CreateRenderTargetView(w.finalBloomTemp[level].Get(), nullptr, rtv);
++        rtv.ptr += w.finalBloomRtvStride;
++    }
+ 
+     auto createSrv = [&](ID3D12Resource* resource, DXGI_FORMAT format, UINT& index,
+         D3D12_CPU_DESCRIPTOR_HANDLE& cpu, D3D12_GPU_DESCRIPTOR_HANDLE& gpu)
+@@ -10167,17 +10243,47 @@ static void QD3D12_EnsureFinalBloomResources(QD3D12Window& w)
+ 
+     createSrv(w.finalBloomSceneCopy.Get(), QD3D12_SceneColorFormat,
+         w.finalBloomSceneCopySrvIndex, w.finalBloomSceneCopySrvCpu, w.finalBloomSceneCopySrvGpu);
+-    createSrv(w.finalBloomBright.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+-        w.finalBloomBrightSrvIndex, w.finalBloomBrightSrvCpu, w.finalBloomBrightSrvGpu);
+-    createSrv(w.finalBloomBlurA.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+-        w.finalBloomBlurASrvIndex, w.finalBloomBlurASrvCpu, w.finalBloomBlurASrvGpu);
+-    createSrv(w.finalBloomBlurB.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
+-        w.finalBloomBlurBSrvIndex, w.finalBloomBlurBSrvCpu, w.finalBloomBlurBSrvGpu);
++    createSrv(w.finalBloomSceneBright.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
++        w.finalBloomSceneBrightSrvIndex, w.finalBloomSceneBrightSrvCpu, w.finalBloomSceneBrightSrvGpu);
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        createSrv(w.finalBloomPyramid[level].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
++            w.finalBloomPyramidSrvIndex[level], w.finalBloomPyramidSrvCpu[level], w.finalBloomPyramidSrvGpu[level]);
++        createSrv(w.finalBloomTemp[level].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT,
++            w.finalBloomTempSrvIndex[level], w.finalBloomTempSrvCpu[level], w.finalBloomTempSrvGpu[level]);
++        w.finalBloomLevelWidth[level] = levelWidth[level];
++        w.finalBloomLevelHeight[level] = levelHeight[level];
++    }
+ 
+     w.finalBloomWidth = width;
+     w.finalBloomHeight = height;
+-    w.finalBloomDownWidth = downWidth;
+-    w.finalBloomDownHeight = downHeight;
++}
++
++static bool QD3D12_UpdateFinalBloomHdrSource(QD3D12Window& w, UINT& hdrWidth, UINT& hdrHeight)
++{
++    uint32_t width = 0;
++    uint32_t height = 0;
++    ID3D12Resource* resource = glRaytracingLightingGetBloomHdrTexture(&width, &height);
++    hdrWidth = width;
++    hdrHeight = height;
++    if (!resource || width == 0 || height == 0)
++        return false;
++
++    if (w.finalBloomHdrSource.Get() != resource)
++        w.finalBloomHdrSource = resource;
++    if (w.finalBloomHdrSourceSrvIndex == UINT_MAX)
++    {
++        w.finalBloomHdrSourceSrvIndex = g_gl.nextSrvIndex++;
++        w.finalBloomHdrSourceSrvCpu = QD3D12_SrvCpu(w.finalBloomHdrSourceSrvIndex);
++        w.finalBloomHdrSourceSrvGpu = QD3D12_SrvGpu(w.finalBloomHdrSourceSrvIndex);
++    }
++    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
++    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    sd.Texture2D.MipLevels = 1;
++    g_gl.device->CreateShaderResourceView(resource, &sd, w.finalBloomHdrSourceSrvCpu);
++    return true;
+ }
+ 
+ static void QD3D12_FinalBloomPass(ID3D12GraphicsCommandList* cl,
+@@ -10201,13 +10307,28 @@ static void QD3D12_FinalBloomPass(ID3D12GraphicsCommandList* cl,
+     cl->DrawInstanced(3, 1, 0, 0);
+ }
+ 
+-void glFinalSceneBloomSetOptions(uint32_t mode, float threshold, float strength, float radius, float softKnee)
+-{
+-    g_gl.finalBloomMode = std::min<uint32_t>(mode, 6u);
+-    g_gl.finalBloomThreshold = ClampValue<float>(threshold, 0.05f, 1.50f);
+-    g_gl.finalBloomStrength = ClampValue<float>(strength, 0.0f, 2.0f);
+-    g_gl.finalBloomRadius = ClampValue<float>(radius, 1.0f, 48.0f);
++void glFinalSceneBloomSetOptions(
++    uint32_t mode,
++    float hdrThreshold,
++    float transparentThreshold,
++    float strength,
++    float radius,
++    float softKnee,
++    float sourceGain,
++    float scatter,
++    float hdrWeight,
++    float transparentWeight)
++{
++    g_gl.finalBloomMode = (std::min)(mode, 6u);
++    g_gl.finalBloomHdrThreshold = ClampValue<float>(hdrThreshold, 0.05f, 8.0f);
++    g_gl.finalBloomTransparentThreshold = ClampValue<float>(transparentThreshold, 0.05f, 1.25f);
++    g_gl.finalBloomStrength = ClampValue<float>(strength, 0.0f, 4.0f);
++    g_gl.finalBloomRadius = ClampValue<float>(radius, 1.0f, 64.0f);
+     g_gl.finalBloomSoftKnee = ClampValue<float>(softKnee, 0.0f, 1.0f);
++    g_gl.finalBloomSourceGain = ClampValue<float>(sourceGain, 0.0f, 8.0f);
++    g_gl.finalBloomScatter = ClampValue<float>(scatter, 0.0f, 1.0f);
++    g_gl.finalBloomHdrWeight = ClampValue<float>(hdrWeight, 0.0f, 4.0f);
++    g_gl.finalBloomTransparentWeight = ClampValue<float>(transparentWeight, 0.0f, 4.0f);
+ }
+ 
+ void glFinalSceneBloomApply(void)
+@@ -10227,7 +10348,7 @@ void glFinalSceneBloomApply(void)
+     QD3D12_EnsureFinalBloomResources(w);
+     ID3D12GraphicsCommandList* cl = g_gl.cmdList.Get();
+     ID3D12Resource* backBuffer = w.backBuffers[w.frameIndex].Get();
+-    if (!backBuffer || !w.finalBloomSceneCopy || !w.finalBloomBright || !w.finalBloomBlurA || !w.finalBloomBlurB)
++    if (!backBuffer || !w.finalBloomSceneCopy || !w.finalBloomSceneBright)
+         return;
+ 
+     QD3D12_TransitionResource(cl, backBuffer, w.backBufferState[w.frameIndex], D3D12_RESOURCE_STATE_COPY_SOURCE);
+@@ -10236,65 +10357,132 @@ void glFinalSceneBloomApply(void)
+     QD3D12_TransitionResource(cl, w.finalBloomSceneCopy.Get(), w.finalBloomSceneCopyState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     QD3D12_TransitionResource(cl, backBuffer, w.backBufferState[w.frameIndex], D3D12_RESOURCE_STATE_RENDER_TARGET);
+ 
+-    D3D12_VIEWPORT downViewport{};
+-    downViewport.Width = (float)w.finalBloomDownWidth;
+-    downViewport.Height = (float)w.finalBloomDownHeight;
+-    downViewport.MinDepth = 0.0f;
+-    downViewport.MaxDepth = 1.0f;
+-    D3D12_RECT downScissor{ 0, 0, (LONG)w.finalBloomDownWidth, (LONG)w.finalBloomDownHeight };
++    const D3D12_VIEWPORT halfViewport = QD3D12_FinalBloomViewport(
++        w.finalBloomLevelWidth[0], w.finalBloomLevelHeight[0]);
++    const D3D12_RECT halfScissor = QD3D12_FinalBloomScissor(
++        w.finalBloomLevelWidth[0], w.finalBloomLevelHeight[0]);
++    const float black[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++
++    UINT hdrWidth = 0;
++    UINT hdrHeight = 0;
++    const bool haveHdrSource = QD3D12_UpdateFinalBloomHdrSource(w, hdrWidth, hdrHeight);
+ 
+-    const float diagnosticScale = (g_gl.finalBloomMode == 1u) ? 3.0f : 1.0f;
+-    float brightParams[8] = {
++    QD3D12_TransitionResource(cl, w.finalBloomPyramid[0].Get(), w.finalBloomPyramidState[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
++    cl->ClearRenderTargetView(w.finalBloomPyramidRtv[0], black, 0, nullptr);
++    if (haveHdrSource)
++    {
++        float hdrBrightParams[8] = {
++            1.0f / (float)hdrWidth, 1.0f / (float)hdrHeight,
++            g_gl.finalBloomHdrThreshold, g_gl.finalBloomSoftKnee,
++            g_gl.finalBloomHdrWeight, 1.0f, 0.0f, 0.0f
++        };
++        QD3D12_FinalBloomPass(cl, g_gl.finalBloomBrightPSO.Get(), w.finalBloomHdrSourceSrvGpu,
++            w.finalBloomPyramidRtv[0], halfViewport, halfScissor, hdrBrightParams);
++    }
++    QD3D12_TransitionResource(cl, w.finalBloomPyramid[0].Get(), w.finalBloomPyramidState[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++
++    QD3D12_TransitionResource(cl, w.finalBloomSceneBright.Get(), w.finalBloomSceneBrightState, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    cl->ClearRenderTargetView(w.finalBloomSceneBrightRtv, black, 0, nullptr);
++    float sceneBrightParams[8] = {
+         1.0f / (float)w.finalBloomWidth, 1.0f / (float)w.finalBloomHeight,
+-        g_gl.finalBloomThreshold, g_gl.finalBloomSoftKnee,
+-        0.0f, 0.0f, diagnosticScale, 0.0f
++        g_gl.finalBloomTransparentThreshold, g_gl.finalBloomSoftKnee,
++        g_gl.finalBloomSourceGain * g_gl.finalBloomTransparentWeight, 1.0f, 0.0f, 0.0f
+     };
+-    QD3D12_TransitionResource(cl, w.finalBloomBright.Get(), w.finalBloomBrightState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+     QD3D12_FinalBloomPass(cl, g_gl.finalBloomBrightPSO.Get(), w.finalBloomSceneCopySrvGpu,
+-        w.finalBloomBrightRtv, downViewport, downScissor, brightParams);
+-    QD3D12_TransitionResource(cl, w.finalBloomBright.Get(), w.finalBloomBrightState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+-
+-    const float quarterRadius = (std::max)(g_gl.finalBloomRadius * 0.25f, 0.5f);
+-    float blurH[8] = {
+-        1.0f / (float)w.finalBloomDownWidth, 1.0f / (float)w.finalBloomDownHeight,
+-        1.0f, 0.0f, quarterRadius, 1.0f, 0.0f, 0.0f
+-    };
+-    QD3D12_TransitionResource(cl, w.finalBloomBlurA.Get(), w.finalBloomBlurAState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+-    QD3D12_FinalBloomPass(cl, g_gl.finalBloomBlurPSO.Get(), w.finalBloomBrightSrvGpu,
+-        w.finalBloomBlurARtv, downViewport, downScissor, blurH);
+-    QD3D12_TransitionResource(cl, w.finalBloomBlurA.Get(), w.finalBloomBlurAState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+-
+-    float blurV[8] = {
+-        1.0f / (float)w.finalBloomDownWidth, 1.0f / (float)w.finalBloomDownHeight,
+-        0.0f, 1.0f, quarterRadius, g_gl.finalBloomStrength, 0.0f, 0.0f
+-    };
+-    QD3D12_TransitionResource(cl, w.finalBloomBlurB.Get(), w.finalBloomBlurBState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+-    QD3D12_FinalBloomPass(cl, g_gl.finalBloomBlurPSO.Get(), w.finalBloomBlurASrvGpu,
+-        w.finalBloomBlurBRtv, downViewport, downScissor, blurV);
+-    QD3D12_TransitionResource(cl, w.finalBloomBlurB.Get(), w.finalBloomBlurBState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+-
+-    D3D12_VIEWPORT fullViewport{};
+-    fullViewport.Width = (float)w.width;
+-    fullViewport.Height = (float)w.height;
+-    fullViewport.MinDepth = 0.0f;
+-    fullViewport.MaxDepth = 1.0f;
+-    D3D12_RECT fullScissor{ 0, 0, (LONG)w.width, (LONG)w.height };
++        w.finalBloomSceneBrightRtv, halfViewport, halfScissor, sceneBrightParams);
++    QD3D12_TransitionResource(cl, w.finalBloomSceneBright.Get(), w.finalBloomSceneBrightState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+ 
++    const D3D12_VIEWPORT fullViewport = QD3D12_FinalBloomViewport(w.width, w.height);
++    const D3D12_RECT fullScissor = QD3D12_FinalBloomScissor(w.width, w.height);
+     if (g_gl.finalBloomMode == 1u)
+     {
+-        QD3D12_PostFullscreenPass(cl, g_gl.postCopyPSO.Get(), w.finalBloomBrightSrvGpu,
++        QD3D12_PostFullscreenPass(cl, g_gl.postCopyPSO.Get(), w.finalBloomPyramidSrvGpu[0],
+             CurrentBackBufferRTV(), fullViewport, fullScissor);
++        QD3D12_BindTargetsForCurrentPhase(w);
++        return;
+     }
+-    else if (g_gl.finalBloomMode == 2u)
++    if (g_gl.finalBloomMode == 2u)
+     {
+-        QD3D12_PostFullscreenPass(cl, g_gl.postCopyPSO.Get(), w.finalBloomBlurBSrvGpu,
++        QD3D12_PostFullscreenPass(cl, g_gl.postCopyPSO.Get(), w.finalBloomSceneBrightSrvGpu,
+             CurrentBackBufferRTV(), fullViewport, fullScissor);
++        QD3D12_BindTargetsForCurrentPhase(w);
++        return;
+     }
+-    else
++
++    // Add source B to source A at the first pyramid level.
++    QD3D12_TransitionResource(cl, w.finalBloomPyramid[0].Get(), w.finalBloomPyramidState[0], D3D12_RESOURCE_STATE_RENDER_TARGET);
++    float addParams[8] = {
++        1.0f / (float)w.finalBloomLevelWidth[0], 1.0f / (float)w.finalBloomLevelHeight[0],
++        0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f
++    };
++    QD3D12_FinalBloomPass(cl, g_gl.finalBloomBrightAddPSO.Get(), w.finalBloomSceneBrightSrvGpu,
++        w.finalBloomPyramidRtv[0], halfViewport, halfScissor, addParams);
++    QD3D12_TransitionResource(cl, w.finalBloomPyramid[0].Get(), w.finalBloomPyramidState[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++
++    // Generate the 1/2, 1/4, 1/8 and 1/16 pyramid.
++    for (UINT level = 1; level < QD3D12_FinalBloomLevelCount; ++level)
+     {
++        const D3D12_VIEWPORT viewport = QD3D12_FinalBloomViewport(
++            w.finalBloomLevelWidth[level], w.finalBloomLevelHeight[level]);
++        const D3D12_RECT scissor = QD3D12_FinalBloomScissor(
++            w.finalBloomLevelWidth[level], w.finalBloomLevelHeight[level]);
++        float params[8] = {
++            1.0f / (float)w.finalBloomLevelWidth[level - 1],
++            1.0f / (float)w.finalBloomLevelHeight[level - 1],
++            0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f
++        };
++        QD3D12_TransitionResource(cl, w.finalBloomPyramid[level].Get(), w.finalBloomPyramidState[level], D3D12_RESOURCE_STATE_RENDER_TARGET);
++        cl->ClearRenderTargetView(w.finalBloomPyramidRtv[level], black, 0, nullptr);
++        QD3D12_FinalBloomPass(cl, g_gl.finalBloomDownsamplePSO.Get(), w.finalBloomPyramidSrvGpu[level - 1],
++            w.finalBloomPyramidRtv[level], viewport, scissor, params);
++        QD3D12_TransitionResource(cl, w.finalBloomPyramid[level].Get(), w.finalBloomPyramidState[level], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    }
++
++    // Blur and weight every level. Coarser levels form the wide atmospheric halo.
++    float scatterWeight = 1.0f;
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        const D3D12_VIEWPORT viewport = QD3D12_FinalBloomViewport(
++            w.finalBloomLevelWidth[level], w.finalBloomLevelHeight[level]);
++        const D3D12_RECT scissor = QD3D12_FinalBloomScissor(
++            w.finalBloomLevelWidth[level], w.finalBloomLevelHeight[level]);
++        const float divisor = (float)(1u << (level + 1u));
++        const float levelRadius = ClampValue<float>(g_gl.finalBloomRadius / divisor, 0.75f, 8.0f);
++        const float levelScale = g_gl.finalBloomStrength * scatterWeight;
++
++        float blurH[8] = {
++            1.0f / (float)w.finalBloomLevelWidth[level],
++            1.0f / (float)w.finalBloomLevelHeight[level],
++            1.0f, 0.0f, levelRadius, 1.0f, 0.0f, 0.0f
++        };
++        QD3D12_TransitionResource(cl, w.finalBloomTemp[level].Get(), w.finalBloomTempState[level], D3D12_RESOURCE_STATE_RENDER_TARGET);
++        cl->ClearRenderTargetView(w.finalBloomTempRtv[level], black, 0, nullptr);
++        QD3D12_FinalBloomPass(cl, g_gl.finalBloomBlurPSO.Get(), w.finalBloomPyramidSrvGpu[level],
++            w.finalBloomTempRtv[level], viewport, scissor, blurH);
++        QD3D12_TransitionResource(cl, w.finalBloomTemp[level].Get(), w.finalBloomTempState[level], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++
++        float blurV[8] = {
++            1.0f / (float)w.finalBloomLevelWidth[level],
++            1.0f / (float)w.finalBloomLevelHeight[level],
++            0.0f, 1.0f, levelRadius, levelScale, 0.0f, 0.0f
++        };
++        QD3D12_TransitionResource(cl, w.finalBloomPyramid[level].Get(), w.finalBloomPyramidState[level], D3D12_RESOURCE_STATE_RENDER_TARGET);
++        cl->ClearRenderTargetView(w.finalBloomPyramidRtv[level], black, 0, nullptr);
++        QD3D12_FinalBloomPass(cl, g_gl.finalBloomBlurPSO.Get(), w.finalBloomTempSrvGpu[level],
++            w.finalBloomPyramidRtv[level], viewport, scissor, blurV);
++        QD3D12_TransitionResource(cl, w.finalBloomPyramid[level].Get(), w.finalBloomPyramidState[level], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++        scatterWeight *= g_gl.finalBloomScatter;
++    }
++
++    if (g_gl.finalBloomMode == 3u)
++        cl->ClearRenderTargetView(CurrentBackBufferRTV(), black, 0, nullptr);
++    else
+         QD3D12_PostFullscreenPass(cl, g_gl.postCopyPSO.Get(), w.finalBloomSceneCopySrvGpu,
+             CurrentBackBufferRTV(), fullViewport, fullScissor);
+-        QD3D12_PostFullscreenPass(cl, g_gl.postAdditivePSO.Get(), w.finalBloomBlurBSrvGpu,
++
++    for (UINT level = 0; level < QD3D12_FinalBloomLevelCount; ++level)
++    {
++        QD3D12_PostFullscreenPass(cl, g_gl.postAdditivePSO.Get(), w.finalBloomPyramidSrvGpu[level],
+             CurrentBackBufferRTV(), fullViewport, fullScissor);
+     }
+ 
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 319f07e..95ce665 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1721,9 +1721,13 @@ void                       glRaytracingLightingSetToneMappingOptions(
+ 	uint32_t mode, float whitePoint, float saturation, float contrast);
+ void                       glRaytracingLightingSetBloomOptions(
+ 	uint32_t mode, float threshold, float strength, float radius, float softKnee);
+-// Final-scene Bloom 18.1: after transparent 3D effects, before 2D UI.
++ID3D12Resource*            glRaytracingLightingGetBloomHdrTexture(
++	uint32_t* width, uint32_t* height);
++// Final-scene Bloom 18.2: combines FP16 opaque HDR with final-scene transparent SDR.
+ void                       glFinalSceneBloomSetOptions(
+-	uint32_t mode, float threshold, float strength, float radius, float softKnee);
++	uint32_t mode, float hdrThreshold, float transparentThreshold,
++	float strength, float radius, float softKnee, float sourceGain, float scatter,
++	float hdrWeight, float transparentWeight);
+ void                       glFinalSceneBloomApply(void);
+ void                       glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 6483454..df6156a 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1496,20 +1496,29 @@ static void RB_RunRaytracedLightingPass(void)
+ 		bloomMode = 0;
+ 	else if (bloomMode > 6)
+ 		bloomMode = 6;
+-	const float bloomThreshold = r_dxrBloomThreshold ? r_dxrBloomThreshold->value : 1.20f;
+-	const float bloomStrength = r_dxrBloomStrength ? r_dxrBloomStrength->value : 0.22f;
+-	const float bloomRadius = r_dxrBloomRadius ? r_dxrBloomRadius->value : 6.0f;
+-	const float bloomSoftKnee = r_dxrBloomSoftKnee ? r_dxrBloomSoftKnee->value : 0.50f;
++	const float bloomThreshold = r_dxrBloomThreshold ? r_dxrBloomThreshold->value : 1.00f;
++	const float bloomTransparentThreshold = r_dxrBloomTransparentThreshold ? r_dxrBloomTransparentThreshold->value : 0.68f;
++	const float bloomStrength = r_dxrBloomStrength ? r_dxrBloomStrength->value : 0.36f;
++	const float bloomRadius = r_dxrBloomRadius ? r_dxrBloomRadius->value : 14.0f;
++	const float bloomSoftKnee = r_dxrBloomSoftKnee ? r_dxrBloomSoftKnee->value : 0.45f;
++	const float bloomSourceGain = r_dxrBloomSourceGain ? r_dxrBloomSourceGain->value : 2.20f;
++	const float bloomScatter = r_dxrBloomScatter ? r_dxrBloomScatter->value : 0.72f;
++	const float bloomHdrWeight = r_dxrBloomHdrWeight ? r_dxrBloomHdrWeight->value : 1.00f;
++	const float bloomTransparentWeight = r_dxrBloomTransparentWeight ? r_dxrBloomTransparentWeight->value : 1.20f;
+ 	glRaytracingLightingSetBloomOptions(
+ 		(uint32_t)bloomMode, bloomThreshold, bloomStrength, bloomRadius, bloomSoftKnee);
+ 	glFinalSceneBloomSetOptions(
+-		(uint32_t)bloomMode, bloomThreshold, bloomStrength, bloomRadius, bloomSoftKnee);
++		(uint32_t)bloomMode, bloomThreshold, bloomTransparentThreshold,
++		bloomStrength, bloomRadius, bloomSoftKnee, bloomSourceGain, bloomScatter,
++		bloomHdrWeight, bloomTransparentWeight);
+ 	if (bloomMode != s_lastBloomMode)
+ 	{
+ 		s_lastBloomMode = bloomMode;
+ 		ri.Printf(PRINT_ALL,
+-			"BLOOM_EXP18_1 mode=%d threshold=%.2f strength=%.2f radius=%.2f softKnee=%.2f toneMap=%d stage=FINAL_SCENE\n",
+-			bloomMode, bloomThreshold, bloomStrength, bloomRadius, bloomSoftKnee, toneMappingMode);
++			"BLOOM_EXP18_2 mode=%d hdrThreshold=%.2f transparentThreshold=%.2f strength=%.2f radius=%.2f softKnee=%.2f sourceGain=%.2f scatter=%.2f hdrWeight=%.2f transparentWeight=%.2f toneMap=%d stage=DUAL_SOURCE_MULTI_SCALE\n",
++			bloomMode, bloomThreshold, bloomTransparentThreshold, bloomStrength, bloomRadius,
++			bloomSoftKnee, bloomSourceGain, bloomScatter, bloomHdrWeight, bloomTransparentWeight,
++			toneMappingMode);
+ 	}
+ 
+ 	int atmosphereMode = r_dxrAtmosphereMode ? r_dxrAtmosphereMode->integer : 0;
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index f85e3eb..312aabe 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -91,6 +91,11 @@ cvar_t  *r_dxrBloomThreshold;
+ cvar_t  *r_dxrBloomStrength;
+ cvar_t  *r_dxrBloomRadius;
+ cvar_t  *r_dxrBloomSoftKnee;
++cvar_t  *r_dxrBloomTransparentThreshold;
++cvar_t  *r_dxrBloomSourceGain;
++cvar_t  *r_dxrBloomScatter;
++cvar_t  *r_dxrBloomHdrWeight;
++cvar_t  *r_dxrBloomTransparentWeight;
+ cvar_t  *r_dxrAtmosphereMode;
+ cvar_t  *r_dxrAtmosphereStrength;
+ cvar_t  *r_dxrAtmosphereDistanceScale;
+@@ -1042,10 +1047,15 @@ void R_Register( void ) {
+ 	r_dxrToneMapSaturation = ri.Cvar_Get( "r_dxrToneMapSaturation", "1.0", CVAR_ARCHIVE );
+ 	r_dxrToneMapContrast = ri.Cvar_Get( "r_dxrToneMapContrast", "1.0", CVAR_ARCHIVE );
+ 	r_dxrBloomMode = ri.Cvar_Get( "r_dxrBloomMode", "0", CVAR_ARCHIVE );
+-	r_dxrBloomThreshold = ri.Cvar_Get( "r_dxrBloomThreshold", "0.72", CVAR_ARCHIVE );
+-	r_dxrBloomStrength = ri.Cvar_Get( "r_dxrBloomStrength", "0.26", CVAR_ARCHIVE );
+-	r_dxrBloomRadius = ri.Cvar_Get( "r_dxrBloomRadius", "10.0", CVAR_ARCHIVE );
+-	r_dxrBloomSoftKnee = ri.Cvar_Get( "r_dxrBloomSoftKnee", "0.35", CVAR_ARCHIVE );
++	r_dxrBloomThreshold = ri.Cvar_Get( "r_dxrBloomThreshold", "1.00", CVAR_ARCHIVE );
++	r_dxrBloomTransparentThreshold = ri.Cvar_Get( "r_dxrBloomTransparentThreshold", "0.68", CVAR_ARCHIVE );
++	r_dxrBloomStrength = ri.Cvar_Get( "r_dxrBloomStrength", "0.36", CVAR_ARCHIVE );
++	r_dxrBloomRadius = ri.Cvar_Get( "r_dxrBloomRadius", "14.0", CVAR_ARCHIVE );
++	r_dxrBloomSoftKnee = ri.Cvar_Get( "r_dxrBloomSoftKnee", "0.45", CVAR_ARCHIVE );
++	r_dxrBloomSourceGain = ri.Cvar_Get( "r_dxrBloomSourceGain", "2.20", CVAR_ARCHIVE );
++	r_dxrBloomScatter = ri.Cvar_Get( "r_dxrBloomScatter", "0.72", CVAR_ARCHIVE );
++	r_dxrBloomHdrWeight = ri.Cvar_Get( "r_dxrBloomHdrWeight", "1.00", CVAR_ARCHIVE );
++	r_dxrBloomTransparentWeight = ri.Cvar_Get( "r_dxrBloomTransparentWeight", "1.20", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereStrength = ri.Cvar_Get( "r_dxrAtmosphereStrength", "1.0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereDistanceScale = ri.Cvar_Get( "r_dxrAtmosphereDistanceScale", "1.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 5771977..e3fc51d 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1144,11 +1144,16 @@ extern cvar_t   *r_dxrToneMappingMode; // 0 legacy clamp, 1 Reinhard, 2 ACES, 3
+ extern cvar_t   *r_dxrToneMapWhitePoint; // highlight shoulder reference point
+ extern cvar_t   *r_dxrToneMapSaturation; // presentation saturation after tone mapping
+ extern cvar_t   *r_dxrToneMapContrast; // presentation contrast after tone mapping
+-extern cvar_t   *r_dxrBloomMode; // 0 off, 1 bright-mask, 2 bloom-only, 3 subtle, 4 torch, 5 balanced, 6 cinematic
+-extern cvar_t   *r_dxrBloomThreshold; // final SDR scene luminance threshold
+-extern cvar_t   *r_dxrBloomStrength; // bloom additive strength
+-extern cvar_t   *r_dxrBloomRadius; // blur radius in pixels before mode scaling
++extern cvar_t   *r_dxrBloomMode; // 0 off, 1 HDR mask, 2 final-scene mask, 3 Bloom-only, 4 subtle, 5 balanced, 6 strong
++extern cvar_t   *r_dxrBloomThreshold; // opaque FP16 HDR threshold
++extern cvar_t   *r_dxrBloomTransparentThreshold; // final-scene SDR threshold
++extern cvar_t   *r_dxrBloomStrength; // total additive Bloom strength
++extern cvar_t   *r_dxrBloomRadius; // full-resolution blur radius reference
+ extern cvar_t   *r_dxrBloomSoftKnee; // threshold transition softness
++extern cvar_t   *r_dxrBloomSourceGain; // pre-blur gain for final-scene SDR fire/particles
++extern cvar_t   *r_dxrBloomScatter; // relative contribution of coarse pyramid levels
++extern cvar_t   *r_dxrBloomHdrWeight; // opaque FP16 HDR source weight
++extern cvar_t   *r_dxrBloomTransparentWeight; // final-scene transparent/SDR source weight
+ extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
+ extern cvar_t   *r_dxrAtmosphereStrength; // global fog strength multiplier
+ extern cvar_t   *r_dxrAtmosphereDistanceScale; // >1 pushes fog farther away, <1 brings it closer

@@ -1,0 +1,12 @@
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1539,6 +1539,8 @@ enum GeometryFlag_t
+ };
+ 
+ void APIENTRY glGeometryFlagf(GLfloat flag);
++void APIENTRY glSurfaceRoughnessf(GLfloat roughness);
++void APIENTRY glMaterialTypef(GLfloat materialType);
+ 
+ void glUpdateBottomAccelStructure(bool opaque, uint32_t& meshHandle);
+ void glUpdateTopLevelAceelStructure(uint32_t mesh, float* transform, uint32_t& topLevelHandle);

@@ -1,0 +1,340 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index c1aa218..6df1449 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1763,10 +1763,14 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t contactShadows;
+ 	uint32_t frameIndex;
+ 	uint32_t dynamicLightQualityMode;
+-	uint32_t qualityPad1;
++	uint32_t atmosphereMode;
++	uint32_t mapFogMode;
++	uint32_t atmospherePad[3];
++	float mapFogColor[4];
++	float mapFogParams[4];
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 256,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 304,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1857,7 +1861,10 @@ cbuffer LightingCB : register(b0)
+     uint     gContactShadows;
+     uint     gFrameIndex;
+     uint     gDynamicLightQualityMode;
+-    uint     gQualityPad1;
++    uint     gAtmosphereMode;
++    uint     gMapFogMode;
++    float4   gMapFogColor;
++    float4   gMapFogParams;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -2393,6 +2400,93 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+ }
+ )"
+ R"(
++float ComputeLinearFogAmount(float distanceToCamera, float startDistance, float endDistance)
++{
++    float span = max(endDistance - startDistance, 1.0);
++    return saturate((distanceToCamera - startDistance) / span);
++}
++
++float ComputeMapFogAmount(float distanceToCamera)
++{
++    float startDistance = gMapFogParams.x;
++    float endDistance = gMapFogParams.y;
++    float density = max(gMapFogParams.z, 0.0);
++
++    if (gMapFogMode == 1u)
++    {
++        return ComputeLinearFogAmount(distanceToCamera, startDistance, endDistance);
++    }
++    if (gMapFogMode == 2u)
++    {
++        return saturate(1.0 - exp(-density * distanceToCamera));
++    }
++    if (gMapFogMode == 3u)
++    {
++        float d = density * distanceToCamera;
++        return saturate(1.0 - exp(-(d * d)));
++    }
++    return 0.0;
++}
++
++float3 ApplyDXRAtmosphere(float3 color, float3 worldPos)
++{
++    uint mode = min(gAtmosphereMode, 6u);
++    if (mode == 0u)
++        return color;
++
++    float distanceToCamera = length(worldPos - gCameraPos.xyz);
++    float fogAmount = 0.0;
++    float3 fogColor = float3(0.18, 0.20, 0.22);
++
++    if (mode == 1u)
++    {
++        fogAmount = ComputeMapFogAmount(distanceToCamera);
++        fogColor = gMapFogColor.rgb;
++    }
++    else if (mode == 2u)
++    {
++        if (gMapFogMode != 0u)
++        {
++            fogAmount = ComputeMapFogAmount(distanceToCamera);
++            fogColor = gMapFogColor.rgb;
++        }
++        else
++        {
++            fogAmount = ComputeLinearFogAmount(distanceToCamera, 550.0, 2600.0) * 0.48;
++            fogColor = float3(0.17, 0.19, 0.21);
++        }
++    }
++    else if (mode == 3u)
++    {
++        fogAmount = ComputeLinearFogAmount(distanceToCamera, 220.0, 1500.0) * 0.72;
++        fogColor = float3(0.15, 0.19, 0.24);
++    }
++    else if (mode == 4u)
++    {
++        fogAmount = ComputeLinearFogAmount(distanceToCamera, 160.0, 1200.0) * 0.60;
++        fogColor = float3(0.27, 0.21, 0.15);
++    }
++    else if (mode == 5u)
++    {
++        float distanceFog = ComputeLinearFogAmount(distanceToCamera, 180.0, 1700.0);
++        float belowCamera = saturate((gCameraPos.z - worldPos.z + 48.0) / 320.0);
++        float lowLayer = smoothstep(0.05, 0.95, belowCamera);
++        fogAmount = saturate(distanceFog * 0.28 + lowLayer * 0.52);
++        fogColor = float3(0.18, 0.22, 0.24);
++    }
++    else
++    {
++        float distanceFog = ComputeLinearFogAmount(distanceToCamera, 100.0, 1250.0);
++        float belowCamera = saturate((gCameraPos.z - worldPos.z + 32.0) / 420.0);
++        float layer = smoothstep(0.0, 1.0, belowCamera);
++        fogAmount = saturate(distanceFog * 0.58 + layer * 0.28);
++        fogColor = float3(0.13, 0.17, 0.21);
++    }
++
++    fogAmount = min(saturate(fogAmount), 0.90);
++    return lerp(color, fogColor, fogAmount);
++}
++
+ [shader("raygeneration")]
+ void RayGen()
+ {
+@@ -2599,7 +2693,8 @@ void RayGen()
+ 
+     if (geoFlag == GEOMETRY_FLAG_UNLIT)
+     {
+-        gOutputTex[pixel] = float4(baseAlbedo, albedoSample.a);
++        float3 unlitColor = ApplyDXRAtmosphere(baseAlbedo, worldPos);
++        gOutputTex[pixel] = float4(unlitColor, albedoSample.a);
+     }
+     else
+     {
+@@ -2614,6 +2709,7 @@ void RayGen()
+             saturate(gLegacyShadowStrength) * legacyShadowInfluence);
+         legacyShadow = max(legacyShadow, saturate(gShadowMinVisibility));
+         float3 finalColor = lerp(rtLitColor, baseAlbedo * legacyShadow, legacyKeep);
++        finalColor = ApplyDXRAtmosphere(finalColor, worldPos);
+         finalColor *= max(gExposure, 0.001);
+ 
+         if (gDebugMode == 1)
+@@ -3157,6 +3253,20 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.contactShadowLength = 96.0f;
+ 	g_glRaytracingLighting.constants.contactShadows = 0u;
+ 	g_glRaytracingLighting.constants.frameIndex = 0u;
++	g_glRaytracingLighting.constants.dynamicLightQualityMode = 0u;
++	g_glRaytracingLighting.constants.atmosphereMode = 0u;
++	g_glRaytracingLighting.constants.mapFogMode = 0u;
++	g_glRaytracingLighting.constants.atmospherePad[0] = 0u;
++	g_glRaytracingLighting.constants.atmospherePad[1] = 0u;
++	g_glRaytracingLighting.constants.atmospherePad[2] = 0u;
++	g_glRaytracingLighting.constants.mapFogColor[0] = 0.18f;
++	g_glRaytracingLighting.constants.mapFogColor[1] = 0.20f;
++	g_glRaytracingLighting.constants.mapFogColor[2] = 0.22f;
++	g_glRaytracingLighting.constants.mapFogColor[3] = 1.0f;
++	g_glRaytracingLighting.constants.mapFogParams[0] = 0.0f;
++	g_glRaytracingLighting.constants.mapFogParams[1] = 1.0f;
++	g_glRaytracingLighting.constants.mapFogParams[2] = 0.0f;
++	g_glRaytracingLighting.constants.mapFogParams[3] = 0.0f;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -3314,6 +3424,29 @@ void glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetAtmosphereOptions(
++	uint32_t atmosphereMode,
++	uint32_t mapFogMode,
++	float fogR,
++	float fogG,
++	float fogB,
++	float fogStart,
++	float fogEnd,
++	float fogDensity)
++{
++	g_glRaytracingLighting.constants.atmosphereMode = glRaytracingClamp<uint32_t>(atmosphereMode, 0u, 6u);
++	g_glRaytracingLighting.constants.mapFogMode = glRaytracingClamp<uint32_t>(mapFogMode, 0u, 3u);
++	g_glRaytracingLighting.constants.mapFogColor[0] = glRaytracingClamp<float>(fogR, 0.0f, 4.0f);
++	g_glRaytracingLighting.constants.mapFogColor[1] = glRaytracingClamp<float>(fogG, 0.0f, 4.0f);
++	g_glRaytracingLighting.constants.mapFogColor[2] = glRaytracingClamp<float>(fogB, 0.0f, 4.0f);
++	g_glRaytracingLighting.constants.mapFogColor[3] = 1.0f;
++	g_glRaytracingLighting.constants.mapFogParams[0] = fogStart;
++	g_glRaytracingLighting.constants.mapFogParams[1] = (fogEnd > fogStart + 1.0f) ? fogEnd : (fogStart + 1.0f);
++	g_glRaytracingLighting.constants.mapFogParams[2] = (fogDensity > 0.0f) ? fogDensity : 0.0f;
++	g_glRaytracingLighting.constants.mapFogParams[3] = 0.0f;
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 6da7b58..a8a0f69 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1714,6 +1714,11 @@ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
+ void                       glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode);
++void                       glRaytracingLightingSetAtmosphereOptions(
++	uint32_t atmosphereMode,
++	uint32_t mapFogMode,
++	float fogR, float fogG, float fogB,
++	float fogStart, float fogEnd, float fogDensity);
+ void                       glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index d05f7cc..ab3ae2c 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1216,6 +1216,7 @@ static void RB_RunRaytracedLightingPass(void)
+ {
+ 	static int s_lastDXRDebugPrintTime = 0;
+ 	static int s_lastDynamicLightQualityMode = -1;
++	static int s_lastAtmosphereMode = -1;
+ 
+ 	if (backEnd.raytraceRendered || !RB_DXRShouldRenderLighting())
+ 	{
+@@ -1301,6 +1302,63 @@ static void RB_RunRaytracedLightingPass(void)
+ 		ri.Printf(PRINT_ALL, "DYNAMIC_LIGHT_QUALITY_EXP14 mode=%d\n", dynamicLightQualityMode);
+ 	}
+ 
++	int atmosphereMode = r_dxrAtmosphereMode ? r_dxrAtmosphereMode->integer : 0;
++	if (atmosphereMode < 0)
++		atmosphereMode = 0;
++	else if (atmosphereMode > 6)
++		atmosphereMode = 6;
++
++	uint32_t mapFogMode = 0u;
++	float mapFogColor[3] = { 0.18f, 0.20f, 0.22f };
++	float mapFogStart = 0.0f;
++	float mapFogEnd = 1.0f;
++	float mapFogDensity = 0.0f;
++
++	const glfog_t* activeFog = NULL;
++	if (r_wolffog && r_wolffog->integer)
++	{
++		if (glfogsettings[FOG_CURRENT].registered)
++		{
++			activeFog = &glfogsettings[FOG_CURRENT];
++		}
++		else if (glfogNum > FOG_NONE && glfogNum < NUM_FOGS && glfogsettings[glfogNum].registered)
++		{
++			activeFog = &glfogsettings[glfogNum];
++		}
++	}
++
++	if (activeFog)
++	{
++		if (activeFog->mode == GL_LINEAR)
++			mapFogMode = 1u;
++		else if (activeFog->mode == GL_EXP)
++			mapFogMode = 2u;
++		else if (activeFog->mode == GL_EXP2)
++			mapFogMode = 3u;
++
++		mapFogColor[0] = activeFog->color[0];
++		mapFogColor[1] = activeFog->color[1];
++		mapFogColor[2] = activeFog->color[2];
++		mapFogStart = activeFog->start;
++		mapFogEnd = activeFog->end;
++		mapFogDensity = activeFog->density;
++	}
++
++	glRaytracingLightingSetAtmosphereOptions(
++		(uint32_t)atmosphereMode,
++		mapFogMode,
++		mapFogColor[0], mapFogColor[1], mapFogColor[2],
++		mapFogStart, mapFogEnd, mapFogDensity);
++
++	if (atmosphereMode != s_lastAtmosphereMode)
++	{
++		s_lastAtmosphereMode = atmosphereMode;
++		ri.Printf(PRINT_ALL,
++			"ATMOSPHERIC_FOG_EXP15 mode=%d mapFogMode=%u start=%.1f end=%.1f density=%.5f color=%.3f/%.3f/%.3f\n",
++			atmosphereMode, mapFogMode, mapFogStart, mapFogEnd, mapFogDensity,
++			mapFogColor[0], mapFogColor[1], mapFogColor[2]);
++	}
++
+ 	RB_AddDXRFallbackLightIfNeeded();
+ 
+ 	if (r_dxrDebug && r_dxrDebug->integer)
+@@ -1310,7 +1368,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d dlqMode=%d\n",
++				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d dlqMode=%d atmosphereMode=%d mapFogMode=%u\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1330,7 +1388,9 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrLegacyBlend ? r_dxrLegacyBlend->value : 0.0f,
+ 				r_dxrExposure ? r_dxrExposure->value : 0.0f,
+ 				r_dxrDebugMode ? r_dxrDebugMode->integer : 0,
+-				dynamicLightQualityMode);
++				dynamicLightQualityMode,
++				atmosphereMode,
++				mapFogMode);
+ 		}
+ 	}
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index d8612a3..3b05060 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -81,6 +81,7 @@ cvar_t  *r_dxrExposure;
+ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrDynamicLightQualityMode;
++cvar_t  *r_dxrAtmosphereMode;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
+@@ -1020,6 +1021,7 @@ void R_Register( void ) {
+ 	r_dxrDebug = ri.Cvar_Get( "r_dxrDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
++	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index df3379d..ab24d49 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1139,6 +1139,7 @@ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR reso
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
++extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;

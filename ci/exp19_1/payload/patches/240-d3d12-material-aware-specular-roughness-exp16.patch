@@ -1,0 +1,636 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index fc46e0b..3280aa8 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1765,7 +1765,8 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t dynamicLightQualityMode;
+ 	uint32_t atmosphereMode;
+ 	uint32_t mapFogMode;
+-	uint32_t atmospherePad[3];
++	uint32_t materialSpecularMode;
++	uint32_t atmospherePad[2];
+ 	float mapFogColor[4];
+ 	float mapFogParams[4];
+ 	float atmosphereControls[4]; // strength, distanceScale, maxOpacity, reserved
+@@ -1865,6 +1866,8 @@ cbuffer LightingCB : register(b0)
+     uint     gDynamicLightQualityMode;
+     uint     gAtmosphereMode;
+     uint     gMapFogMode;
++    uint     gMaterialSpecularMode;
++    uint2    gMaterialPad;
+     float4   gMapFogColor;
+     float4   gMapFogParams;
+     float4   gAtmosphereControls;
+@@ -2372,36 +2375,235 @@ float ComputeCavity(uint2 pixel, float3 worldPos, float3 N)
+     return 1.0 - cavity * 0.10;
+ }
+ 
+-float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float lightIntensity, float atten, float shadow, float3 baseAlbedo)
+-{
+-    if (gEnableSpecular == 0)
+-        return 0.0;
++static const uint DXR_MATERIAL_GENERIC = 0u;
++static const uint DXR_MATERIAL_STONE = 1u;
++static const uint DXR_MATERIAL_METAL = 2u;
++static const uint DXR_MATERIAL_WOOD = 3u;
++static const uint DXR_MATERIAL_GLASS = 4u;
++static const uint DXR_MATERIAL_SNOW = 5u;
++static const uint DXR_MATERIAL_ORGANIC = 6u;
++static const uint DXR_MATERIAL_SOFT = 7u;
++static const uint DXR_MATERIAL_CERAMIC = 8u;
++static const uint DXR_MATERIAL_RUBBLE = 9u;
++static const uint DXR_MATERIAL_WEAPON = 10u;
+ 
++float3 ComputeLegacySpecular(
++    float3 N, float3 V, float3 L, float3 lightColor,
++    float lightIntensity, float atten, float shadow, float3 baseAlbedo)
++{
+     float3 H = normalize(V + L);
+-
+     float NdotL = saturate(dot(N, L));
+     float NdotV = saturate(dot(N, V));
+     float NdotH = saturate(dot(N, H));
+     float VdotH = saturate(dot(V, H));
+-
+     if (NdotL <= 0.0 || NdotV <= 0.0)
+         return 0.0;
+ 
+     float shininess = 48.0;
+     float specPow = pow(NdotH, shininess);
+-
+     float3 dielectricF0 = float3(0.04, 0.04, 0.04);
+-    float luminance = dot(baseAlbedo, float3(0.299, 0.587, 0.114));
+     float metalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.75) * 1.5);
+     float3 F0 = lerp(dielectricF0, baseAlbedo, metalHint);
+-
+     float3 fresnel = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+-
+     float energyNorm = (shininess + 8.0) * 0.125;
+     float3 spec = fresnel * specPow * energyNorm;
++    return lightColor * (lightIntensity * atten * shadow * NdotL) * spec;
++}
++
++)"
++R"(
++float3 ComputeRoughnessOnlyGGXSpecular(
++    float3 N, float3 V, float3 L, float3 lightColor,
++    float lightIntensity, float atten, float shadow, float3 baseAlbedo,
++    float surfaceRoughness)
++{
++    float3 H = normalize(V + L);
++    float NdotL = saturate(dot(N, L));
++    float NdotV = saturate(dot(N, V));
++    float NdotH = saturate(dot(N, H));
++    float VdotH = saturate(dot(V, H));
++    if (NdotL <= 0.0 || NdotV <= 0.0)
++        return 0.0;
++
++    float roughness = clamp(surfaceRoughness, 0.08, 0.99);
++    float alpha = roughness * roughness;
++    float alpha2 = alpha * alpha;
++    float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
++    float D = alpha2 / max(3.14159265 * denom * denom, 1e-5);
++    float k = roughness + 1.0;
++    k = (k * k) * 0.125;
++    float Gv = NdotV / max(NdotV * (1.0 - k) + k, 1e-5);
++    float Gl = NdotL / max(NdotL * (1.0 - k) + k, 1e-5);
++    float metalHint = saturate((max(max(baseAlbedo.r, baseAlbedo.g), baseAlbedo.b) - 0.75) * 1.5);
++    float3 F0 = lerp(float3(0.04, 0.04, 0.04), baseAlbedo, metalHint);
++    float3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
++    float3 brdf = (D * Gv * Gl * F) / max(4.0 * NdotV * NdotL, 1e-4);
++    brdf = min(brdf * 0.60, 2.5);
++    return lightColor * (lightIntensity * atten * shadow * NdotL) * brdf;
++}
++
++float3 MaterialF0(uint materialType, float3 baseAlbedo)
++{
++    if (materialType == DXR_MATERIAL_METAL)
++        return saturate(baseAlbedo * 0.78 + 0.10);
++    if (materialType == DXR_MATERIAL_WEAPON)
++        return saturate(baseAlbedo * 0.58 + 0.12);
++    if (materialType == DXR_MATERIAL_GLASS)
++        return float3(0.075, 0.075, 0.075);
++    if (materialType == DXR_MATERIAL_CERAMIC)
++        return float3(0.050, 0.050, 0.050);
++    if (materialType == DXR_MATERIAL_STONE || materialType == DXR_MATERIAL_RUBBLE)
++        return float3(0.022, 0.022, 0.022);
++    if (materialType == DXR_MATERIAL_WOOD)
++        return float3(0.028, 0.025, 0.022);
++    if (materialType == DXR_MATERIAL_SNOW)
++        return float3(0.020, 0.020, 0.020);
++    if (materialType == DXR_MATERIAL_ORGANIC)
++        return float3(0.018, 0.018, 0.018);
++    if (materialType == DXR_MATERIAL_SOFT)
++        return float3(0.012, 0.012, 0.012);
++    return float3(0.035, 0.035, 0.035);
++}
++
++float MaterialSpecularScale(uint materialType, bool strictMode)
++{
++    float scale = 0.34;
++    if (materialType == DXR_MATERIAL_METAL) scale = 1.00;
++    else if (materialType == DXR_MATERIAL_WEAPON) scale = 0.82;
++    else if (materialType == DXR_MATERIAL_GLASS) scale = 0.78;
++    else if (materialType == DXR_MATERIAL_CERAMIC) scale = 0.32;
++    else if (materialType == DXR_MATERIAL_WOOD) scale = 0.16;
++    else if (materialType == DXR_MATERIAL_STONE) scale = 0.11;
++    else if (materialType == DXR_MATERIAL_RUBBLE) scale = 0.07;
++    else if (materialType == DXR_MATERIAL_SNOW) scale = 0.09;
++    else if (materialType == DXR_MATERIAL_ORGANIC) scale = 0.055;
++    else if (materialType == DXR_MATERIAL_SOFT) scale = 0.025;
++
++    if (strictMode && materialType != DXR_MATERIAL_METAL &&
++        materialType != DXR_MATERIAL_WEAPON && materialType != DXR_MATERIAL_GLASS)
++    {
++        scale *= 0.55;
++    }
++    return scale;
++}
++
++float3 ComputeMaterialGGXSpecular(
++    float3 N, float3 V, float3 L, float3 lightColor,
++    float lightIntensity, float atten, float shadow, float3 baseAlbedo,
++    float surfaceRoughness, uint materialType, bool strictMode)
++{
++    float3 H = normalize(V + L);
++    float NdotL = saturate(dot(N, L));
++    float NdotV = saturate(dot(N, V));
++    float NdotH = saturate(dot(N, H));
++    float VdotH = saturate(dot(V, H));
++    if (NdotL <= 0.0 || NdotV <= 0.0)
++        return 0.0;
++
++    float roughness = clamp(surfaceRoughness, 0.08, 0.99);
++    if (strictMode && materialType != DXR_MATERIAL_METAL &&
++        materialType != DXR_MATERIAL_WEAPON && materialType != DXR_MATERIAL_GLASS)
++    {
++        roughness = min(0.99, roughness + 0.08);
++    }
++
++    float alpha = roughness * roughness;
++    float alpha2 = alpha * alpha;
++    float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
++    float D = alpha2 / max(3.14159265 * denom * denom, 1e-5);
++
++    float k = (roughness + 1.0);
++    k = (k * k) * 0.125;
++    float Gv = NdotV / max(NdotV * (1.0 - k) + k, 1e-5);
++    float Gl = NdotL / max(NdotL * (1.0 - k) + k, 1e-5);
++    float G = Gv * Gl;
++
++    float3 F0 = MaterialF0(materialType, baseAlbedo);
++    float3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
++    float3 brdf = (D * G * F) / max(4.0 * NdotV * NdotL, 1e-4);
++    brdf *= MaterialSpecularScale(materialType, strictMode);
++    brdf = min(brdf, 2.5);
+ 
++    return lightColor * (lightIntensity * atten * shadow * NdotL) * brdf;
++}
++
++)"
++R"(
++float3 ComputeMaterialBlinnSpecular(
++    float3 N, float3 V, float3 L, float3 lightColor,
++    float lightIntensity, float atten, float shadow, float3 baseAlbedo, uint materialType)
++{
++    float3 H = normalize(V + L);
++    float NdotL = saturate(dot(N, L));
++    float NdotV = saturate(dot(N, V));
++    float NdotH = saturate(dot(N, H));
++    float VdotH = saturate(dot(V, H));
++    if (NdotL <= 0.0 || NdotV <= 0.0)
++        return 0.0;
++
++    float shininess = 48.0;
++    float specPow = pow(NdotH, shininess);
++    float3 F0 = MaterialF0(materialType, baseAlbedo);
++    float3 fresnel = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
++    float3 spec = fresnel * specPow * ((shininess + 8.0) * 0.125);
++    spec *= MaterialSpecularScale(materialType, false);
+     return lightColor * (lightIntensity * atten * shadow * NdotL) * spec;
+ }
++
++float3 ComputeSpecular(
++    float3 N, float3 V, float3 L, float3 lightColor,
++    float lightIntensity, float atten, float shadow, float3 baseAlbedo,
++    float surfaceRoughness, uint materialType, float geoFlag)
++{
++    if (gEnableSpecular == 0)
++        return 0.0;
++
++    if (gMaterialSpecularMode == 0u)
++    {
++        return ComputeLegacySpecular(
++            N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo);
++    }
++
++    if (gMaterialSpecularMode == 1u)
++    {
++        // Roughness-channel A/B: keep the old albedo-based metal guess, but
++        // replace the fixed shininess with the per-surface roughness carried
++        // by the G-buffer.
++        return ComputeRoughnessOnlyGGXSpecular(
++            N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo,
++            surfaceRoughness);
++    }
++
++    if (gMaterialSpecularMode == 2u)
++    {
++        // Isolate the bad albedo-brightness metal guess: retain the old lobe
++        // shape while replacing F0 and intensity with RTCW material classes.
++        return ComputeMaterialBlinnSpecular(
++            N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo, materialType);
++    }
++
++    bool organicPixel = (materialType == DXR_MATERIAL_ORGANIC) ||
++                        ((uint)(geoFlag + 0.5) == GEOMETRY_FLAG_SKELETAL &&
++                         materialType != DXR_MATERIAL_WEAPON);
++
++    if (gMaterialSpecularMode == 3u && !organicPixel)
++    {
++        // Character-only A/B: leave the world on the exact legacy response.
++        return ComputeLegacySpecular(
++            N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo);
++    }
++    if (gMaterialSpecularMode == 4u && organicPixel)
++    {
++        // World-only A/B: leave characters on the exact legacy response.
++        return ComputeLegacySpecular(
++            N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo);
++    }
++
++    bool strictMode = (gMaterialSpecularMode == 6u);
++    return ComputeMaterialGGXSpecular(
++        N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo,
++        surfaceRoughness, materialType, strictMode);
++}
+ )"
+ R"(
+ float AtmosphereDistance(float distanceToCamera)
+@@ -2544,9 +2746,16 @@ void RayGen()
+     float3 worldPos = positionSample.xyz;
+     float3 N = normalSample.xyz * rsqrt(normalLenSq);
+     float3 V = normalize(gCameraPos.xyz - worldPos);
++    float surfaceRoughness = saturate(normalSample.w);
+ 
+-    // Raster G-buffer stores geometryFlag + 1 so zero remains an invalid marker.
+-    float geoFlag = positionSample.w - 1.0;
++    // The integer part stores geometryFlag + 1.  Experiment 16 packs the
++    // small material id into the fractional hundredths without consuming an
++    // additional G-buffer target.
++    float packedSurface = positionSample.w;
++    float geometryMarker = floor(packedSurface + 0.0001);
++    float geoFlag = geometryMarker - 1.0;
++    uint materialType = (uint)clamp(
++        floor((packedSurface - geometryMarker) * 100.0 + 0.5), 0.0, 31.0);
+ 
+     float cavity = ComputeCavity(pixel, worldPos, N);
+     float microShadow = lerp(0.90, 1.0, cavity);
+@@ -2617,7 +2826,8 @@ void RayGen()
+             lightingAccum += DynamicLightSoftPeak(diffuse);
+ 
+             float3 pointSpecular = ComputeSpecular(
+-                N, V, L, effectiveColor, specularIntensity, atten, shadow, baseAlbedo);
++                N, V, L, effectiveColor, specularIntensity, atten, shadow, baseAlbedo,
++                surfaceRoughness, materialType, geoFlag);
+             specularAccum += DynamicLightSoftPeak(pointSpecular);
+         }
+         else if (Lgt.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+@@ -2682,7 +2892,10 @@ void RayGen()
+                     rectSpecularIntensity * faceTerm,
+                     1.0,
+                     1.0,
+-                    baseAlbedo);
++                    baseAlbedo,
++                    surfaceRoughness,
++                    materialType,
++                    geoFlag);
+             }
+ 
+             rectDiffuseAccum /= (float)sampleCount;
+@@ -2705,7 +2918,9 @@ void RayGen()
+     if (geoFlag == GEOMETRY_FLAG_SKELETAL)
+     {
+         lightingAccum *= 1.05;
+-        specularAccum *= 1.05;
++        // Do not globally boost character specular.  Material mode 0 already
++        // preserves the legacy response; material-aware modes control organic
++        // highlights explicitly.
+     }
+ 
+     if (geoFlag == GEOMETRY_FLAG_UNLIT)
+@@ -3449,6 +3664,12 @@ void glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetMaterialSpecularMode(uint32_t mode)
++{
++	g_glRaytracingLighting.constants.materialSpecularMode = glRaytracingClamp<uint32_t>(mode, 0u, 6u);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+diff --git a/src/opengl/gl_d3d12shim.cpp b/src/opengl/gl_d3d12shim.cpp
+index 4ce9012..299d355 100644
+--- a/src/opengl/gl_d3d12shim.cpp
++++ b/src/opengl/gl_d3d12shim.cpp
+@@ -1606,7 +1606,10 @@ PSOut PSMain(VSOut i)
+     PSOut o;
+     o.color = BuildTexturedColor(i);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x + 1.0);
++    // Pack the small integer material id into the fractional part.  The
++    // integer part remains geometryFlag + 1, so zero still marks an invalid
++    // G-buffer pixel and existing geometry classification remains intact.
++    o.position = float4(i.worldPos, i.attr.x + 1.0 + clamp(i.attr.z, 0.0, 31.0) * 0.01);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+@@ -1617,7 +1620,10 @@ PSOut PSMainAlphaTest(VSOut i)
+     o.color = BuildTexturedColor(i);
+     QD3D12_AlphaTest(o.color.a);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x + 1.0);
++    // Pack the small integer material id into the fractional part.  The
++    // integer part remains geometryFlag + 1, so zero still marks an invalid
++    // G-buffer pixel and existing geometry classification remains intact.
++    o.position = float4(i.worldPos, i.attr.x + 1.0 + clamp(i.attr.z, 0.0, 31.0) * 0.01);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+@@ -1627,7 +1633,10 @@ PSOut PSMainUntextured(VSOut i)
+     PSOut o;
+     o.color = ApplyFog(i.col, i.fogCoord);
+     o.normal = float4(i.normal, i.attr.y);
+-    o.position = float4(i.worldPos, i.attr.x + 1.0);
++    // Pack the small integer material id into the fractional part.  The
++    // integer part remains geometryFlag + 1, so zero still marks an invalid
++    // G-buffer pixel and existing geometry classification remains intact.
++    o.position = float4(i.worldPos, i.attr.x + 1.0 + clamp(i.attr.z, 0.0, 31.0) * 0.01);
+     o.velocity = BuildVelocity(i);
+     return o;
+ }
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 496efaf..80e8b13 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1714,6 +1714,7 @@ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
+ void                       glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode);
++void                       glRaytracingLightingSetMaterialSpecularMode(uint32_t mode);
+ void                       glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 9c99899..207fb7a 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1140,12 +1140,164 @@ void RB_UpdateDXRMesh(trDXRMesh_t* mesh, int currentFrame, int surfaceId, int st
+ /*
+ ==================
+ RB_UpdateDrawSurfFlags
++
++Material-Aware Specular / Roughness Experiment 16.  RTCW already carries
++useful surfaceparm flags, while animated characters and first-person weapons
++can be separated through geometry type and RF_DEPTHHACK.  Feed this existing
++information into the D3D12 G-buffer instead of guessing metal from albedo.
+ ==================
+ */
+-void RB_UpdateDrawSurfFlags(drawSurf_t* surf, shader_t *shader)
++typedef enum
++{
++	DXR_MATERIAL_GENERIC = 0,
++	DXR_MATERIAL_STONE = 1,
++	DXR_MATERIAL_METAL = 2,
++	DXR_MATERIAL_WOOD = 3,
++	DXR_MATERIAL_GLASS = 4,
++	DXR_MATERIAL_SNOW = 5,
++	DXR_MATERIAL_ORGANIC = 6,
++	DXR_MATERIAL_SOFT = 7,
++	DXR_MATERIAL_CERAMIC = 8,
++	DXR_MATERIAL_RUBBLE = 9,
++	DXR_MATERIAL_WEAPON = 10
++} dxrMaterialType_t;
++
++static qboolean RB_DXRShaderNameContains(const shader_t* shader, const char* token)
++{
++	char lowerName[MAX_QPATH];
++	if (!shader || !token || !token[0])
++		return qfalse;
++	Q_strncpyz(lowerName, shader->name, sizeof(lowerName));
++	Q_strlwr(lowerName);
++	return strstr(lowerName, token) != NULL ? qtrue : qfalse;
++}
++
++static void RB_DXRSelectSurfaceMaterial(
++	drawSurf_t* surf,
++	shader_t* shader,
++	int entityNum,
++	float* outRoughness,
++	float* outMaterialType)
++{
++	float roughness = 0.72f;
++	dxrMaterialType_t material = DXR_MATERIAL_GENERIC;
++	const int flags = shader ? shader->surfaceFlags : 0;
++	const qboolean skeletal = (surf && surf->geoFlag == GEOMETRY_FLAG_SKELETAL) ? qtrue : qfalse;
++	qboolean viewWeapon = qfalse;
++
++	if (entityNum >= 0 && entityNum < backEnd.refdef.num_entities)
++	{
++		viewWeapon = (backEnd.refdef.entities[entityNum].e.renderfx & RF_DEPTHHACK) ? qtrue : qfalse;
++	}
++
++	// Explicit map surface flags take priority over every heuristic.
++	if (flags & SURF_GLASS)
++	{
++		material = DXR_MATERIAL_GLASS;
++		roughness = 0.14f;
++	}
++	else if (flags & SURF_METAL)
++	{
++		material = DXR_MATERIAL_METAL;
++		roughness = 0.30f;
++	}
++	else if (flags & SURF_WOOD)
++	{
++		material = DXR_MATERIAL_WOOD;
++		roughness = 0.78f;
++	}
++	else if (flags & SURF_SNOW)
++	{
++		material = DXR_MATERIAL_SNOW;
++		roughness = 0.86f;
++	}
++	else if (flags & SURF_CERAMIC)
++	{
++		material = DXR_MATERIAL_CERAMIC;
++		roughness = 0.52f;
++	}
++	else if (flags & (SURF_CARPET | SURF_GRASS))
++	{
++		material = DXR_MATERIAL_SOFT;
++		roughness = 0.97f;
++	}
++	else if (flags & (SURF_GRAVEL | SURF_RUBBLE))
++	{
++		material = DXR_MATERIAL_RUBBLE;
++		roughness = 0.94f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "glass"))
++	{
++		material = DXR_MATERIAL_GLASS;
++		roughness = 0.14f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "metal") ||
++		RB_DXRShaderNameContains(shader, "steel") ||
++		RB_DXRShaderNameContains(shader, "chrome"))
++	{
++		material = DXR_MATERIAL_METAL;
++		roughness = 0.30f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "wood"))
++	{
++		material = DXR_MATERIAL_WOOD;
++		roughness = 0.78f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "snow"))
++	{
++		material = DXR_MATERIAL_SNOW;
++		roughness = 0.86f;
++	}
++	else if (viewWeapon)
++	{
++		// Keep first-person weapons responsive and metallic without applying
++		// the same glossy response to every animated character.
++		material = DXR_MATERIAL_WEAPON;
++		roughness = 0.38f;
++	}
++	else if (skeletal)
++	{
++		material = DXR_MATERIAL_ORGANIC;
++		roughness = 0.95f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "carpet") ||
++		RB_DXRShaderNameContains(shader, "cloth") ||
++		RB_DXRShaderNameContains(shader, "fabric"))
++	{
++		material = DXR_MATERIAL_SOFT;
++		roughness = 0.97f;
++	}
++	else if (RB_DXRShaderNameContains(shader, "brick") ||
++		RB_DXRShaderNameContains(shader, "stone") ||
++		RB_DXRShaderNameContains(shader, "rock") ||
++		RB_DXRShaderNameContains(shader, "concrete") ||
++		RB_DXRShaderNameContains(shader, "wall"))
++	{
++		material = DXR_MATERIAL_STONE;
++		roughness = 0.90f;
++	}
++	else if (entityNum == ENTITYNUM_WORLD)
++	{
++		// Unlabelled BSP surfaces in RTCW are far more often masonry than
++		// polished metal.  This conservative default removes lacquered walls.
++		material = DXR_MATERIAL_STONE;
++		roughness = 0.88f;
++	}
++
++	*outRoughness = roughness;
++	*outMaterialType = (float)material;
++}
++
++void RB_UpdateDrawSurfFlags(drawSurf_t* surf, shader_t *shader, int entityNum)
+ {
+-	// The base flag is the geometry flag. 
++	float roughness = 0.72f;
++	float materialType = (float)DXR_MATERIAL_GENERIC;
++
++	// The base flag is the geometry flag.
+ 	glGeometryFlagf(surf->geoFlag);
++	RB_DXRSelectSurfaceMaterial(surf, shader, entityNum, &roughness, &materialType);
++	glSurfaceRoughnessf(roughness);
++	glMaterialTypef(materialType);
+ 
+ 	// Now check to see if we will override it.
+ 	if (shader->stages[0] != NULL && shader->stages[0]->bundle != NULL && shader->stages[0]->bundle[0].light > 0) {
+@@ -1216,6 +1368,7 @@ static void RB_RunRaytracedLightingPass(void)
+ {
+ 	static int s_lastDXRDebugPrintTime = 0;
+ 	static int s_lastDynamicLightQualityMode = -1;
++	static int s_lastMaterialSpecularMode = -1;
+ 	static int s_lastAtmosphereMode = -1;
+ 
+ 	if (backEnd.raytraceRendered || !RB_DXRShouldRenderLighting())
+@@ -1302,6 +1455,20 @@ static void RB_RunRaytracedLightingPass(void)
+ 		ri.Printf(PRINT_ALL, "DYNAMIC_LIGHT_QUALITY_EXP14 mode=%d\n", dynamicLightQualityMode);
+ 	}
+ 
++	int materialSpecularMode = r_dxrMaterialSpecularMode
++		? r_dxrMaterialSpecularMode->integer
++		: 0;
++	if (materialSpecularMode < 0)
++		materialSpecularMode = 0;
++	else if (materialSpecularMode > 6)
++		materialSpecularMode = 6;
++	glRaytracingLightingSetMaterialSpecularMode((uint32_t)materialSpecularMode);
++	if (materialSpecularMode != s_lastMaterialSpecularMode)
++	{
++		s_lastMaterialSpecularMode = materialSpecularMode;
++		ri.Printf(PRINT_ALL, "MATERIAL_SPECULAR_EXP16 mode=%d\n", materialSpecularMode);
++	}
++
+ 	int atmosphereMode = r_dxrAtmosphereMode ? r_dxrAtmosphereMode->integer : 0;
+ 	if (atmosphereMode < 0)
+ 		atmosphereMode = 0;
+@@ -1533,7 +1700,7 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
+ 				RB_EndSurface();
+ 			}
+ 			RB_BeginSurface( shader, fogNum );
+-			RB_UpdateDrawSurfFlags(drawSurf, shader);
++			RB_UpdateDrawSurfFlags(drawSurf, shader, entityNum);
+ 
+ 			oldShader = shader;
+ 			oldFogNum = fogNum;
+@@ -1638,6 +1805,8 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
+ 
+ 		RB_EndSurface();
+ 		glGeometryFlagf(GEOMETRY_FLAG_NONE);
++		glSurfaceRoughnessf(0.72f);
++		glMaterialTypef((float)DXR_MATERIAL_GENERIC);
+ 		glLoadModelMatrixf(NULL);
+ 	}
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 453a885..c811df5 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -81,6 +81,7 @@ cvar_t  *r_dxrExposure;
+ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrDynamicLightQualityMode;
++cvar_t  *r_dxrMaterialSpecularMode;
+ cvar_t  *r_dxrAtmosphereMode;
+ cvar_t  *r_dxrAtmosphereStrength;
+ cvar_t  *r_dxrAtmosphereDistanceScale;
+@@ -1026,6 +1027,7 @@ void R_Register( void ) {
+ 	r_dxrDebug = ri.Cvar_Get( "r_dxrDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
++	r_dxrMaterialSpecularMode = ri.Cvar_Get( "r_dxrMaterialSpecularMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereStrength = ri.Cvar_Get( "r_dxrAtmosphereStrength", "1.0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereDistanceScale = ri.Cvar_Get( "r_dxrAtmosphereDistanceScale", "1.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 093fa3c..2d8c208 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1139,6 +1139,7 @@ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR reso
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
++extern cvar_t   *r_dxrMaterialSpecularMode; // 0 legacy, 1 roughness only, 2 material F0, 3 characters matte, 4 world matte, 5 balanced, 6 strict
+ extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
+ extern cvar_t   *r_dxrAtmosphereStrength; // global fog strength multiplier
+ extern cvar_t   *r_dxrAtmosphereDistanceScale; // >1 pushes fog farther away, <1 brings it closer

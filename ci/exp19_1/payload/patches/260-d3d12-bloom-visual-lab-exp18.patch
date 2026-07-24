@@ -1,0 +1,754 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 44e96ae..7a46392 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1772,13 +1772,19 @@ struct glRaytracingLightingConstants_t
+ 	float toneMapSaturation;
+ 	float toneMapContrast;
+ 	uint32_t toneMappingPad[2];
++	uint32_t bloomMode;
++	float bloomThreshold;
++	float bloomStrength;
++	float bloomRadius;
++	float bloomSoftKnee;
++	uint32_t bloomPad[3];
+ 	float mapFogColor[4];
+ 	float mapFogParams[4];
+ 	float atmosphereControls[4]; // strength, distanceScale, maxOpacity, reserved
+ 	float atmosphereHeight[4];   // baseHeight, heightFalloff, reserved, reserved
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 352,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 384,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1795,6 +1801,12 @@ struct glRaytracingLightingState_t
+ 
+ 	ComPtr<ID3D12RootSignature> globalRootSig;
+ 	ComPtr<ID3D12RootSignature> localRootSig;
++	ComPtr<ID3D12RootSignature> postRootSig;
++	ComPtr<ID3D12PipelineState> postPipelineState;
++
++	ComPtr<ID3D12Resource> bloomHdrTexture;
++	UINT bloomHdrWidth;
++	UINT bloomHdrHeight;
+ 
+ 	ComPtr<ID3D12StateObject> rtStateObject;
+ 	ComPtr<ID3D12StateObjectProperties> rtStateProps;
+@@ -1809,6 +1821,8 @@ struct glRaytracingLightingState_t
+ 	{
+ 		memset(&constants, 0, sizeof(constants));
+ 		descriptorStride = 0;
++		bloomHdrWidth = 0;
++		bloomHdrHeight = 0;
+ 		initialized = false;
+ 	}
+ };
+@@ -1877,6 +1891,12 @@ cbuffer LightingCB : register(b0)
+     float    gToneMapSaturation;
+     float    gToneMapContrast;
+     uint2    gToneMappingPad;
++    uint     gBloomMode;
++    float    gBloomThreshold;
++    float    gBloomStrength;
++    float    gBloomRadius;
++    float    gBloomSoftKnee;
++    uint3    gBloomPad;
+     float4   gMapFogColor;
+     float4   gMapFogParams;
+     float4   gAtmosphereControls;
+@@ -3096,8 +3116,10 @@ void RayGen()
+         {
+             finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
+         }
+-        else
++        else if (gBloomMode == 0u)
+         {
++            // Bloom needs the unclipped HDR-like scene. When Bloom is enabled,
++            // tone mapping is moved to the post compute pass after bright-pass blur.
+             finalColor = ApplyHDRLikeToneMapping(finalColor);
+         }
+ 
+@@ -3107,6 +3129,253 @@ void RayGen()
+ )";
+ 
+ 
++static const char g_glRaytracingBloomPostHlsl[] = R"(
++cbuffer LightingCB : register(b0)
++{
++    float4x4 gInvViewProj;
++    float4x4 gInvViewMatrix;
++    float4   gCameraPos;
++    float4   gAmbientColor;
++    float4   gScreenSize;
++    float    gNormalReconstructZ;
++    uint     gLightCount;
++    uint     gEnableSpecular;
++    uint     gEnableHalfLambert;
++    float    gShadowBias;
++    float    gExposure;
++    float    gLegacyBlend;
++    uint     gDebugMode;
++    uint     gShadowSamples;
++    uint     gRectShadowSamples;
++    uint     gAOSamples;
++    uint     gSkySamples;
++    float    gShadowStrength;
++    float    gLegacyShadowStrength;
++    float    gShadowMinVisibility;
++    float    gContactShadowLength;
++    uint     gContactShadows;
++    uint     gFrameIndex;
++    uint     gDynamicLightQualityMode;
++    uint     gAtmosphereMode;
++    uint     gMapFogMode;
++    uint     gMaterialSpecularMode;
++    uint     gToneMappingMode;
++    float    gToneMapWhitePoint;
++    float    gToneMapSaturation;
++    float    gToneMapContrast;
++    uint2    gToneMappingPad;
++    uint     gBloomMode;
++    float    gBloomThreshold;
++    float    gBloomStrength;
++    float    gBloomRadius;
++    float    gBloomSoftKnee;
++    uint3    gBloomPad;
++    float4   gMapFogColor;
++    float4   gMapFogParams;
++    float4   gAtmosphereControls;
++    float4   gAtmosphereHeight;
++};
++
++Texture2D<float4>   gHdrScene : register(t0);
++RWTexture2D<float4> gFinalOut : register(u0);
++
++float3 ToneMapExtendedReinhard(float3 x, float whitePoint)
++{
++    float white2 = max(whitePoint * whitePoint, 1e-4);
++    return (x * (1.0 + x / white2)) / (1.0 + x);
++}
++
++float3 ToneMapACESFitted(float3 x)
++{
++    const float a = 2.51;
++    const float b = 0.03;
++    const float c = 2.43;
++    const float d = 0.59;
++    const float e = 0.14;
++    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
++}
++
++float3 HablePartial(float3 x)
++{
++    const float A = 0.15;
++    const float B = 0.50;
++    const float C = 0.10;
++    const float D = 0.20;
++    const float E = 0.02;
++    const float F = 0.30;
++    return ((x * (A * x + C * B) + D * E) /
++            (x * (A * x + B) + D * F)) - E / F;
++}
++
++float3 ToneMapHable(float3 x, float whitePoint)
++{
++    float3 mapped = HablePartial(x * 2.0);
++    float3 whiteScale = 1.0 / max(HablePartial(float3(whitePoint, whitePoint, whitePoint)), 1e-4);
++    return saturate(mapped * whiteScale);
++}
++
++float3 ToneMapNeutralLuminance(float3 x, float whitePoint)
++{
++    float lum = dot(x, float3(0.2126, 0.7152, 0.0722));
++    if (lum <= 1e-5)
++        return 0.0;
++    float mappedLum = (lum * (1.0 + lum / max(whitePoint * whitePoint, 1e-4))) / (1.0 + lum);
++    return saturate(x * (mappedLum / lum));
++}
++
++float3 ApplyToneMapPresentationControls(float3 color, float modeContrastScale, float modeSaturationScale)
++{
++    float contrast = clamp(gToneMapContrast * modeContrastScale, 0.50, 1.60);
++    color = saturate((color - 0.18) * contrast + 0.18);
++    float lum = dot(color, float3(0.2126, 0.7152, 0.0722));
++    float saturation = clamp(gToneMapSaturation * modeSaturationScale, 0.0, 2.0);
++    return saturate(lerp(lum.xxx, color, saturation));
++}
++
++float3 ApplyHDRLikeToneMapping(float3 sceneColor)
++{
++    float3 x = max(sceneColor, 0.0) * max(gExposure, 0.0);
++    uint mode = min(gToneMappingMode, 6u);
++    float whitePoint = clamp(gToneMapWhitePoint, 1.0, 16.0);
++    if (mode == 0u)
++        return saturate(x);
++
++    float3 mapped = 0.0;
++    float contrastScale = 1.0;
++    float saturationScale = 1.0;
++    if (mode == 1u)
++        mapped = ToneMapExtendedReinhard(x, whitePoint);
++    else if (mode == 2u)
++    {
++        mapped = ToneMapACESFitted(x);
++        saturationScale = 1.03;
++    }
++    else if (mode == 3u)
++    {
++        mapped = ToneMapHable(x, whitePoint);
++        contrastScale = 1.05;
++    }
++    else if (mode == 4u)
++        mapped = ToneMapNeutralLuminance(x, whitePoint);
++    else if (mode == 5u)
++    {
++        mapped = ToneMapACESFitted(x * 0.92);
++        contrastScale = 1.02;
++        saturationScale = 1.01;
++    }
++    else
++    {
++        mapped = ToneMapHable(x * 1.18, whitePoint);
++        contrastScale = 1.12;
++        saturationScale = 1.06;
++    }
++    return ApplyToneMapPresentationControls(mapped, contrastScale, saturationScale);
++}
++
++float3 LoadHdrClamped(int2 p)
++{
++    int2 maxPixel = int2((int)gScreenSize.x - 1, (int)gScreenSize.y - 1);
++    return gHdrScene.Load(int3(clamp(p, int2(0, 0), maxPixel), 0)).rgb;
++}
++
++float3 ExtractBloom(float3 color, float threshold, float softKnee)
++{
++    float brightness = max(color.r, max(color.g, color.b));
++    float knee = max(threshold * clamp(softKnee, 0.0, 1.0), 1e-4);
++    float soft = clamp(brightness - threshold + knee, 0.0, 2.0 * knee);
++    soft = soft * soft / (4.0 * knee + 1e-4);
++    float contribution = max(brightness - threshold, soft) / max(brightness, 1e-4);
++    return color * max(contribution, 0.0);
++}
++
++float3 SampleBloom(int2 pixel, float threshold, float radius, float softKnee)
++{
++    int r0 = max(1, (int)round(radius * 0.50));
++    int r1 = max(1, (int)round(radius * 0.72));
++    int r2 = max(1, (int)round(radius));
++
++    float3 sum = ExtractBloom(LoadHdrClamped(pixel), threshold, softKnee) * 0.20;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2( r0, 0)), threshold, softKnee) * 0.10;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(-r0, 0)), threshold, softKnee) * 0.10;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(0,  r0)), threshold, softKnee) * 0.10;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(0, -r0)), threshold, softKnee) * 0.10;
++
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2( r1,  r1)), threshold, softKnee) * 0.06;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(-r1,  r1)), threshold, softKnee) * 0.06;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2( r1, -r1)), threshold, softKnee) * 0.06;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(-r1, -r1)), threshold, softKnee) * 0.06;
++
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2( r2, 0)), threshold, softKnee) * 0.05;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(-r2, 0)), threshold, softKnee) * 0.05;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(0,  r2)), threshold, softKnee) * 0.05;
++    sum += ExtractBloom(LoadHdrClamped(pixel + int2(0, -r2)), threshold, softKnee) * 0.05;
++    return sum / 1.04;
++}
++
++[numthreads(8, 8, 1)]
++void BloomCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    uint2 pixel = dispatchThreadId.xy;
++    if (pixel.x >= (uint)gScreenSize.x || pixel.y >= (uint)gScreenSize.y)
++        return;
++
++    float4 hdrSample = gHdrScene.Load(int3(pixel, 0));
++    float3 hdrColor = max(hdrSample.rgb, 0.0);
++
++    // Keep diagnostic buffers exact and free from presentation processing.
++    if (gDebugMode != 0u)
++    {
++        gFinalOut[pixel] = float4(saturate(hdrColor), hdrSample.a);
++        return;
++    }
++
++    uint mode = min(gBloomMode, 6u);
++    float threshold = max(gBloomThreshold, 0.0);
++    float strength = max(gBloomStrength, 0.0);
++    float radius = clamp(gBloomRadius, 0.5, 32.0);
++    float softKnee = clamp(gBloomSoftKnee, 0.0, 1.0);
++
++    if (mode == 1u)
++    {
++        threshold *= 1.25;
++        strength *= 0.55;
++        radius *= 0.75;
++    }
++    else if (mode == 2u)
++    {
++        threshold *= 0.95;
++        strength *= 0.85;
++    }
++    else if (mode == 3u)
++    {
++        threshold *= 1.65;
++        strength *= 1.20;
++        radius *= 0.85;
++    }
++    else if (mode == 4u)
++    {
++        threshold *= 0.80;
++        strength *= 0.85;
++        radius *= 1.80;
++    }
++    else if (mode == 5u)
++    {
++        radius *= 1.25;
++    }
++    else if (mode == 6u)
++    {
++        threshold *= 0.70;
++        strength *= 1.55;
++        radius *= 2.20;
++    }
++
++    float3 bloom = SampleBloom(int2(pixel), threshold, radius, softKnee);
++    float3 combinedHdr = hdrColor + bloom * strength;
++    gFinalOut[pixel] = float4(ApplyHDRLikeToneMapping(combinedHdr), hdrSample.a);
++}
++)";
++
++
+ static std::string glRaytracingLightingBuildHlsl()
+ {
+ 	std::string source;
+@@ -3191,10 +3460,74 @@ static ComPtr<IDxcBlob> glRaytracingLightingCompileLibrary(const char* src)
+ 	return dxil;
+ }
+ 
++static ComPtr<IDxcBlob> glRaytracingLightingCompileCompute(const char* src, const wchar_t* entryPoint)
++{
++	ComPtr<IDxcUtils> utils;
++	ComPtr<IDxcCompiler3> compiler;
++	ComPtr<IDxcIncludeHandler> includeHandler;
++	HRESULT hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils));
++	if (FAILED(hr))
++	{
++		glRaytracingFatal("DxcCreateInstance utils failed 0x%08X", (unsigned)hr);
++		return nullptr;
++	}
++	hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler));
++	if (FAILED(hr))
++	{
++		glRaytracingFatal("DxcCreateInstance compiler failed 0x%08X", (unsigned)hr);
++		return nullptr;
++	}
++	hr = utils->CreateDefaultIncludeHandler(&includeHandler);
++	if (FAILED(hr))
++	{
++		glRaytracingFatal("CreateDefaultIncludeHandler failed 0x%08X", (unsigned)hr);
++		return nullptr;
++	}
++
++	DxcBuffer source = {};
++	source.Ptr = src;
++	source.Size = strlen(src);
++	source.Encoding = DXC_CP_UTF8;
++	const wchar_t* args[] =
++	{
++		L"-E", entryPoint,
++		L"-T", L"cs_6_0",
++		L"-Zi",
++		L"-Qembed_debug",
++		L"-O3",
++		L"-all_resources_bound"
++	};
++
++	ComPtr<IDxcResult> result;
++	hr = compiler->Compile(&source, args, _countof(args), includeHandler.Get(), IID_PPV_ARGS(&result));
++	if (FAILED(hr))
++	{
++		glRaytracingFatal("DXC compute compile failed 0x%08X", (unsigned)hr);
++		return nullptr;
++	}
++	ComPtr<IDxcBlobUtf8> errors;
++	result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
++	if (errors && errors->GetStringLength() > 0)
++	{
++		OutputDebugStringA(errors->GetStringPointer());
++		OutputDebugStringA("\n");
++	}
++	HRESULT status = S_OK;
++	result->GetStatus(&status);
++	if (FAILED(status))
++	{
++		glRaytracingFatal("DXIL compute status failed 0x%08X", (unsigned)status);
++		return nullptr;
++	}
++	ComPtr<IDxcBlob> dxil;
++	result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&dxil), nullptr);
++	return dxil;
++}
++
+ static int glRaytracingLightingCreateDescriptorHeap(void)
+ {
+ 	D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+-	hd.NumDescriptors = 7;
++	hd.NumDescriptors = 9;
+ 	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+ 	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+ 
+@@ -3264,6 +3597,39 @@ static int glRaytracingLightingCreateRootSignatures(void)
+ 			IID_PPV_ARGS(&g_glRaytracingLighting.localRootSig)));
+ 	}
+ 
++	{
++		D3D12_DESCRIPTOR_RANGE ranges[2] = {};
++		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++		ranges[0].NumDescriptors = 1;
++		ranges[0].BaseShaderRegister = 0;
++		ranges[0].OffsetInDescriptorsFromTableStart = 0;
++		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++		ranges[1].NumDescriptors = 1;
++		ranges[1].BaseShaderRegister = 0;
++		ranges[1].OffsetInDescriptorsFromTableStart = 0;
++
++		D3D12_ROOT_PARAMETER params[3] = {};
++		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++		params[0].DescriptorTable.NumDescriptorRanges = 1;
++		params[0].DescriptorTable.pDescriptorRanges = &ranges[0];
++		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++		params[1].DescriptorTable.NumDescriptorRanges = 1;
++		params[1].DescriptorTable.pDescriptorRanges = &ranges[1];
++		params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
++		params[2].Descriptor.ShaderRegister = 0;
++
++		D3D12_ROOT_SIGNATURE_DESC rsd = {};
++		rsd.NumParameters = _countof(params);
++		rsd.pParameters = params;
++		rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
++		ComPtr<ID3DBlob> sig;
++		ComPtr<ID3DBlob> err;
++		GLR_CHECK(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err));
++		GLR_CHECK(g_glRaytracingCmd.device->CreateRootSignature(
++			0, sig->GetBufferPointer(), sig->GetBufferSize(),
++			IID_PPV_ARGS(&g_glRaytracingLighting.postRootSig)));
++	}
++
+ 	return 1;
+ }
+ 
+@@ -3458,6 +3824,59 @@ static int glRaytracingLightingCreateStateObject(void)
+ 	return 1;
+ }
+ 
++static int glRaytracingLightingCreatePostPipeline(void)
++{
++	ComPtr<IDxcBlob> dxil = glRaytracingLightingCompileCompute(g_glRaytracingBloomPostHlsl, L"BloomCS");
++	if (!dxil)
++		return 0;
++	D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
++	desc.pRootSignature = g_glRaytracingLighting.postRootSig.Get();
++	desc.CS.pShaderBytecode = dxil->GetBufferPointer();
++	desc.CS.BytecodeLength = dxil->GetBufferSize();
++	GLR_CHECK(g_glRaytracingCmd.device->CreateComputePipelineState(
++		&desc, IID_PPV_ARGS(&g_glRaytracingLighting.postPipelineState)));
++	return 1;
++}
++
++static int glRaytracingLightingEnsureBloomHdrTexture(UINT width, UINT height)
++{
++	if (g_glRaytracingLighting.bloomHdrTexture &&
++		g_glRaytracingLighting.bloomHdrWidth == width &&
++		g_glRaytracingLighting.bloomHdrHeight == height)
++	{
++		return 1;
++	}
++
++	g_glRaytracingLighting.bloomHdrTexture.Reset();
++	g_glRaytracingLighting.bloomHdrWidth = 0;
++	g_glRaytracingLighting.bloomHdrHeight = 0;
++
++	D3D12_HEAP_PROPERTIES heap = {};
++	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++	D3D12_RESOURCE_DESC desc = {};
++	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++	desc.Width = width;
++	desc.Height = height;
++	desc.DepthOrArraySize = 1;
++	desc.MipLevels = 1;
++	desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++	desc.SampleDesc.Count = 1;
++	desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++	HRESULT hr = g_glRaytracingCmd.device->CreateCommittedResource(
++		&heap, D3D12_HEAP_FLAG_NONE, &desc,
++		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++		nullptr, IID_PPV_ARGS(&g_glRaytracingLighting.bloomHdrTexture));
++	if (FAILED(hr))
++	{
++		glRaytracingHandleFailure(hr, "Create bloom HDR texture", __FILE__, __LINE__);
++		return 0;
++	}
++	g_glRaytracingLighting.bloomHdrWidth = width;
++	g_glRaytracingLighting.bloomHdrHeight = height;
++	return 1;
++}
++
+ static int glRaytracingLightingCreateShaderTables(void)
+ {
+ 	void* raygenId = g_glRaytracingLighting.rtStateProps->GetShaderIdentifier(L"RayGen");
+@@ -3571,14 +3990,36 @@ static void glRaytracingLightingCreatePerPassDescriptors(const glRaytracingLight
+ 		&tlasSrv,
+ 		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 5));
+ 
++	const bool useBloom = g_glRaytracingLighting.constants.bloomMode != 0u &&
++		g_glRaytracingLighting.constants.bloomStrength > 0.0f;
++	ID3D12Resource* rayOutput = useBloom
++		? g_glRaytracingLighting.bloomHdrTexture.Get()
++		: pass->outputTexture;
+ 	D3D12_UNORDERED_ACCESS_VIEW_DESC outputUav = {};
+ 	outputUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+-	outputUav.Format = pass->outputFormat;
++	outputUav.Format = useBloom ? DXGI_FORMAT_R16G16B16A16_FLOAT : pass->outputFormat;
+ 	g_glRaytracingCmd.device->CreateUnorderedAccessView(
+-		pass->outputTexture,
+-		nullptr,
+-		&outputUav,
++		rayOutput, nullptr, &outputUav,
+ 		glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 6));
++
++	if (useBloom)
++	{
++		D3D12_SHADER_RESOURCE_VIEW_DESC hdrSrv = {};
++		hdrSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++		hdrSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++		hdrSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++		hdrSrv.Texture2D.MipLevels = 1;
++		g_glRaytracingCmd.device->CreateShaderResourceView(
++			g_glRaytracingLighting.bloomHdrTexture.Get(), &hdrSrv,
++			glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 7));
++
++		D3D12_UNORDERED_ACCESS_VIEW_DESC finalUav = {};
++		finalUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++		finalUav.Format = pass->outputFormat;
++		g_glRaytracingCmd.device->CreateUnorderedAccessView(
++			pass->outputTexture, nullptr, &finalUav,
++			glRaytracingOffsetCpu(base, g_glRaytracingLighting.descriptorStride, 8));
++	}
+ }
+ 
+ // ============================================================
+@@ -3611,6 +4052,9 @@ bool glRaytracingLightingInit(void)
+ 	if (!glRaytracingLightingCreateStateObject())
+ 		return false;
+ 
++	if (!glRaytracingLightingCreatePostPipeline())
++		return false;
++
+ 	if (!glRaytracingLightingCreateShaderTables())
+ 		return false;
+ 
+@@ -3646,6 +4090,14 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.toneMapContrast = 1.0f;
+ 	g_glRaytracingLighting.constants.toneMappingPad[0] = 0u;
+ 	g_glRaytracingLighting.constants.toneMappingPad[1] = 0u;
++	g_glRaytracingLighting.constants.bloomMode = 0u;
++	g_glRaytracingLighting.constants.bloomThreshold = 1.20f;
++	g_glRaytracingLighting.constants.bloomStrength = 0.22f;
++	g_glRaytracingLighting.constants.bloomRadius = 6.0f;
++	g_glRaytracingLighting.constants.bloomSoftKnee = 0.50f;
++	g_glRaytracingLighting.constants.bloomPad[0] = 0u;
++	g_glRaytracingLighting.constants.bloomPad[1] = 0u;
++	g_glRaytracingLighting.constants.bloomPad[2] = 0u;
+ 	g_glRaytracingLighting.constants.mapFogColor[0] = 0.18f;
+ 	g_glRaytracingLighting.constants.mapFogColor[1] = 0.20f;
+ 	g_glRaytracingLighting.constants.mapFogColor[2] = 0.22f;
+@@ -3838,6 +4290,21 @@ void glRaytracingLightingSetToneMappingOptions(
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetBloomOptions(
++	uint32_t mode,
++	float threshold,
++	float strength,
++	float radius,
++	float softKnee)
++{
++	g_glRaytracingLighting.constants.bloomMode = glRaytracingClamp<uint32_t>(mode, 0u, 6u);
++	g_glRaytracingLighting.constants.bloomThreshold = glRaytracingClamp<float>(threshold, 0.0f, 16.0f);
++	g_glRaytracingLighting.constants.bloomStrength = glRaytracingClamp<float>(strength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.bloomRadius = glRaytracingClamp<float>(radius, 0.5f, 32.0f);
++	g_glRaytracingLighting.constants.bloomSoftKnee = glRaytracingClamp<float>(softKnee, 0.0f, 1.0f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+@@ -3940,15 +4407,22 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 	++g_glRaytracingLighting.constants.frameIndex;
+ 	glRaytracingLightingPrepareSelectedLights();
+ 	glRaytracingLightingUpdateConstants();
++	const bool useBloom = g_glRaytracingLighting.constants.bloomMode != 0u &&
++		g_glRaytracingLighting.constants.bloomStrength > 0.0f;
++	if (useBloom && !glRaytracingLightingEnsureBloomHdrTexture(pass->width, pass->height))
++		return false;
+ 	glRaytracingLightingCreatePerPassDescriptors(pass);
+ 
+ 	if (!glRaytracingBeginCmd())
+ 		return false;
+ 
++	ID3D12Resource* rayOutput = useBloom
++		? g_glRaytracingLighting.bloomHdrTexture.Get()
++		: pass->outputTexture;
+ 	glRaytracingTransition(
+ 		g_glRaytracingCmd.cmdList.Get(),
+-		pass->outputTexture,
+-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++		rayOutput,
++		useBloom ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+ 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ 
+ 	ID3D12DescriptorHeap* heaps[] = { g_glRaytracingLighting.descriptorHeap.Get() };
+@@ -3994,12 +4468,39 @@ bool glRaytracingLightingExecute(const glRaytracingLightingPassDesc_t* pass)
+ 
+ 	D3D12_RESOURCE_BARRIER uav = {};
+ 	uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+-	uav.UAV.pResource = pass->outputTexture;
++	uav.UAV.pResource = rayOutput;
+ 	g_glRaytracingCmd.cmdList->ResourceBarrier(1, &uav);
+ 
+-	// The shim composites the lighting texture later in glLightScene().  Do not
+-	// copy directly to the swapchain here; doing so races the normal backbuffer
+-	// resolve/upscale path and can be overwritten before Present.
++	if (useBloom)
++	{
++		glRaytracingTransition(
++			g_glRaytracingCmd.cmdList.Get(),
++			g_glRaytracingLighting.bloomHdrTexture.Get(),
++			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++		glRaytracingTransition(
++			g_glRaytracingCmd.cmdList.Get(),
++			pass->outputTexture,
++			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++			D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++
++		g_glRaytracingCmd.cmdList->SetComputeRootSignature(g_glRaytracingLighting.postRootSig.Get());
++		g_glRaytracingCmd.cmdList->SetPipelineState(g_glRaytracingLighting.postPipelineState.Get());
++		g_glRaytracingCmd.cmdList->SetComputeRootDescriptorTable(
++			0, glRaytracingOffsetGpu(gpuBase, g_glRaytracingLighting.descriptorStride, 7));
++		g_glRaytracingCmd.cmdList->SetComputeRootDescriptorTable(
++			1, glRaytracingOffsetGpu(gpuBase, g_glRaytracingLighting.descriptorStride, 8));
++		g_glRaytracingCmd.cmdList->SetComputeRootConstantBufferView(
++			2, g_glRaytracingLighting.constantBuffer.gpuVA);
++		g_glRaytracingCmd.cmdList->Dispatch((pass->width + 7u) / 8u, (pass->height + 7u) / 8u, 1u);
++
++		D3D12_RESOURCE_BARRIER finalUav = {};
++		finalUav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++		finalUav.UAV.pResource = pass->outputTexture;
++		g_glRaytracingCmd.cmdList->ResourceBarrier(1, &finalUav);
++	}
++
++	// The shim composites the lighting texture later in glLightScene().
+ 	glRaytracingTransition(
+ 		g_glRaytracingCmd.cmdList.Get(),
+ 		pass->outputTexture,
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index bc74c69..2d83ec6 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1719,6 +1719,8 @@ void                       glRaytracingLightingSetDynamicLightQualityMode(uint32
+ void                       glRaytracingLightingSetMaterialSpecularMode(uint32_t mode);
+ void                       glRaytracingLightingSetToneMappingOptions(
+ 	uint32_t mode, float whitePoint, float saturation, float contrast);
++void                       glRaytracingLightingSetBloomOptions(
++	uint32_t mode, float threshold, float strength, float radius, float softKnee);
+ void                       glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index fd27c6a..922e696 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1370,6 +1370,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 	static int s_lastDynamicLightQualityMode = -1;
+ 	static int s_lastMaterialSpecularMode = -1;
+ 	static int s_lastToneMappingMode = -1;
++	static int s_lastBloomMode = -1;
+ 	static int s_lastAtmosphereMode = -1;
+ 
+ 	if (backEnd.raytraceRendered || !RB_DXRShouldRenderLighting())
+@@ -1490,6 +1491,25 @@ static void RB_RunRaytracedLightingPass(void)
+ 			toneMapWhitePoint, toneMapSaturation, toneMapContrast);
+ 	}
+ 
++	int bloomMode = r_dxrBloomMode ? r_dxrBloomMode->integer : 0;
++	if (bloomMode < 0)
++		bloomMode = 0;
++	else if (bloomMode > 6)
++		bloomMode = 6;
++	const float bloomThreshold = r_dxrBloomThreshold ? r_dxrBloomThreshold->value : 1.20f;
++	const float bloomStrength = r_dxrBloomStrength ? r_dxrBloomStrength->value : 0.22f;
++	const float bloomRadius = r_dxrBloomRadius ? r_dxrBloomRadius->value : 6.0f;
++	const float bloomSoftKnee = r_dxrBloomSoftKnee ? r_dxrBloomSoftKnee->value : 0.50f;
++	glRaytracingLightingSetBloomOptions(
++		(uint32_t)bloomMode, bloomThreshold, bloomStrength, bloomRadius, bloomSoftKnee);
++	if (bloomMode != s_lastBloomMode)
++	{
++		s_lastBloomMode = bloomMode;
++		ri.Printf(PRINT_ALL,
++			"BLOOM_EXP18 mode=%d threshold=%.2f strength=%.2f radius=%.2f softKnee=%.2f toneMap=%d\n",
++			bloomMode, bloomThreshold, bloomStrength, bloomRadius, bloomSoftKnee, toneMappingMode);
++	}
++
+ 	int atmosphereMode = r_dxrAtmosphereMode ? r_dxrAtmosphereMode->integer : 0;
+ 	if (atmosphereMode < 0)
+ 		atmosphereMode = 0;
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 3fc1395..86442e6 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -86,6 +86,11 @@ cvar_t  *r_dxrToneMappingMode;
+ cvar_t  *r_dxrToneMapWhitePoint;
+ cvar_t  *r_dxrToneMapSaturation;
+ cvar_t  *r_dxrToneMapContrast;
++cvar_t  *r_dxrBloomMode;
++cvar_t  *r_dxrBloomThreshold;
++cvar_t  *r_dxrBloomStrength;
++cvar_t  *r_dxrBloomRadius;
++cvar_t  *r_dxrBloomSoftKnee;
+ cvar_t  *r_dxrAtmosphereMode;
+ cvar_t  *r_dxrAtmosphereStrength;
+ cvar_t  *r_dxrAtmosphereDistanceScale;
+@@ -1036,6 +1041,11 @@ void R_Register( void ) {
+ 	r_dxrToneMapWhitePoint = ri.Cvar_Get( "r_dxrToneMapWhitePoint", "4.0", CVAR_ARCHIVE );
+ 	r_dxrToneMapSaturation = ri.Cvar_Get( "r_dxrToneMapSaturation", "1.0", CVAR_ARCHIVE );
+ 	r_dxrToneMapContrast = ri.Cvar_Get( "r_dxrToneMapContrast", "1.0", CVAR_ARCHIVE );
++	r_dxrBloomMode = ri.Cvar_Get( "r_dxrBloomMode", "0", CVAR_ARCHIVE );
++	r_dxrBloomThreshold = ri.Cvar_Get( "r_dxrBloomThreshold", "1.20", CVAR_ARCHIVE );
++	r_dxrBloomStrength = ri.Cvar_Get( "r_dxrBloomStrength", "0.22", CVAR_ARCHIVE );
++	r_dxrBloomRadius = ri.Cvar_Get( "r_dxrBloomRadius", "6.0", CVAR_ARCHIVE );
++	r_dxrBloomSoftKnee = ri.Cvar_Get( "r_dxrBloomSoftKnee", "0.50", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereStrength = ri.Cvar_Get( "r_dxrAtmosphereStrength", "1.0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereDistanceScale = ri.Cvar_Get( "r_dxrAtmosphereDistanceScale", "1.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 119b8ba..9977401 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1144,6 +1144,11 @@ extern cvar_t   *r_dxrToneMappingMode; // 0 legacy clamp, 1 Reinhard, 2 ACES, 3
+ extern cvar_t   *r_dxrToneMapWhitePoint; // highlight shoulder reference point
+ extern cvar_t   *r_dxrToneMapSaturation; // presentation saturation after tone mapping
+ extern cvar_t   *r_dxrToneMapContrast; // presentation contrast after tone mapping
++extern cvar_t   *r_dxrBloomMode; // 0 off, 1 subtle, 2 soft, 3 highlights, 4 wide, 5 balanced, 6 cinematic
++extern cvar_t   *r_dxrBloomThreshold; // HDR brightness threshold
++extern cvar_t   *r_dxrBloomStrength; // bloom additive strength
++extern cvar_t   *r_dxrBloomRadius; // blur radius in pixels before mode scaling
++extern cvar_t   *r_dxrBloomSoftKnee; // threshold transition softness
+ extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
+ extern cvar_t   *r_dxrAtmosphereStrength; // global fog strength multiplier
+ extern cvar_t   *r_dxrAtmosphereDistanceScale; // >1 pushes fog farther away, <1 brings it closer

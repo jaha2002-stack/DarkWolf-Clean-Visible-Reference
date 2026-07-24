@@ -1,0 +1,878 @@
+diff --git a/src/opengl/gl_d3d12shim.cpp b/src/opengl/gl_d3d12shim.cpp
+index c1883ea..4ce9012 100644
+--- a/src/opengl/gl_d3d12shim.cpp
++++ b/src/opengl/gl_d3d12shim.cpp
+@@ -157,6 +157,9 @@ static void QD3D12_Log(const char* fmt, ...)
+ 	OutputDebugStringA("\n");
+ }
+ 
++// Translate OpenGL polygon offset permanently into D3D12 rasterizer depth bias.
++// This fixes z-fighting on decals and other coplanar surfaces.
++
+ static void QD3D12_Fatal(const char* fmt, ...)
+ {
+ 	char buffer[4096];
+@@ -302,6 +305,19 @@ struct UploadRing
+ 	UINT offset = 0;
+ };
+ 
++struct TextureMipLevel
++{
++	int width = 0;
++	int height = 0;
++	GLenum format = GL_RGBA;
++	bool compressed = false;
++	GLenum compressedInternalFormat = 0;
++	UINT compressedBlockBytes = 0;
++	UINT compressedImageSize = 0;
++	std::vector<uint8_t> sysmem;
++	bool defined = false;
++};
++
+ struct TextureResource
+ {
+ 	GLuint glId = 0;
+@@ -314,6 +330,9 @@ struct TextureResource
+ 	GLenum wrapT = GL_REPEAT;
+ 
+ 	std::vector<uint8_t> sysmem;
++	// OpenGL levels 1..N. Level 0 intentionally stays in the original fields
++	// above so baseline mode remains byte-for-byte equivalent in behavior.
++	std::vector<TextureMipLevel> extraMipLevels;
+ 
+ 	bool compressed = false;
+ 	GLenum compressedInternalFormat = 0;
+@@ -463,6 +482,10 @@ struct BatchKey
+ 	GLenum cullMode = GL_BACK;
+ 	GLenum frontFace = GL_CCW;
+ 
++	bool polygonOffsetFill = false;
++	float polygonOffsetFactor = 0.0f;
++	float polygonOffsetUnits = 0.0f;
++
+ 	bool stencilTest = false;
+ 	UINT8 stencilReadMask = 0xFF;
+ 	UINT8 stencilWriteMask = 0xFF;
+@@ -554,6 +577,9 @@ static bool BatchKeyEquals(const BatchKey& a, const BatchKey& b)
+ 		a.cullFaceEnabled == b.cullFaceEnabled &&
+ 		a.cullMode == b.cullMode &&
+ 		a.frontFace == b.frontFace &&
++		a.polygonOffsetFill == b.polygonOffsetFill &&
++		a.polygonOffsetFactor == b.polygonOffsetFactor &&
++		a.polygonOffsetUnits == b.polygonOffsetUnits &&
+ 		a.stencilTest == b.stencilTest &&
+ 		a.stencilReadMask == b.stencilReadMask &&
+ 		a.stencilWriteMask == b.stencilWriteMask &&
+@@ -866,6 +892,7 @@ struct GLState
+ 	GLdouble clipPlane0[4] = { 0.0, 0.0, 0.0, 0.0 };
+ 	bool clipPlane0Enabled = false;
+ 
++	bool polygonOffsetFill = false;
+ 	GLfloat polygonOffsetFactor = 0.0f;
+ 	GLfloat polygonOffsetUnits = 0.0f;
+ 
+@@ -2098,6 +2125,9 @@ static BatchKey BuildCurrentBatchKey(GLenum originalMode, const TextureResource*
+ 	key.cullFaceEnabled = g_gl.cullFace;
+ 	key.cullMode = g_gl.cullMode;
+ 	key.frontFace = g_gl.frontFace;
++	key.polygonOffsetFill = g_gl.polygonOffsetFill;
++	key.polygonOffsetFactor = key.polygonOffsetFill ? g_gl.polygonOffsetFactor : 0.0f;
++	key.polygonOffsetUnits = key.polygonOffsetFill ? g_gl.polygonOffsetUnits : 0.0f;
+ 	key.stencilTest = g_gl.stencilTest;
+ 	key.stencilReadMask = QD3D12_ClampStencilMask(g_gl.stencilFrontFuncMask & g_gl.stencilBackFuncMask);
+ 	key.stencilWriteMask = QD3D12_ClampStencilMask(g_gl.stencilFrontMask | g_gl.stencilBackMask);
+@@ -2497,6 +2527,14 @@ static void ApplyRasterDepthStencilState(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d,
+ {
+ 	d.RasterizerState.CullMode = key.cullFaceEnabled ? MapCull(key.cullMode) : D3D12_CULL_MODE_NONE;
+ 	d.RasterizerState.FrontCounterClockwise = (key.frontFace == GL_CCW) ? TRUE : FALSE;
++	if (key.polygonOffsetFill)
++	{
++		// OpenGL: offset = slope * factor + resolution * units.
++		// D3D12 exposes the same two terms as SlopeScaledDepthBias and DepthBias.
++		d.RasterizerState.SlopeScaledDepthBias = key.polygonOffsetFactor;
++		d.RasterizerState.DepthBias = (INT)key.polygonOffsetUnits;
++		d.RasterizerState.DepthBiasClamp = 0.0f;
++	}
+ 
+ 	d.DepthStencilState.DepthEnable = key.depthTest ? TRUE : FALSE;
+ 	d.DepthStencilState.DepthWriteMask = key.depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+@@ -4008,6 +4046,13 @@ static void QD3D12_CreatePSOs()
+ 	QD3D12_CHECK(g_gl.device->CreateGraphicsPipelineState(&depthDesc, IID_PPV_ARGS(&g_gl.postDepthCopyPSO)));
+ }
+ 
++static uint32_t QD3D12_FloatBits(float value)
++{
++	uint32_t bits = 0;
++	memcpy(&bits, &value, sizeof(bits));
++	return bits;
++}
++
+ static uint64_t MakePSOKey(
+ 	const BatchKey& key,
+ 	D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType,
+@@ -4032,6 +4077,9 @@ static uint64_t MakePSOKey(
+ 	mix(key.cullFaceEnabled ? 1ull : 0ull);
+ 	mix(uint32_t(key.cullMode));
+ 	mix(uint32_t(key.frontFace));
++	mix(key.polygonOffsetFill ? 1ull : 0ull);
++	mix(QD3D12_FloatBits(key.polygonOffsetFactor));
++	mix(QD3D12_FloatBits(key.polygonOffsetUnits));
+ 	mix(key.stencilTest ? 1ull : 0ull);
+ 	mix(uint32_t(key.stencilReadMask));
+ 	mix(uint32_t(key.stencilWriteMask));
+@@ -4183,6 +4231,9 @@ static uint64_t MakeARBPSOKey(
+ 	mix(key.cullFaceEnabled ? 1ull : 0ull);
+ 	mix(uint32_t(key.cullMode));
+ 	mix(uint32_t(key.frontFace));
++	mix(key.polygonOffsetFill ? 1ull : 0ull);
++	mix(QD3D12_FloatBits(key.polygonOffsetFactor));
++	mix(QD3D12_FloatBits(key.polygonOffsetUnits));
+ 	mix(key.stencilTest ? 1ull : 0ull);
+ 	mix(uint32_t(key.stencilReadMask));
+ 	mix(uint32_t(key.stencilWriteMask));
+@@ -4615,9 +4666,100 @@ void QD3D12_SwapBuffers(HDC hdc) {
+ // SECTION 9: texture upload/update
+ // ============================================================
+ 
++static int QD3D12_MipDimension(int baseDimension, UINT level)
++{
++	if (baseDimension <= 0)
++		return 0;
++	if (level >= 31)
++		return 1;
++	return (std::max)(1, baseDimension >> level);
++}
++
++static UINT QD3D12_TextureMipCount(const TextureResource& tex)
++{
++	if (tex.width <= 0 || tex.height <= 0)
++		return 1;
++
++	UINT count = 1;
++	for (size_t index = 0; index < tex.extraMipLevels.size(); ++index)
++	{
++		const TextureMipLevel& mip = tex.extraMipLevels[index];
++		const UINT level = (UINT)index + 1u;
++		if (!mip.defined)
++			break;
++
++		const int expectedWidth = QD3D12_MipDimension(tex.width, level);
++		const int expectedHeight = QD3D12_MipDimension(tex.height, level);
++		if (mip.width != expectedWidth || mip.height != expectedHeight)
++		{
++			QD3D12_Log("Texture %u mip %u has size %dx%d; expected %dx%d",
++				tex.glId, level, mip.width, mip.height, expectedWidth, expectedHeight);
++			break;
++		}
++
++		++count;
++		if (expectedWidth == 1 && expectedHeight == 1)
++			break;
++	}
++	return count;
++}
++
++struct TextureMipView
++{
++	int width = 0;
++	int height = 0;
++	GLenum format = GL_RGBA;
++	bool compressed = false;
++	GLenum compressedInternalFormat = 0;
++	UINT compressedBlockBytes = 0;
++	const std::vector<uint8_t>* sysmem = nullptr;
++};
++
++static bool QD3D12_GetTextureMipView(const TextureResource& tex, UINT level, TextureMipView& out)
++{
++	if (level == 0)
++	{
++		out.width = tex.width;
++		out.height = tex.height;
++		out.format = tex.format;
++		out.compressed = tex.compressed;
++		out.compressedInternalFormat = tex.compressedInternalFormat;
++		out.compressedBlockBytes = tex.compressedBlockBytes;
++		out.sysmem = &tex.sysmem;
++		return tex.width > 0 && tex.height > 0;
++	}
++
++	const size_t index = (size_t)level - 1u;
++	if (index >= tex.extraMipLevels.size())
++		return false;
++
++	const TextureMipLevel& mip = tex.extraMipLevels[index];
++	if (!mip.defined)
++		return false;
++
++	out.width = mip.width;
++	out.height = mip.height;
++	out.format = mip.format;
++	out.compressed = mip.compressed;
++	out.compressedInternalFormat = mip.compressedInternalFormat;
++	out.compressedBlockBytes = mip.compressedBlockBytes;
++	out.sysmem = &mip.sysmem;
++	return true;
++}
++
++static TextureMipLevel& QD3D12_EnsureExtraMipLevel(TextureResource& tex, UINT level)
++{
++	assert(level > 0);
++	const size_t index = (size_t)level - 1u;
++	if (tex.extraMipLevels.size() <= index)
++		tex.extraMipLevels.resize(index + 1u);
++	return tex.extraMipLevels[index];
++}
++
+ static void EnsureTextureResource(TextureResource& tex)
+ {
+ 	const DXGI_FORMAT dxgiFormat = tex.dxgiFormat;
++	const UINT desiredMipLevels = QD3D12_TextureMipCount(tex);
+ 
+ 	if (tex.width <= 0 || tex.height <= 0 || dxgiFormat == DXGI_FORMAT_UNKNOWN)
+ 		return;
+@@ -4638,7 +4780,9 @@ static void EnsureTextureResource(TextureResource& tex)
+ 			sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+ 			sd.Format = dxgiFormat;
+ 			sd.Shader4ComponentMapping = QD3D12_TextureShaderComponentMapping(tex);
+-			sd.Texture2D.MipLevels = 1;
++			sd.Texture2D.MostDetailedMip = 0;
++			sd.Texture2D.MipLevels = desiredMipLevels;
++			sd.Texture2D.ResourceMinLODClamp = 0.0f;
+ 			g_gl.device->CreateShaderResourceView(tex.texture.Get(), &sd, tex.srvCpu);
+ 		};
+ 
+@@ -4653,7 +4797,8 @@ static void EnsureTextureResource(TextureResource& tex)
+ 		D3D12_RESOURCE_DESC desc = tex.texture->GetDesc();
+ 		if ((int)desc.Width != tex.width ||
+ 			(int)desc.Height != tex.height ||
+-			desc.Format != dxgiFormat)
++			desc.Format != dxgiFormat ||
++			(UINT)desc.MipLevels != desiredMipLevels)
+ 		{
+ 			QD3D12_RetireResource(tex.texture);
+ 			tex.gpuValid = false;
+@@ -4675,7 +4820,7 @@ static void EnsureTextureResource(TextureResource& tex)
+ 	rd.Width = (UINT)tex.width;
+ 	rd.Height = (UINT)tex.height;
+ 	rd.DepthOrArraySize = 1;
+-	rd.MipLevels = 1;
++	rd.MipLevels = (UINT16)desiredMipLevels;
+ 	rd.Format = dxgiFormat;
+ 	rd.SampleDesc.Count = 1;
+ 	rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+@@ -4999,7 +5144,7 @@ static void ConvertToRGBA8(const TextureResource& tex, std::vector<uint8_t>& out
+ 
+ 	std::fill(outRGBA.begin(), outRGBA.end(), 255);
+ }
+-static void UploadTexture(TextureResource& tex)
++static void UploadTextureLegacy(TextureResource& tex)
+ {
+ 	if (!tex.texture)
+ 		return;
+@@ -5322,6 +5467,189 @@ static void UploadTexture(TextureResource& tex)
+ }
+ 
+ 
++static void QD3D12_ExpandMipRowToRGBA8(const TextureMipView& mip, int y, uint8_t* dst)
++{
++	if (!dst || mip.width <= 0)
++		return;
++
++	const std::vector<uint8_t>& bytes = *mip.sysmem;
++	if (bytes.empty())
++	{
++		memset(dst, 255, (size_t)mip.width * 4u);
++		return;
++	}
++
++	const int srcBpp = BytesPerPixel(mip.format, GL_UNSIGNED_BYTE);
++	const size_t rowOffset = (size_t)y * (size_t)mip.width * (size_t)srcBpp;
++	if (rowOffset >= bytes.size())
++	{
++		memset(dst, 255, (size_t)mip.width * 4u);
++		return;
++	}
++
++	const uint8_t* src = bytes.data() + rowOffset;
++	for (int x = 0; x < mip.width; ++x)
++	{
++		switch (mip.format)
++		{
++		case GL_RGB:
++			dst[x * 4 + 0] = src[x * 3 + 0];
++			dst[x * 4 + 1] = src[x * 3 + 1];
++			dst[x * 4 + 2] = src[x * 3 + 2];
++			dst[x * 4 + 3] = 255;
++			break;
++		case GL_ALPHA:
++			dst[x * 4 + 0] = 255;
++			dst[x * 4 + 1] = 255;
++			dst[x * 4 + 2] = 255;
++			dst[x * 4 + 3] = src[x];
++			break;
++		case GL_LUMINANCE:
++			dst[x * 4 + 0] = src[x];
++			dst[x * 4 + 1] = src[x];
++			dst[x * 4 + 2] = src[x];
++			dst[x * 4 + 3] = 255;
++			break;
++		case GL_INTENSITY:
++			dst[x * 4 + 0] = src[x];
++			dst[x * 4 + 1] = src[x];
++			dst[x * 4 + 2] = src[x];
++			dst[x * 4 + 3] = src[x];
++			break;
++		case GL_RGBA:
++		default:
++			dst[x * 4 + 0] = src[x * 4 + 0];
++			dst[x * 4 + 1] = src[x * 4 + 1];
++			dst[x * 4 + 2] = src[x * 4 + 2];
++			dst[x * 4 + 3] = src[x * 4 + 3];
++			break;
++		}
++	}
++}
++
++static void UploadTextureMipChain(TextureResource& tex)
++{
++	if (!tex.texture)
++		return;
++
++	const UINT mipCount = QD3D12_TextureMipCount(tex);
++	if (mipCount <= 1)
++	{
++		UploadTextureLegacy(tex);
++		return;
++	}
++
++	const D3D12_RESOURCE_DESC resourceDesc = tex.texture->GetDesc();
++	if ((UINT)resourceDesc.MipLevels != mipCount)
++	{
++		QD3D12_Fatal("D3D12 texture resource mip mismatch: texture=%u resource=%u expected=%u", tex.glId, (UINT)resourceDesc.MipLevels, mipCount);
++		return;
++	}
++
++	std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(mipCount);
++	std::vector<UINT> numRows(mipCount);
++	std::vector<UINT64> rowSizes(mipCount);
++	UINT64 totalBytes = 0;
++	g_gl.device->GetCopyableFootprints(
++		&resourceDesc,
++		0,
++		mipCount,
++		0,
++		layouts.data(),
++		numRows.data(),
++		rowSizes.data(),
++		&totalBytes);
++
++	if (totalBytes == 0 || totalBytes > UINT_MAX)
++	{
++		QD3D12_Fatal("D3D12 texture mip upload size invalid: texture=%u bytes=%llu", tex.glId, (unsigned long long)totalBytes);
++		return;
++	}
++
++	UploadAlloc alloc = QD3D12_AllocUpload((UINT)totalBytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
++	uint8_t* uploadCpu = static_cast<uint8_t*>(alloc.cpu);
++	memset(uploadCpu, 0, (size_t)totalBytes);
++
++	if (tex.state != D3D12_RESOURCE_STATE_COPY_DEST)
++	{
++		D3D12_RESOURCE_BARRIER toCopy{};
++		toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++		toCopy.Transition.pResource = tex.texture.Get();
++		toCopy.Transition.StateBefore = tex.state;
++		toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++		toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++		g_gl.cmdList->ResourceBarrier(1, &toCopy);
++		tex.state = D3D12_RESOURCE_STATE_COPY_DEST;
++	}
++
++	for (UINT level = 0; level < mipCount; ++level)
++	{
++		TextureMipView mip{};
++		if (!QD3D12_GetTextureMipView(tex, level, mip))
++		{
++			QD3D12_Fatal("D3D12 texture missing mip data: texture=%u level=%u", tex.glId, level);
++			return;
++		}
++
++		uint8_t* dstBase = uploadCpu + (size_t)layouts[level].Offset;
++		const UINT dstRowPitch = layouts[level].Footprint.RowPitch;
++
++		if (mip.compressed)
++		{
++			const UINT blockBytes = mip.compressedBlockBytes ? mip.compressedBlockBytes : QD3D12_CompressedTextureBlockBytes(mip.compressedInternalFormat);
++			const UINT blocksWide = QD3D12_CompressedTextureBlocksWide(mip.width);
++			const UINT blocksHigh = QD3D12_CompressedTextureBlocksHigh(mip.height);
++			const size_t srcRowBytes = (size_t)blocksWide * (size_t)blockBytes;
++			const std::vector<uint8_t>& bytes = *mip.sysmem;
++			for (UINT row = 0; row < blocksHigh; ++row)
++			{
++				const size_t srcOffset = (size_t)row * srcRowBytes;
++				if (srcOffset >= bytes.size())
++					break;
++				const size_t copyBytes = (std::min)(srcRowBytes, bytes.size() - srcOffset);
++				memcpy(dstBase + (size_t)row * dstRowPitch, bytes.data() + srcOffset, copyBytes);
++			}
++		}
++		else
++		{
++			for (int row = 0; row < mip.height; ++row)
++				QD3D12_ExpandMipRowToRGBA8(mip, row, dstBase + (size_t)row * dstRowPitch);
++		}
++
++		D3D12_TEXTURE_COPY_LOCATION srcLoc{};
++		srcLoc.pResource = g_currentWindow->upload.resource[g_currentWindow->frameIndex].Get();
++		srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++		srcLoc.PlacedFootprint = layouts[level];
++		srcLoc.PlacedFootprint.Offset += alloc.offset;
++
++		D3D12_TEXTURE_COPY_LOCATION dstLoc{};
++		dstLoc.pResource = tex.texture.Get();
++		dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++		dstLoc.SubresourceIndex = level;
++
++		g_gl.cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
++	}
++
++	D3D12_RESOURCE_BARRIER toSrv{};
++	toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++	toSrv.Transition.pResource = tex.texture.Get();
++	toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++	toSrv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++	toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++	g_gl.cmdList->ResourceBarrier(1, &toSrv);
++
++	tex.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++	tex.gpuValid = true;
++}
++
++static void UploadTexture(TextureResource& tex)
++{
++	if (QD3D12_TextureMipCount(tex) > 1)
++		UploadTextureMipChain(tex);
++	else
++		UploadTextureLegacy(tex);
++}
++
+ 
+ static GLenum QD3D12_NormalizeCopyTextureFormat(GLenum format)
+ {
+@@ -6314,6 +6642,7 @@ void APIENTRY glEnable(GLenum cap)
+ 	case GL_ALPHA_TEST: g_gl.alphaTest = true; break;
+ 	case GL_DEPTH_TEST: g_gl.depthTest = true; break;
+ 	case GL_CULL_FACE: g_gl.cullFace = true; break;
++	case GL_POLYGON_OFFSET_FILL: g_gl.polygonOffsetFill = true; break;
+ 	case GL_SCISSOR_TEST: g_gl.scissorTest = true; break;
+ 	case GL_STENCIL_TEST: g_gl.stencilTest = true; break;
+ #ifdef GL_STENCIL_TEST_TWO_SIDE_EXT
+@@ -6348,6 +6677,7 @@ void APIENTRY glDisable(GLenum cap)
+ 	case GL_ALPHA_TEST: g_gl.alphaTest = false; break;
+ 	case GL_DEPTH_TEST: g_gl.depthTest = false; break;
+ 	case GL_CULL_FACE: g_gl.cullFace = false; break;
++	case GL_POLYGON_OFFSET_FILL: g_gl.polygonOffsetFill = false; break;
+ 	case GL_SCISSOR_TEST: g_gl.scissorTest = false; break;
+ 	case GL_STENCIL_TEST: g_gl.stencilTest = false; break;
+ #ifdef GL_STENCIL_TEST_TWO_SIDE_EXT
+@@ -7253,29 +7583,63 @@ void APIENTRY glTexImage2D(GLenum, GLint level, GLint internalFormat,
+ 	if (it == g_gl.textures.end())
+ 		return;
+ 
+-	if (level > 0)
++	if (level < 0)
++	{
++		g_gl.lastError = GL_INVALID_VALUE;
+ 		return;
++	}
+ 
+ 	TextureResource& tex = it->second;
++	const GLenum storedFormat = (format != 0) ? format : (GLenum)internalFormat;
++	const int bpp = BytesPerPixel(storedFormat, type);
++	const size_t byteCount = (size_t)width * (size_t)height * (size_t)bpp;
+ 
+-	tex.width = width;
+-	tex.height = height;
+-	tex.format = (format != 0) ? format : (GLenum)internalFormat;
+-	tex.compressed = false;
+-	tex.compressedInternalFormat = 0;
+-	tex.compressedBlockBytes = 0;
+-	tex.compressedImageSize = 0;
+-	tex.forceOpaqueAlpha = false;
+-	tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
++	if (level == 0)
++	{
++		tex.width = width;
++		tex.height = height;
++		tex.format = storedFormat;
++		tex.compressed = false;
++		tex.compressedInternalFormat = 0;
++		tex.compressedBlockBytes = 0;
++		tex.compressedImageSize = 0;
++		tex.forceOpaqueAlpha = false;
++		tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
++		tex.extraMipLevels.clear();
++
++		tex.sysmem.resize(byteCount);
++		if (pixels)
++			memcpy(tex.sysmem.data(), pixels, tex.sysmem.size());
++		else
++			memset(tex.sysmem.data(), 0, tex.sysmem.size());
+ 
+-	const int bpp = BytesPerPixel(tex.format, type);
+-	tex.sysmem.resize((size_t)width * (size_t)height * (size_t)bpp);
++		// Defer resource creation until the first draw so all contiguous mip
++		// levels supplied by the renderer are known before allocating D3D12.
++		tex.gpuValid = false;
++		return;
++	}
++
++	if (tex.width <= 0 || tex.height <= 0 || tex.compressed)
++	{
++		g_gl.lastError = GL_INVALID_OPERATION;
++		return;
++	}
++
++	TextureMipLevel& mip = QD3D12_EnsureExtraMipLevel(tex, (UINT)level);
++	mip.width = width;
++	mip.height = height;
++	mip.format = storedFormat;
++	mip.compressed = false;
++	mip.compressedInternalFormat = 0;
++	mip.compressedBlockBytes = 0;
++	mip.compressedImageSize = 0;
++	mip.sysmem.resize(byteCount);
+ 	if (pixels)
+-		memcpy(tex.sysmem.data(), pixels, tex.sysmem.size());
++		memcpy(mip.sysmem.data(), pixels, mip.sysmem.size());
+ 	else
+-		memset(tex.sysmem.data(), 0, tex.sysmem.size());
++		memset(mip.sysmem.data(), 0, mip.sysmem.size());
++	mip.defined = true;
+ 
+-	EnsureTextureResource(tex);
+ 	tex.gpuValid = false;
+ }
+ 
+@@ -7302,9 +7666,6 @@ void APIENTRY glCompressedTexImage2DARB(GLenum target, GLint level, GLenum inter
+ 		return;
+ 	}
+ 
+-	if (level > 0)
+-		return;
+-
+ 	if (width <= 0 || height <= 0 || border != 0 || imageSize < 0)
+ 	{
+ 		g_gl.lastError = GL_INVALID_VALUE;
+@@ -7325,23 +7686,51 @@ void APIENTRY glCompressedTexImage2DARB(GLenum target, GLint level, GLenum inter
+ 	}
+ 
+ 	TextureResource& tex = it->second;
+-	tex.width = width;
+-	tex.height = height;
+-	tex.format = internalFormat;
+-	tex.compressed = true;
+-	tex.compressedInternalFormat = internalFormat;
+-	tex.compressedBlockBytes = QD3D12_CompressedTextureBlockBytes(internalFormat);
+-	tex.compressedImageSize = expectedSize;
+-	tex.forceOpaqueAlpha = (internalFormat == GL_COMPRESSED_RGB_S3TC_DXT1_EXT);
+-	tex.dxgiFormat = QD3D12_MapCompressedTextureFormat(internalFormat);
+-
+-	tex.sysmem.resize(expectedSize);
++	if (level == 0)
++	{
++		tex.width = width;
++		tex.height = height;
++		tex.format = internalFormat;
++		tex.compressed = true;
++		tex.compressedInternalFormat = internalFormat;
++		tex.compressedBlockBytes = QD3D12_CompressedTextureBlockBytes(internalFormat);
++		tex.compressedImageSize = expectedSize;
++		tex.forceOpaqueAlpha = (internalFormat == GL_COMPRESSED_RGB_S3TC_DXT1_EXT);
++		tex.dxgiFormat = QD3D12_MapCompressedTextureFormat(internalFormat);
++		tex.extraMipLevels.clear();
++
++		tex.sysmem.resize(expectedSize);
++		if (data && expectedSize > 0)
++			memcpy(tex.sysmem.data(), data, expectedSize);
++		else if (expectedSize > 0)
++			memset(tex.sysmem.data(), 0, expectedSize);
++
++		// Defer resource creation until the full contiguous chain is known.
++		tex.gpuValid = false;
++		return;
++	}
++
++	if (tex.width <= 0 || tex.height <= 0 || !tex.compressed || tex.compressedInternalFormat != internalFormat)
++	{
++		g_gl.lastError = GL_INVALID_OPERATION;
++		return;
++	}
++
++	TextureMipLevel& mip = QD3D12_EnsureExtraMipLevel(tex, (UINT)level);
++	mip.width = width;
++	mip.height = height;
++	mip.format = internalFormat;
++	mip.compressed = true;
++	mip.compressedInternalFormat = internalFormat;
++	mip.compressedBlockBytes = QD3D12_CompressedTextureBlockBytes(internalFormat);
++	mip.compressedImageSize = expectedSize;
++	mip.sysmem.resize(expectedSize);
+ 	if (data && expectedSize > 0)
+-		memcpy(tex.sysmem.data(), data, expectedSize);
++		memcpy(mip.sysmem.data(), data, expectedSize);
+ 	else if (expectedSize > 0)
+-		memset(tex.sysmem.data(), 0, expectedSize);
++		memset(mip.sysmem.data(), 0, expectedSize);
++	mip.defined = true;
+ 
+-	EnsureTextureResource(tex);
+ 	tex.gpuValid = false;
+ }
+ 
+@@ -7381,9 +7770,6 @@ void APIENTRY glCompressedTexSubImage2DARB(GLenum target, GLint level,
+ 		return;
+ 	}
+ 
+-	if (level > 0)
+-		return;
+-
+ 	if (xoffset < 0 || yoffset < 0 || width <= 0 || height <= 0 || imageSize < 0)
+ 	{
+ 		g_gl.lastError = GL_INVALID_VALUE;
+@@ -7391,26 +7777,27 @@ void APIENTRY glCompressedTexSubImage2DARB(GLenum target, GLint level,
+ 	}
+ 
+ 	TextureResource& tex = it->second;
+-	if (!tex.compressed || tex.width <= 0 || tex.height <= 0)
++	TextureMipView view{};
++	if (!QD3D12_GetTextureMipView(tex, (UINT)level, view) || !view.compressed)
+ 	{
+ 		g_gl.lastError = GL_INVALID_OPERATION;
+ 		return;
+ 	}
+ 
+-	if (format != tex.compressedInternalFormat || !QD3D12_IsCompressedTextureFormat(format))
++	if (format != view.compressedInternalFormat || !QD3D12_IsCompressedTextureFormat(format))
+ 	{
+ 		g_gl.lastError = GL_INVALID_ENUM;
+ 		return;
+ 	}
+ 
+-	if (xoffset + width > tex.width || yoffset + height > tex.height)
++	if (xoffset + width > view.width || yoffset + height > view.height)
+ 	{
+ 		g_gl.lastError = GL_INVALID_VALUE;
+ 		return;
+ 	}
+ 
+-	const bool touchesRightEdge = (xoffset + width) == tex.width;
+-	const bool touchesBottomEdge = (yoffset + height) == tex.height;
++	const bool touchesRightEdge = (xoffset + width) == view.width;
++	const bool touchesBottomEdge = (yoffset + height) == view.height;
+ 	if ((xoffset & 3) != 0 || (yoffset & 3) != 0 ||
+ 		(!touchesRightEdge && (width & 3) != 0) ||
+ 		(!touchesBottomEdge && (height & 3) != 0))
+@@ -7420,38 +7807,41 @@ void APIENTRY glCompressedTexSubImage2DARB(GLenum target, GLint level,
+ 	}
+ 
+ 	const UINT blockBytes = QD3D12_CompressedTextureBlockBytes(format);
+-	const UINT fullBlocksWide = QD3D12_CompressedTextureBlocksWide(tex.width);
++	const UINT fullBlocksWide = QD3D12_CompressedTextureBlocksWide(view.width);
+ 	const UINT subBlocksWide = QD3D12_CompressedTextureBlocksWide(width);
+ 	const UINT subBlocksHigh = QD3D12_CompressedTextureBlocksHigh(height);
+ 	const size_t srcRowBytes = (size_t)subBlocksWide * (size_t)blockBytes;
+ 	const size_t expectedSize = srcRowBytes * (size_t)subBlocksHigh;
+-	if ((size_t)imageSize < expectedSize)
++	if ((size_t)imageSize < expectedSize || (!data && expectedSize > 0))
+ 	{
+ 		g_gl.lastError = GL_INVALID_VALUE;
+ 		return;
+ 	}
+ 
+-	const size_t fullSize = (size_t)QD3D12_CompressedTextureImageSize(tex.width, tex.height, tex.compressedInternalFormat);
+-	if (tex.sysmem.size() != fullSize)
+-		tex.sysmem.resize(fullSize, 0);
++	std::vector<uint8_t>* storage = nullptr;
++	if (level == 0)
++		storage = &tex.sysmem;
++	else
++		storage = &tex.extraMipLevels[(size_t)level - 1u].sysmem;
+ 
+-	const uint8_t* src = static_cast<const uint8_t*>(data);
+-	if (!src && expectedSize > 0)
+-	{
+-		g_gl.lastError = GL_INVALID_VALUE;
+-		return;
+-	}
++	const size_t fullSize = (size_t)QD3D12_CompressedTextureImageSize(view.width, view.height, view.compressedInternalFormat);
++	if (storage->size() != fullSize)
++		storage->resize(fullSize, 0);
+ 
++	const uint8_t* src = static_cast<const uint8_t*>(data);
+ 	const UINT dstBlockX = (UINT)xoffset / 4u;
+ 	const UINT dstBlockY = (UINT)yoffset / 4u;
+ 	for (UINT row = 0; row < subBlocksHigh; ++row)
+ 	{
+ 		const size_t dstOff = ((size_t)(dstBlockY + row) * (size_t)fullBlocksWide + (size_t)dstBlockX) * (size_t)blockBytes;
+ 		const size_t srcOff = (size_t)row * srcRowBytes;
+-		memcpy(tex.sysmem.data() + dstOff, src + srcOff, srcRowBytes);
++		memcpy(storage->data() + dstOff, src + srcOff, srcRowBytes);
+ 	}
+ 
+-	tex.compressedImageSize = (UINT)fullSize;
++	if (level == 0)
++		tex.compressedImageSize = (UINT)fullSize;
++	else
++		tex.extraMipLevels[(size_t)level - 1u].compressedImageSize = (UINT)fullSize;
+ 	tex.gpuValid = false;
+ }
+ 
+@@ -7478,22 +7868,28 @@ void APIENTRY glGetCompressedTexImageARB(GLenum target, GLint level, GLvoid* img
+ 		return;
+ 	}
+ 
+-	if (level > 0 || !img)
++	if (level < 0 || !img)
+ 		return;
+-
+ 	auto it = g_gl.textures.find(g_gl.boundTexture[g_gl.activeTextureUnit]);
+-	if (it == g_gl.textures.end() || !it->second.compressed)
++	if (it == g_gl.textures.end())
+ 	{
+ 		g_gl.lastError = GL_INVALID_OPERATION;
+ 		return;
+ 	}
+ 
+-	TextureResource& tex = it->second;
+-	if (!tex.sysmem.empty())
+-		memcpy(img, tex.sysmem.data(), tex.sysmem.size());
++	TextureMipView view{};
++	if (!QD3D12_GetTextureMipView(it->second, (UINT)level, view) || !view.compressed)
++	{
++		g_gl.lastError = GL_INVALID_OPERATION;
++		return;
++	}
++
++	if (view.sysmem && !view.sysmem->empty())
++		memcpy(img, view.sysmem->data(), view.sysmem->size());
+ }
+ 
+ 
++
+ void APIENTRY glTexSubImage2D(GLenum, GLint level, GLint xoffset, GLint yoffset,
+ 	GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid* pixels)
+ {
+@@ -7501,29 +7897,42 @@ void APIENTRY glTexSubImage2D(GLenum, GLint level, GLint xoffset, GLint yoffset,
+ 	if (it == g_gl.textures.end() || !pixels)
+ 		return;
+ 
+-	if (level > 0)
++	if (level < 0)
++	{
++		g_gl.lastError = GL_INVALID_VALUE;
+ 		return;
+-
++	}
+ 	TextureResource& tex = it->second;
+-	if (tex.width <= 0 || tex.height <= 0)
++	TextureMipView view{};
++	if (!QD3D12_GetTextureMipView(tex, (UINT)level, view) || view.compressed)
++	{
++		g_gl.lastError = GL_INVALID_OPERATION;
+ 		return;
++	}
+ 
+-	if (tex.compressed)
++	if (xoffset < 0 || yoffset < 0 || width <= 0 || height <= 0 ||
++		xoffset + width > view.width || yoffset + height > view.height)
+ 	{
+-		g_gl.lastError = GL_INVALID_OPERATION;
++		g_gl.lastError = GL_INVALID_VALUE;
+ 		return;
+ 	}
+ 
+ 	const int bpp = BytesPerPixel(format, type);
+-	if (tex.sysmem.empty())
+-		tex.sysmem.resize((size_t)tex.width * (size_t)tex.height * (size_t)bpp);
++	std::vector<uint8_t>* storage = nullptr;
++	if (level == 0)
++		storage = &tex.sysmem;
++	else
++		storage = &tex.extraMipLevels[(size_t)level - 1u].sysmem;
++
++	if (storage->empty())
++		storage->resize((size_t)view.width * (size_t)view.height * (size_t)bpp);
+ 
+ 	const uint8_t* src = (const uint8_t*)pixels;
+ 	for (int row = 0; row < height; ++row)
+ 	{
+-		size_t dstOff = ((size_t)(yoffset + row) * (size_t)tex.width + (size_t)xoffset) * (size_t)bpp;
+-		size_t srcOff = (size_t)row * (size_t)width * (size_t)bpp;
+-		memcpy(tex.sysmem.data() + dstOff, src + srcOff, (size_t)width * (size_t)bpp);
++		const size_t dstOff = ((size_t)(yoffset + row) * (size_t)view.width + (size_t)xoffset) * (size_t)bpp;
++		const size_t srcOff = (size_t)row * (size_t)width * (size_t)bpp;
++		memcpy(storage->data() + dstOff, src + srcOff, (size_t)width * (size_t)bpp);
+ 	}
+ 
+ 	tex.gpuValid = false;
+@@ -7641,7 +8050,7 @@ void APIENTRY glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname,
+ 		return;
+ 	}
+ 
+-	if (level != 0)
++	if (level < 0)
+ 	{
+ 		*params = 0;
+ 		return;
+@@ -7654,23 +8063,29 @@ void APIENTRY glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname,
+ 		return;
+ 	}
+ 
+-	const TextureResource& tex = it->second;
++	TextureMipView view{};
++	if (!QD3D12_GetTextureMipView(it->second, (UINT)level, view))
++	{
++		*params = 0;
++		return;
++	}
++
+ 	switch (pname)
+ 	{
+ 	case GL_TEXTURE_WIDTH:
+-		*params = tex.width;
++		*params = view.width;
+ 		break;
+ 	case GL_TEXTURE_HEIGHT:
+-		*params = tex.height;
++		*params = view.height;
+ 		break;
+ 	case GL_TEXTURE_INTERNAL_FORMAT:
+-		*params = (GLint)tex.format;
++		*params = (GLint)view.format;
+ 		break;
+ 	case GL_TEXTURE_COMPRESSED_ARB:
+-		*params = tex.compressed ? GL_TRUE : GL_FALSE;
++		*params = view.compressed ? GL_TRUE : GL_FALSE;
+ 		break;
+ 	case GL_TEXTURE_COMPRESSED_IMAGE_SIZE_ARB:
+-		*params = tex.compressed ? (GLint)tex.compressedImageSize : 0;
++		*params = view.compressed && view.sysmem ? (GLint)view.sysmem->size() : 0;
+ 		break;
+ 	default:
+ 		*params = 0;
+diff --git a/src/renderer/tr_image.cpp b/src/renderer/tr_image.cpp
+index bac140e..192ff35 100644
+--- a/src/renderer/tr_image.cpp
++++ b/src/renderer/tr_image.cpp
+@@ -888,7 +888,8 @@ image_t *R_CreateImageExt( const char *name, const byte *pic, int width, int hei
+ 
+ 	tr.numImages++;
+ 
+-	mipmap = qfalse; // jmarshall fixme
++	// Honor the renderer-provided mipmap policy.  Callers that request
++	// nomipmaps (UI, special images, shader nomipmaps) remain single-level.
+ 	image->mipmap = mipmap;
+ 	image->allowPicmip = allowPicmip;
+ 

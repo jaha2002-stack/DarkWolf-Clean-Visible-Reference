@@ -1,0 +1,241 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 6df1449..fc46e0b 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1768,9 +1768,11 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t atmospherePad[3];
+ 	float mapFogColor[4];
+ 	float mapFogParams[4];
++	float atmosphereControls[4]; // strength, distanceScale, maxOpacity, reserved
++	float atmosphereHeight[4];   // baseHeight, heightFalloff, reserved, reserved
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 304,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 336,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1865,6 +1867,8 @@ cbuffer LightingCB : register(b0)
+     uint     gMapFogMode;
+     float4   gMapFogColor;
+     float4   gMapFogParams;
++    float4   gAtmosphereControls;
++    float4   gAtmosphereHeight;
+ };
+ 
+ StructuredBuffer<Light> gLights : register(t0);
+@@ -2400,14 +2404,21 @@ float3 ComputeSpecular(float3 N, float3 V, float3 L, float3 lightColor, float li
+ }
+ )"
+ R"(
++float AtmosphereDistance(float distanceToCamera)
++{
++    return distanceToCamera / max(gAtmosphereControls.y, 0.05);
++}
++
+ float ComputeLinearFogAmount(float distanceToCamera, float startDistance, float endDistance)
+ {
++    float scaledDistance = AtmosphereDistance(distanceToCamera);
+     float span = max(endDistance - startDistance, 1.0);
+-    return saturate((distanceToCamera - startDistance) / span);
++    return saturate((scaledDistance - startDistance) / span);
+ }
+ 
+ float ComputeMapFogAmount(float distanceToCamera)
+ {
++    float scaledDistance = AtmosphereDistance(distanceToCamera);
+     float startDistance = gMapFogParams.x;
+     float endDistance = gMapFogParams.y;
+     float density = max(gMapFogParams.z, 0.0);
+@@ -2418,16 +2429,23 @@ float ComputeMapFogAmount(float distanceToCamera)
+     }
+     if (gMapFogMode == 2u)
+     {
+-        return saturate(1.0 - exp(-density * distanceToCamera));
++        return saturate(1.0 - exp(-density * scaledDistance));
+     }
+     if (gMapFogMode == 3u)
+     {
+-        float d = density * distanceToCamera;
++        float d = density * scaledDistance;
+         return saturate(1.0 - exp(-(d * d)));
+     }
+     return 0.0;
+ }
+ 
++float ComputeWorldLowFog(float worldZ)
++{
++    float baseHeight = gAtmosphereHeight.x;
++    float heightFalloff = max(gAtmosphereHeight.y, 1.0);
++    return 1.0 - smoothstep(baseHeight, baseHeight + heightFalloff, worldZ);
++}
++
+ float3 ApplyDXRAtmosphere(float3 color, float3 worldPos)
+ {
+     uint mode = min(gAtmosphereMode, 6u);
+@@ -2469,21 +2487,20 @@ float3 ApplyDXRAtmosphere(float3 color, float3 worldPos)
+     else if (mode == 5u)
+     {
+         float distanceFog = ComputeLinearFogAmount(distanceToCamera, 180.0, 1700.0);
+-        float belowCamera = saturate((gCameraPos.z - worldPos.z + 48.0) / 320.0);
+-        float lowLayer = smoothstep(0.05, 0.95, belowCamera);
++        float lowLayer = ComputeWorldLowFog(worldPos.z);
+         fogAmount = saturate(distanceFog * 0.28 + lowLayer * 0.52);
+         fogColor = float3(0.18, 0.22, 0.24);
+     }
+     else
+     {
+         float distanceFog = ComputeLinearFogAmount(distanceToCamera, 100.0, 1250.0);
+-        float belowCamera = saturate((gCameraPos.z - worldPos.z + 32.0) / 420.0);
+-        float layer = smoothstep(0.0, 1.0, belowCamera);
++        float layer = ComputeWorldLowFog(worldPos.z);
+         fogAmount = saturate(distanceFog * 0.58 + layer * 0.28);
+         fogColor = float3(0.13, 0.17, 0.21);
+     }
+ 
+-    fogAmount = min(saturate(fogAmount), 0.90);
++    fogAmount *= max(gAtmosphereControls.x, 0.0);
++    fogAmount = min(saturate(fogAmount), saturate(gAtmosphereControls.z));
+     return lerp(color, fogColor, fogAmount);
+ }
+ 
+@@ -3267,6 +3284,14 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.mapFogParams[1] = 1.0f;
+ 	g_glRaytracingLighting.constants.mapFogParams[2] = 0.0f;
+ 	g_glRaytracingLighting.constants.mapFogParams[3] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereControls[0] = 1.0f;
++	g_glRaytracingLighting.constants.atmosphereControls[1] = 1.0f;
++	g_glRaytracingLighting.constants.atmosphereControls[2] = 0.80f;
++	g_glRaytracingLighting.constants.atmosphereControls[3] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[0] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[1] = 320.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[2] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[3] = 0.0f;
+ 
+ 	glRaytracingLightingUpdateConstants();
+ 
+@@ -3432,7 +3457,12 @@ void glRaytracingLightingSetAtmosphereOptions(
+ 	float fogB,
+ 	float fogStart,
+ 	float fogEnd,
+-	float fogDensity)
++	float fogDensity,
++	float atmosphereStrength,
++	float atmosphereDistanceScale,
++	float atmosphereMaxOpacity,
++	float fogBaseHeight,
++	float fogHeightFalloff)
+ {
+ 	g_glRaytracingLighting.constants.atmosphereMode = glRaytracingClamp<uint32_t>(atmosphereMode, 0u, 6u);
+ 	g_glRaytracingLighting.constants.mapFogMode = glRaytracingClamp<uint32_t>(mapFogMode, 0u, 3u);
+@@ -3444,6 +3474,14 @@ void glRaytracingLightingSetAtmosphereOptions(
+ 	g_glRaytracingLighting.constants.mapFogParams[1] = (fogEnd > fogStart + 1.0f) ? fogEnd : (fogStart + 1.0f);
+ 	g_glRaytracingLighting.constants.mapFogParams[2] = (fogDensity > 0.0f) ? fogDensity : 0.0f;
+ 	g_glRaytracingLighting.constants.mapFogParams[3] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereControls[0] = glRaytracingClamp<float>(atmosphereStrength, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.atmosphereControls[1] = glRaytracingClamp<float>(atmosphereDistanceScale, 0.05f, 8.0f);
++	g_glRaytracingLighting.constants.atmosphereControls[2] = glRaytracingClamp<float>(atmosphereMaxOpacity, 0.0f, 1.0f);
++	g_glRaytracingLighting.constants.atmosphereControls[3] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[0] = fogBaseHeight;
++	g_glRaytracingLighting.constants.atmosphereHeight[1] = glRaytracingClamp<float>(fogHeightFalloff, 1.0f, 8192.0f);
++	g_glRaytracingLighting.constants.atmosphereHeight[2] = 0.0f;
++	g_glRaytracingLighting.constants.atmosphereHeight[3] = 0.0f;
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index a8a0f69..496efaf 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1718,7 +1718,9 @@ void                       glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+ 	float fogR, float fogG, float fogB,
+-	float fogStart, float fogEnd, float fogDensity);
++	float fogStart, float fogEnd, float fogDensity,
++	float atmosphereStrength, float atmosphereDistanceScale, float atmosphereMaxOpacity,
++	float fogBaseHeight, float fogHeightFalloff);
+ void                       glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index ab3ae2c..9c99899 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1344,19 +1344,29 @@ static void RB_RunRaytracedLightingPass(void)
+ 		mapFogDensity = activeFog->density;
+ 	}
+ 
++	const float atmosphereStrength = r_dxrAtmosphereStrength ? r_dxrAtmosphereStrength->value : 1.0f;
++	const float atmosphereDistanceScale = r_dxrAtmosphereDistanceScale ? r_dxrAtmosphereDistanceScale->value : 1.0f;
++	const float atmosphereMaxOpacity = r_dxrAtmosphereMaxOpacity ? r_dxrAtmosphereMaxOpacity->value : 0.80f;
++	const float fogBaseHeight = r_dxrFogBaseHeight ? r_dxrFogBaseHeight->value : 0.0f;
++	const float fogHeightFalloff = r_dxrFogHeightFalloff ? r_dxrFogHeightFalloff->value : 320.0f;
++
+ 	glRaytracingLightingSetAtmosphereOptions(
+ 		(uint32_t)atmosphereMode,
+ 		mapFogMode,
+ 		mapFogColor[0], mapFogColor[1], mapFogColor[2],
+-		mapFogStart, mapFogEnd, mapFogDensity);
++		mapFogStart, mapFogEnd, mapFogDensity,
++		atmosphereStrength, atmosphereDistanceScale, atmosphereMaxOpacity,
++		fogBaseHeight, fogHeightFalloff);
+ 
+ 	if (atmosphereMode != s_lastAtmosphereMode)
+ 	{
+ 		s_lastAtmosphereMode = atmosphereMode;
+ 		ri.Printf(PRINT_ALL,
+-			"ATMOSPHERIC_FOG_EXP15 mode=%d mapFogMode=%u start=%.1f end=%.1f density=%.5f color=%.3f/%.3f/%.3f\n",
++			"ATMOSPHERIC_FOG_EXP15_1 mode=%d mapFogMode=%u start=%.1f end=%.1f density=%.5f color=%.3f/%.3f/%.3f strength=%.2f distanceScale=%.2f maxOpacity=%.2f baseHeight=%.1f heightFalloff=%.1f\n",
+ 			atmosphereMode, mapFogMode, mapFogStart, mapFogEnd, mapFogDensity,
+-			mapFogColor[0], mapFogColor[1], mapFogColor[2]);
++			mapFogColor[0], mapFogColor[1], mapFogColor[2],
++			atmosphereStrength, atmosphereDistanceScale, atmosphereMaxOpacity,
++			fogBaseHeight, fogHeightFalloff);
+ 	}
+ 
+ 	RB_AddDXRFallbackLightIfNeeded();
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 3b05060..453a885 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -82,6 +82,11 @@ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrDynamicLightQualityMode;
+ cvar_t  *r_dxrAtmosphereMode;
++cvar_t  *r_dxrAtmosphereStrength;
++cvar_t  *r_dxrAtmosphereDistanceScale;
++cvar_t  *r_dxrAtmosphereMaxOpacity;
++cvar_t  *r_dxrFogBaseHeight;
++cvar_t  *r_dxrFogHeightFalloff;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
+@@ -1022,6 +1027,11 @@ void R_Register( void ) {
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
++	r_dxrAtmosphereStrength = ri.Cvar_Get( "r_dxrAtmosphereStrength", "1.0", CVAR_ARCHIVE );
++	r_dxrAtmosphereDistanceScale = ri.Cvar_Get( "r_dxrAtmosphereDistanceScale", "1.0", CVAR_ARCHIVE );
++	r_dxrAtmosphereMaxOpacity = ri.Cvar_Get( "r_dxrAtmosphereMaxOpacity", "0.80", CVAR_ARCHIVE );
++	r_dxrFogBaseHeight = ri.Cvar_Get( "r_dxrFogBaseHeight", "0.0", CVAR_ARCHIVE );
++	r_dxrFogHeightFalloff = ri.Cvar_Get( "r_dxrFogHeightFalloff", "320.0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index ab24d49..093fa3c 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1140,6 +1140,11 @@ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the con
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
+ extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
++extern cvar_t   *r_dxrAtmosphereStrength; // global fog strength multiplier
++extern cvar_t   *r_dxrAtmosphereDistanceScale; // >1 pushes fog farther away, <1 brings it closer
++extern cvar_t   *r_dxrAtmosphereMaxOpacity; // upper bound for final fog opacity
++extern cvar_t   *r_dxrFogBaseHeight; // world-space Z where low fog begins to fade
++extern cvar_t   *r_dxrFogHeightFalloff; // world-space fade height above the fog base
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;

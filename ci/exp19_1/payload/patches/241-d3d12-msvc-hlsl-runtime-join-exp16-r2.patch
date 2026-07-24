@@ -1,0 +1,110 @@
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -16,6 +16,7 @@
+ #include <thread>
+ #include <atomic>
+ #include <algorithm>
++#include <string>
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+@@ -1809,7 +1810,7 @@
+ };
+ 
+ static glRaytracingLightingState_t g_glRaytracingLighting;
+-static const char* g_glRaytracingLightingHlsl = R"(
++static const char g_glRaytracingLightingHlslPart0[] = R"(
+ struct Light
+ {
+     float3 position;
+@@ -1887,8 +1888,9 @@
+ // Stored in Light.pad1. A fill-only light contributes diffuse/specular light but
+ // never casts a ray-traced shadow or overrides the authored-light shadow mask.
+ static const float GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY = 1.0;
+-)"
+-R"(
++)";
++
++static const char g_glRaytracingLightingHlslPart1[] = R"(
+ float DynamicLightPointFalloff(float dist, float radius)
+ {
+     float x = saturate(1.0 - dist / max(radius, 1e-4));
+@@ -1983,8 +1985,9 @@
+     float compressedPeak = knee + excess / (1.0 + excess);
+     return value * (compressedPeak / max(peak, 1e-5));
+ }
+-)"
+-R"(
++)";
++
++static const char g_glRaytracingLightingHlslPart2[] = R"(
+ static const uint GEOMETRY_FLAG_SKELETAL = 1;
+ static const uint GEOMETRY_FLAG_UNLIT    = 2;
+ 
+@@ -2410,8 +2413,9 @@
+     return lightColor * (lightIntensity * atten * shadow * NdotL) * spec;
+ }
+ 
+-)"
+-R"(
++)";
++
++static const char g_glRaytracingLightingHlslPart3[] = R"(
+ float3 ComputeRoughnessOnlyGGXSpecular(
+     float3 N, float3 V, float3 L, float3 lightColor,
+     float lightIntensity, float atten, float shadow, float3 baseAlbedo,
+@@ -2527,8 +2531,9 @@
+     return lightColor * (lightIntensity * atten * shadow * NdotL) * brdf;
+ }
+ 
+-)"
+-R"(
++)";
++
++static const char g_glRaytracingLightingHlslPart4[] = R"(
+ float3 ComputeMaterialBlinnSpecular(
+     float3 N, float3 V, float3 L, float3 lightColor,
+     float lightIntensity, float atten, float shadow, float3 baseAlbedo, uint materialType)
+@@ -2604,8 +2609,9 @@
+         N, V, L, lightColor, lightIntensity, atten, shadow, baseAlbedo,
+         surfaceRoughness, materialType, strictMode);
+ }
+-)"
+-R"(
++)";
++
++static const char g_glRaytracingLightingHlslPart5[] = R"(
+ float AtmosphereDistance(float distanceToCamera)
+ {
+     return distanceToCamera / max(gAtmosphereControls.y, 0.05);
+@@ -2971,6 +2977,20 @@
+ }
+ )";
+ 
++
++static std::string glRaytracingLightingBuildHlsl()
++{
++	std::string source;
++	source.reserve(37570u);
++	source.append(g_glRaytracingLightingHlslPart0);
++	source.append(g_glRaytracingLightingHlslPart1);
++	source.append(g_glRaytracingLightingHlslPart2);
++	source.append(g_glRaytracingLightingHlslPart3);
++	source.append(g_glRaytracingLightingHlslPart4);
++	source.append(g_glRaytracingLightingHlslPart5);
++	return source;
++}
++
+ static ComPtr<IDxcBlob> glRaytracingLightingCompileLibrary(const char* src)
+ {
+ 	ComPtr<IDxcUtils> utils;
+@@ -3225,7 +3245,8 @@
+ 
+ static int glRaytracingLightingCreateStateObject(void)
+ {
+-	ComPtr<IDxcBlob> dxil = glRaytracingLightingCompileLibrary(g_glRaytracingLightingHlsl);
++	const std::string hlslSource = glRaytracingLightingBuildHlsl();
++	ComPtr<IDxcBlob> dxil = glRaytracingLightingCompileLibrary(hlslSource.c_str());
+ 	if (!dxil)
+ 		return 0;
+ 

@@ -1,0 +1,353 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index ef2d2e6..44e96ae 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1767,14 +1767,18 @@ struct glRaytracingLightingConstants_t
+ 	uint32_t atmosphereMode;
+ 	uint32_t mapFogMode;
+ 	uint32_t materialSpecularMode;
+-	uint32_t atmospherePad[2];
++	uint32_t toneMappingMode;
++	float toneMapWhitePoint;
++	float toneMapSaturation;
++	float toneMapContrast;
++	uint32_t toneMappingPad[2];
+ 	float mapFogColor[4];
+ 	float mapFogParams[4];
+ 	float atmosphereControls[4]; // strength, distanceScale, maxOpacity, reserved
+ 	float atmosphereHeight[4];   // baseHeight, heightFalloff, reserved, reserved
+ };
+ 
+-static_assert(sizeof(glRaytracingLightingConstants_t) == 336,
++static_assert(sizeof(glRaytracingLightingConstants_t) == 352,
+ 	"DXR lighting constant buffer layout must match the embedded HLSL cbuffer");
+ 
+ struct glRaytracingLightingState_t
+@@ -1868,7 +1872,11 @@ cbuffer LightingCB : register(b0)
+     uint     gAtmosphereMode;
+     uint     gMapFogMode;
+     uint     gMaterialSpecularMode;
+-    uint2    gMaterialPad;
++    uint     gToneMappingMode;
++    float    gToneMapWhitePoint;
++    float    gToneMapSaturation;
++    float    gToneMapContrast;
++    uint2    gToneMappingPad;
+     float4   gMapFogColor;
+     float4   gMapFogParams;
+     float4   gAtmosphereControls;
+@@ -1977,6 +1985,12 @@ float3 DynamicLightSoftPeak(float3 value)
+     else
+         return value;
+ 
++    // HDR-like modes preserve more linear highlight headroom and defer the
++    // final roll-off to the selected tone mapper instead of crushing light
++    // energy inside the accumulation loop.
++    if (gToneMappingMode != 0u)
++        knee *= 1.75;
++
+     float peak = max(value.r, max(value.g, value.b));
+     if (peak <= knee)
+         return value;
+@@ -2712,6 +2726,118 @@ float3 ApplyDXRAtmosphere(float3 color, float3 worldPos)
+     return lerp(color, fogColor, fogAmount);
+ }
+ 
++float3 ToneMapExtendedReinhard(float3 x, float whitePoint)
++{
++    float white2 = max(whitePoint * whitePoint, 0.01);
++    return (x * (1.0 + x / white2)) / (1.0 + x);
++}
++
++float3 ToneMapACESFitted(float3 x)
++{
++    const float a = 2.51;
++    const float b = 0.03;
++    const float c = 2.43;
++    const float d = 0.59;
++    const float e = 0.14;
++    return saturate((x * (a * x + b)) / max(x * (c * x + d) + e, 1e-5));
++}
++
++float3 HablePartial(float3 x)
++{
++    const float A = 0.15;
++    const float B = 0.50;
++    const float C = 0.10;
++    const float D = 0.20;
++    const float E = 0.02;
++    const float F = 0.30;
++    return ((x * (A * x + C * B) + D * E) /
++            max(x * (A * x + B) + D * F, 1e-5)) - E / F;
++}
++
++float3 ToneMapHable(float3 x, float whitePoint)
++{
++    float3 mapped = HablePartial(x);
++    float whiteScale = max(HablePartial(float3(whitePoint, whitePoint, whitePoint)).r, 1e-5);
++    return saturate(mapped / whiteScale);
++}
++
++float3 ToneMapNeutralLuminance(float3 x, float whitePoint)
++{
++    float peak = max(x.r, max(x.g, x.b));
++    if (peak <= 1e-5)
++        return 0.0;
++
++    float mappedPeak = (peak * (1.0 + peak / max(whitePoint * whitePoint, 0.01))) /
++                       (1.0 + peak);
++    return saturate(x * (mappedPeak / peak));
++}
++
++float3 ApplyToneMapPresentationControls(float3 color, float modeContrastScale, float modeSaturationScale)
++{
++    float contrast = clamp(gToneMapContrast * modeContrastScale, 0.50, 1.60);
++    color = max((color - 0.18) * contrast + 0.18, 0.0);
++
++    float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
++    float saturation = clamp(gToneMapSaturation * modeSaturationScale, 0.0, 2.0);
++    return saturate(lerp(float3(luminance, luminance, luminance), color, saturation));
++}
++
++float3 ApplyHDRLikeToneMapping(float3 sceneColor)
++{
++    float3 x = max(sceneColor, 0.0) * max(gExposure, 0.001);
++    uint mode = min(gToneMappingMode, 6u);
++    float whitePoint = clamp(gToneMapWhitePoint, 1.0, 16.0);
++
++    if (mode == 0u)
++        return x; // exact Stable Clear v2.2 behavior; UNORM output performs the clamp
++
++    float3 mapped = 0.0;
++    float contrastScale = 1.0;
++    float saturationScale = 1.0;
++
++    if (mode == 1u)
++    {
++        mapped = ToneMapExtendedReinhard(x, whitePoint);
++        contrastScale = 0.96;
++    }
++    else if (mode == 2u)
++    {
++        mapped = ToneMapACESFitted(x);
++        saturationScale = 0.98;
++    }
++    else if (mode == 3u)
++    {
++        mapped = ToneMapHable(x, whitePoint);
++        contrastScale = 1.04;
++    }
++    else if (mode == 4u)
++    {
++        mapped = ToneMapNeutralLuminance(x, whitePoint);
++        saturationScale = 1.02;
++    }
++    else if (mode == 5u)
++    {
++        // Balanced production candidate: ACES-like shoulder with a small
++        // midtone lift while retaining highlight color and material detail.
++        mapped = ToneMapACESFitted(x * 0.92);
++        contrastScale = 1.02;
++        saturationScale = 1.00;
++    }
++    else
++    {
++        // Cinematic candidate: wider linear headroom and a stronger Hable
++        // shoulder.  It is intentionally more contrasty for clear A/B tests.
++        mapped = ToneMapHable(x * 1.18, whitePoint);
++        contrastScale = 1.10;
++        saturationScale = 0.96;
++    }
++
++    return ApplyToneMapPresentationControls(mapped, contrastScale, saturationScale);
++}
++
++)";
++
++static const char g_glRaytracingLightingHlslPart6[] = R"(
+ [shader("raygeneration")]
+ void RayGen()
+ {
+@@ -2948,7 +3074,6 @@ void RayGen()
+         legacyShadow = max(legacyShadow, saturate(gShadowMinVisibility));
+         float3 finalColor = lerp(rtLitColor, baseAlbedo * legacyShadow, legacyKeep);
+         finalColor = ApplyDXRAtmosphere(finalColor, worldPos);
+-        finalColor *= max(gExposure, 0.001);
+ 
+         if (gDebugMode == 1)
+         {
+@@ -2971,6 +3096,10 @@ void RayGen()
+         {
+             finalColor = float3(legacyShadow, legacyShadow, legacyShadow);
+         }
++        else
++        {
++            finalColor = ApplyHDRLikeToneMapping(finalColor);
++        }
+ 
+         gOutputTex[pixel] = float4(finalColor, albedoSample.a);
+     }
+@@ -2981,13 +3110,14 @@ void RayGen()
+ static std::string glRaytracingLightingBuildHlsl()
+ {
+ 	std::string source;
+-	source.reserve(37570u);
++	source.reserve(43000u);
+ 	source.append(g_glRaytracingLightingHlslPart0);
+ 	source.append(g_glRaytracingLightingHlslPart1);
+ 	source.append(g_glRaytracingLightingHlslPart2);
+ 	source.append(g_glRaytracingLightingHlslPart3);
+ 	source.append(g_glRaytracingLightingHlslPart4);
+ 	source.append(g_glRaytracingLightingHlslPart5);
++	source.append(g_glRaytracingLightingHlslPart6);
+ 	return source;
+ }
+ 
+@@ -3509,9 +3639,13 @@ bool glRaytracingLightingInit(void)
+ 	g_glRaytracingLighting.constants.dynamicLightQualityMode = 0u;
+ 	g_glRaytracingLighting.constants.atmosphereMode = 0u;
+ 	g_glRaytracingLighting.constants.mapFogMode = 0u;
+-	g_glRaytracingLighting.constants.atmospherePad[0] = 0u;
+-	g_glRaytracingLighting.constants.atmospherePad[1] = 0u;
+-	g_glRaytracingLighting.constants.atmospherePad[2] = 0u;
++	g_glRaytracingLighting.constants.materialSpecularMode = 0u;
++	g_glRaytracingLighting.constants.toneMappingMode = 0u;
++	g_glRaytracingLighting.constants.toneMapWhitePoint = 4.0f;
++	g_glRaytracingLighting.constants.toneMapSaturation = 1.0f;
++	g_glRaytracingLighting.constants.toneMapContrast = 1.0f;
++	g_glRaytracingLighting.constants.toneMappingPad[0] = 0u;
++	g_glRaytracingLighting.constants.toneMappingPad[1] = 0u;
+ 	g_glRaytracingLighting.constants.mapFogColor[0] = 0.18f;
+ 	g_glRaytracingLighting.constants.mapFogColor[1] = 0.20f;
+ 	g_glRaytracingLighting.constants.mapFogColor[2] = 0.22f;
+@@ -3691,6 +3825,19 @@ void glRaytracingLightingSetMaterialSpecularMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetToneMappingOptions(
++	uint32_t mode,
++	float whitePoint,
++	float saturation,
++	float contrast)
++{
++	g_glRaytracingLighting.constants.toneMappingMode = glRaytracingClamp<uint32_t>(mode, 0u, 6u);
++	g_glRaytracingLighting.constants.toneMapWhitePoint = glRaytracingClamp<float>(whitePoint, 1.0f, 16.0f);
++	g_glRaytracingLighting.constants.toneMapSaturation = glRaytracingClamp<float>(saturation, 0.0f, 2.0f);
++	g_glRaytracingLighting.constants.toneMapContrast = glRaytracingClamp<float>(contrast, 0.50f, 1.60f);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 1009587..bc74c69 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1717,6 +1717,8 @@ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend)
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
+ void                       glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode);
+ void                       glRaytracingLightingSetMaterialSpecularMode(uint32_t mode);
++void                       glRaytracingLightingSetToneMappingOptions(
++	uint32_t mode, float whitePoint, float saturation, float contrast);
+ void                       glRaytracingLightingSetAtmosphereOptions(
+ 	uint32_t atmosphereMode,
+ 	uint32_t mapFogMode,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 207fb7a..fd27c6a 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1369,6 +1369,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 	static int s_lastDXRDebugPrintTime = 0;
+ 	static int s_lastDynamicLightQualityMode = -1;
+ 	static int s_lastMaterialSpecularMode = -1;
++	static int s_lastToneMappingMode = -1;
+ 	static int s_lastAtmosphereMode = -1;
+ 
+ 	if (backEnd.raytraceRendered || !RB_DXRShouldRenderLighting())
+@@ -1469,6 +1470,26 @@ static void RB_RunRaytracedLightingPass(void)
+ 		ri.Printf(PRINT_ALL, "MATERIAL_SPECULAR_EXP16 mode=%d\n", materialSpecularMode);
+ 	}
+ 
++	int toneMappingMode = r_dxrToneMappingMode ? r_dxrToneMappingMode->integer : 0;
++	if (toneMappingMode < 0)
++		toneMappingMode = 0;
++	else if (toneMappingMode > 6)
++		toneMappingMode = 6;
++	const float toneMapWhitePoint = r_dxrToneMapWhitePoint ? r_dxrToneMapWhitePoint->value : 4.0f;
++	const float toneMapSaturation = r_dxrToneMapSaturation ? r_dxrToneMapSaturation->value : 1.0f;
++	const float toneMapContrast = r_dxrToneMapContrast ? r_dxrToneMapContrast->value : 1.0f;
++	glRaytracingLightingSetToneMappingOptions(
++		(uint32_t)toneMappingMode, toneMapWhitePoint, toneMapSaturation, toneMapContrast);
++	if (toneMappingMode != s_lastToneMappingMode)
++	{
++		s_lastToneMappingMode = toneMappingMode;
++		ri.Printf(PRINT_ALL,
++			"HDR_TONEMAP_EXP17 mode=%d exposure=%.2f whitePoint=%.2f saturation=%.2f contrast=%.2f\n",
++			toneMappingMode,
++			r_dxrExposure ? r_dxrExposure->value : 1.15f,
++			toneMapWhitePoint, toneMapSaturation, toneMapContrast);
++	}
++
+ 	int atmosphereMode = r_dxrAtmosphereMode ? r_dxrAtmosphereMode->integer : 0;
+ 	if (atmosphereMode < 0)
+ 		atmosphereMode = 0;
+@@ -1545,7 +1566,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d dlqMode=%d atmosphereMode=%d mapFogMode=%u\n",
++				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d dlqMode=%d materialMode=%d toneMode=%d atmosphereMode=%d mapFogMode=%u\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1566,6 +1587,8 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrExposure ? r_dxrExposure->value : 0.0f,
+ 				r_dxrDebugMode ? r_dxrDebugMode->integer : 0,
+ 				dynamicLightQualityMode,
++				materialSpecularMode,
++				toneMappingMode,
+ 				atmosphereMode,
+ 				mapFogMode);
+ 		}
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index c811df5..3fc1395 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -82,6 +82,10 @@ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrDynamicLightQualityMode;
+ cvar_t  *r_dxrMaterialSpecularMode;
++cvar_t  *r_dxrToneMappingMode;
++cvar_t  *r_dxrToneMapWhitePoint;
++cvar_t  *r_dxrToneMapSaturation;
++cvar_t  *r_dxrToneMapContrast;
+ cvar_t  *r_dxrAtmosphereMode;
+ cvar_t  *r_dxrAtmosphereStrength;
+ cvar_t  *r_dxrAtmosphereDistanceScale;
+@@ -1028,6 +1032,10 @@ void R_Register( void ) {
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
+ 	r_dxrMaterialSpecularMode = ri.Cvar_Get( "r_dxrMaterialSpecularMode", "0", CVAR_ARCHIVE );
++	r_dxrToneMappingMode = ri.Cvar_Get( "r_dxrToneMappingMode", "0", CVAR_ARCHIVE );
++	r_dxrToneMapWhitePoint = ri.Cvar_Get( "r_dxrToneMapWhitePoint", "4.0", CVAR_ARCHIVE );
++	r_dxrToneMapSaturation = ri.Cvar_Get( "r_dxrToneMapSaturation", "1.0", CVAR_ARCHIVE );
++	r_dxrToneMapContrast = ri.Cvar_Get( "r_dxrToneMapContrast", "1.0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereMode = ri.Cvar_Get( "r_dxrAtmosphereMode", "0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereStrength = ri.Cvar_Get( "r_dxrAtmosphereStrength", "1.0", CVAR_ARCHIVE );
+ 	r_dxrAtmosphereDistanceScale = ri.Cvar_Get( "r_dxrAtmosphereDistanceScale", "1.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 2d8c208..119b8ba 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1140,6 +1140,10 @@ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the con
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
+ extern cvar_t   *r_dxrMaterialSpecularMode; // 0 legacy, 1 roughness only, 2 material F0, 3 characters matte, 4 world matte, 5 balanced, 6 strict
++extern cvar_t   *r_dxrToneMappingMode; // 0 legacy clamp, 1 Reinhard, 2 ACES, 3 Hable, 4 neutral, 5 balanced HDR, 6 cinematic HDR
++extern cvar_t   *r_dxrToneMapWhitePoint; // highlight shoulder reference point
++extern cvar_t   *r_dxrToneMapSaturation; // presentation saturation after tone mapping
++extern cvar_t   *r_dxrToneMapContrast; // presentation contrast after tone mapping
+ extern cvar_t   *r_dxrAtmosphereMode; // 0 off, 1 map fog, 2 auto, 3 cold distance, 4 warm dust, 5 low mist, 6 cinematic
+ extern cvar_t   *r_dxrAtmosphereStrength; // global fog strength multiplier
+ extern cvar_t   *r_dxrAtmosphereDistanceScale; // >1 pushes fog farther away, <1 brings it closer

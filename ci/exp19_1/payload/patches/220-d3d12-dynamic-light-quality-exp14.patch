@@ -1,0 +1,318 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 0f77986..c1aa218 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -1762,7 +1762,7 @@ struct glRaytracingLightingConstants_t
+ 	float contactShadowLength;
+ 	uint32_t contactShadows;
+ 	uint32_t frameIndex;
+-	uint32_t qualityPad0;
++	uint32_t dynamicLightQualityMode;
+ 	uint32_t qualityPad1;
+ };
+ 
+@@ -1856,7 +1856,7 @@ cbuffer LightingCB : register(b0)
+     float    gContactShadowLength;
+     uint     gContactShadows;
+     uint     gFrameIndex;
+-    uint     gQualityPad0;
++    uint     gDynamicLightQualityMode;
+     uint     gQualityPad1;
+ };
+ 
+@@ -1873,7 +1873,104 @@ static const uint GL_RAYTRACING_LIGHT_TYPE_RECT  = 1;
+ // Stored in Light.pad1. A fill-only light contributes diffuse/specular light but
+ // never casts a ray-traced shadow or overrides the authored-light shadow mask.
+ static const float GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY = 1.0;
++)"
++R"(
++float DynamicLightPointFalloff(float dist, float radius)
++{
++    float x = saturate(1.0 - dist / max(radius, 1e-4));
++    if (gDynamicLightQualityMode == 1u || gDynamicLightQualityMode == 5u)
++    {
++        // Broader C1-continuous falloff: clearly fills the authored light radius
++        // without the abrupt shoulder of the original squared ramp.
++        return x * x * (3.0 - 2.0 * x);
++    }
++    if (gDynamicLightQualityMode == 6u)
++    {
++        // Tighter cinematic falloff keeps dark areas dark while preserving a
++        // strong local pool around torches and lamps.
++        return x * x * x;
++    }
++    return x * x;
++}
++
++float DynamicLightRectFalloff(float dist, float radius)
++{
++    float x = saturate(1.0 - dist / max(radius, 1e-4));
++    if (gDynamicLightQualityMode == 1u || gDynamicLightQualityMode == 5u)
++        return x * x * (3.0 - 2.0 * x);
++    if (gDynamicLightQualityMode == 6u)
++        return x * x * x;
++    return x * x * x * x;
++}
++
++float3 DynamicLightColor(float3 sourceColor, bool fillOnly)
++{
++    if (fillOnly)
++    {
++        if (gDynamicLightQualityMode >= 4u)
++            return lerp(sourceColor, float3(1.00, 0.96, 0.90), 0.35);
++        return sourceColor;
++    }
++
++    float warmEvidence = saturate((sourceColor.r - sourceColor.b) * 2.2 +
++                                  (sourceColor.g - sourceColor.b) * 0.8);
++    float warmStrength = 0.0;
++    if (gDynamicLightQualityMode == 2u)
++        warmStrength = 0.80;
++    else if (gDynamicLightQualityMode == 5u)
++        warmStrength = 0.55;
++    else if (gDynamicLightQualityMode == 6u)
++        warmStrength = 0.72;
++
++    float luminance = max(dot(sourceColor, float3(0.2126, 0.7152, 0.0722)), 0.001);
++    float3 warmTarget = luminance * float3(1.20, 0.72, 0.36);
++    return lerp(sourceColor, warmTarget, warmEvidence * warmStrength);
++}
+ 
++float DynamicLightDiffuseScale(bool fillOnly)
++{
++    if (gDynamicLightQualityMode == 4u)
++        return fillOnly ? 0.38 : 1.25;
++    if (gDynamicLightQualityMode == 5u)
++        return fillOnly ? 0.58 : 1.16;
++    if (gDynamicLightQualityMode == 6u)
++        return fillOnly ? 0.45 : 1.38;
++    return 1.0;
++}
++
++float DynamicLightSpecularScale(bool fillOnly)
++{
++    if (gDynamicLightQualityMode == 4u)
++        return fillOnly ? 0.86 : 1.12;
++    if (gDynamicLightQualityMode == 5u)
++        return fillOnly ? 0.92 : 1.12;
++    if (gDynamicLightQualityMode == 6u)
++        return fillOnly ? 1.00 : 1.28;
++    return 1.0;
++}
++
++float3 DynamicLightSoftPeak(float3 value)
++{
++    float knee = 0.0;
++    if (gDynamicLightQualityMode == 3u)
++        knee = 1.75;
++    else if (gDynamicLightQualityMode == 5u)
++        knee = 2.20;
++    else if (gDynamicLightQualityMode == 6u)
++        knee = 2.55;
++    else
++        return value;
++
++    float peak = max(value.r, max(value.g, value.b));
++    if (peak <= knee)
++        return value;
++
++    float excess = peak - knee;
++    float compressedPeak = knee + excess / (1.0 + excess);
++    return value * (compressedPeak / max(peak, 1e-5));
++}
++)"
++R"(
+ static const uint GEOMETRY_FLAG_SKELETAL = 1;
+ static const uint GEOMETRY_FLAG_UNLIT    = 2;
+ 
+@@ -2383,8 +2480,7 @@ void RayGen()
+             float  dist    = sqrt(max(distSq, 1e-6));
+             float3 L       = toLight / dist;
+ 
+-            float atten = saturate((radius - dist) / radius);
+-            atten = atten * atten;
++            float atten = DynamicLightPointFalloff(dist, radius);
+ 
+             float wrap = 0.35;
+             float NdotLWrap = saturate((dot(N, L) + wrap) / (1.0 + wrap));
+@@ -2403,10 +2499,15 @@ void RayGen()
+                 strongestDirectVisibility = shadow;
+             }
+ 
+-            float3 diffuse = Lgt.color * (Lgt.intensity * directInfluence * shadow);
+-            lightingAccum += diffuse;
++            float3 effectiveColor = DynamicLightColor(Lgt.color, fillOnly);
++            float diffuseIntensity = Lgt.intensity * DynamicLightDiffuseScale(fillOnly);
++            float specularIntensity = Lgt.intensity * DynamicLightSpecularScale(fillOnly);
++            float3 diffuse = effectiveColor * (diffuseIntensity * directInfluence * shadow);
++            lightingAccum += DynamicLightSoftPeak(diffuse);
+ 
+-            specularAccum += ComputeSpecular(N, V, L, Lgt.color, Lgt.intensity, atten, shadow, baseAlbedo);
++            float3 pointSpecular = ComputeSpecular(
++                N, V, L, effectiveColor, specularIntensity, atten, shadow, baseAlbedo);
++            specularAccum += DynamicLightSoftPeak(pointSpecular);
+         }
+         else if (Lgt.type == GL_RAYTRACING_LIGHT_TYPE_RECT)
+         {
+@@ -2418,8 +2519,7 @@ void RayGen()
+             float  centerDist = sqrt(max(centerDistSq, 1e-6));
+             float3 centerDir = toCenter / centerDist;
+ 
+-            float atten = saturate((attenRadius - centerDist) / attenRadius);
+-            atten = atten * atten * atten * atten;
++            float atten = DynamicLightRectFalloff(centerDist, attenRadius);
+ 
+             float shadow = 1.0;
+             if (atten > 0.0 && centerDist > 0.01)
+@@ -2430,6 +2530,9 @@ void RayGen()
+             uint sampleCount = max(Lgt.samples, 1u);
+             sampleCount = min(sampleCount, 16u);
+ 
++            float3 effectiveRectColor = DynamicLightColor(Lgt.color, false);
++            float rectDiffuseIntensity = Lgt.intensity * DynamicLightDiffuseScale(false);
++            float rectSpecularIntensity = Lgt.intensity * DynamicLightSpecularScale(false);
+             float3 rectDiffuseAccum = 0.0;
+             float3 rectSpecAccum = 0.0;
+             float rand = Hash12((float2)pixel * 0.73 + worldPos.xy + float2(worldPos.z, centerDist));
+@@ -2456,16 +2559,16 @@ void RayGen()
+                     ? abs(dot(-L, Lgt.normal))
+                     : saturate(dot(-L, Lgt.normal));
+ 
+-                float sampleWeight = Lgt.intensity * NdotL * faceTerm;
++                float sampleWeight = rectDiffuseIntensity * NdotL * faceTerm;
+ 
+-                rectDiffuseAccum += Lgt.color * sampleWeight;
++                rectDiffuseAccum += effectiveRectColor * sampleWeight;
+ 
+                 rectSpecAccum += ComputeSpecular(
+                     N,
+                     V,
+                     L,
+-                    Lgt.color,
+-                    Lgt.intensity * faceTerm,
++                    effectiveRectColor,
++                    rectSpecularIntensity * faceTerm,
+                     1.0,
+                     1.0,
+                     baseAlbedo);
+@@ -2479,8 +2582,9 @@ void RayGen()
+                 strongestDirectWeight = atten;
+                 strongestDirectVisibility = shadow;
+             }
+-            lightingAccum += clamp(rectDiffuseAccum * atten * shadow, 0.0, 4.0);
+-            specularAccum += rectSpecAccum * atten * shadow;
++            float3 rectDiffuse = clamp(rectDiffuseAccum * atten * shadow, 0.0, 6.0);
++            lightingAccum += DynamicLightSoftPeak(rectDiffuse);
++            specularAccum += DynamicLightSoftPeak(rectSpecAccum * atten * shadow);
+         }
+     }
+ 
+@@ -3204,6 +3308,12 @@ void glRaytracingLightingSetDebugMode(uint32_t mode)
+ 	glRaytracingLightingUpdateConstants();
+ }
+ 
++void glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode)
++{
++	g_glRaytracingLighting.constants.dynamicLightQualityMode = glRaytracingClamp<uint32_t>(mode, 0u, 6u);
++	glRaytracingLightingUpdateConstants();
++}
++
+ void glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index b17240e..6da7b58 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1713,6 +1713,7 @@ void                       glRaytracingLightingSetShadowBias(float bias);
+ void                       glRaytracingLightingSetExposure(float exposure);
+ void                       glRaytracingLightingSetLegacyBlend(float legacyBlend);
+ void                       glRaytracingLightingSetDebugMode(uint32_t mode);
++void                       glRaytracingLightingSetDynamicLightQualityMode(uint32_t mode);
+ void                       glRaytracingLightingSetQualityOptions(
+ 	uint32_t maxLights,
+ 	uint32_t shadowSamples,
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index ab8a8a7..d05f7cc 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -1215,6 +1215,7 @@ static void RB_AddDXRFallbackLightIfNeeded(void)
+ static void RB_RunRaytracedLightingPass(void)
+ {
+ 	static int s_lastDXRDebugPrintTime = 0;
++	static int s_lastDynamicLightQualityMode = -1;
+ 
+ 	if (backEnd.raytraceRendered || !RB_DXRShouldRenderLighting())
+ 	{
+@@ -1286,6 +1287,20 @@ static void RB_RunRaytracedLightingPass(void)
+ 		glRaytracingLightingSetDebugMode(0);
+ 	}
+ 
++	int dynamicLightQualityMode = r_dxrDynamicLightQualityMode
++		? r_dxrDynamicLightQualityMode->integer
++		: 0;
++	if (dynamicLightQualityMode < 0)
++		dynamicLightQualityMode = 0;
++	else if (dynamicLightQualityMode > 6)
++		dynamicLightQualityMode = 6;
++	glRaytracingLightingSetDynamicLightQualityMode((uint32_t)dynamicLightQualityMode);
++	if (dynamicLightQualityMode != s_lastDynamicLightQualityMode)
++	{
++		s_lastDynamicLightQualityMode = dynamicLightQualityMode;
++		ri.Printf(PRINT_ALL, "DYNAMIC_LIGHT_QUALITY_EXP14 mode=%d\n", dynamicLightQualityMode);
++	}
++
+ 	RB_AddDXRFallbackLightIfNeeded();
+ 
+ 	if (r_dxrDebug && r_dxrDebug->integer)
+@@ -1295,7 +1310,7 @@ static void RB_RunRaytracedLightingPass(void)
+ 		{
+ 			s_lastDXRDebugPrintTime = now;
+ 			ri.Printf(PRINT_ALL,
+-				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d\n",
++				"DXR v2.2 visual-correct: meshes=%u instances=%u lights=%u selected=%u async=%d cpuSync=%d samples=%d/%d ao=%d sky=%d fallback=%d fallbackShadows=%d radius=%.1f intensity=%.2f bias=%.4f ambient=%.2f legacy=%.2f exposure=%.2f debugMode=%d dlqMode=%d\n",
+ 				glRaytracingGetMeshCount(),
+ 				glRaytracingGetInstanceCount(),
+ 				glRaytracingLightingGetLightCount(),
+@@ -1314,7 +1329,8 @@ static void RB_RunRaytracedLightingPass(void)
+ 				r_dxrAmbientIntensity ? r_dxrAmbientIntensity->value : 0.0f,
+ 				r_dxrLegacyBlend ? r_dxrLegacyBlend->value : 0.0f,
+ 				r_dxrExposure ? r_dxrExposure->value : 0.0f,
+-				r_dxrDebugMode ? r_dxrDebugMode->integer : 0);
++				r_dxrDebugMode ? r_dxrDebugMode->integer : 0,
++				dynamicLightQualityMode);
+ 		}
+ 	}
+ 
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 8258b2d..d8612a3 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -80,6 +80,7 @@ cvar_t  *r_dxrLegacyBlend;
+ cvar_t  *r_dxrExposure;
+ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
++cvar_t  *r_dxrDynamicLightQualityMode;
+ cvar_t  *r_dxrFallbackLight;
+ cvar_t  *r_dxrFallbackLightRadius;
+ cvar_t  *r_dxrFallbackLightIntensity;
+@@ -1018,6 +1019,7 @@ void R_Register( void ) {
+ 	r_dxrExposure = ri.Cvar_Get( "r_dxrExposure", "1.15", CVAR_ARCHIVE );
+ 	r_dxrDebug = ri.Cvar_Get( "r_dxrDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
++	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLight = ri.Cvar_Get( "r_dxrFallbackLight", "0", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightRadius = ri.Cvar_Get( "r_dxrFallbackLightRadius", "900", CVAR_ARCHIVE );
+ 	r_dxrFallbackLightIntensity = ri.Cvar_Get( "r_dxrFallbackLightIntensity", "6.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index 0ae7354..df3379d 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1138,6 +1138,7 @@ extern cvar_t   *r_dxrLegacyBlend;      // how much of the original RTCW shading
+ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR resolve
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
++extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
+ extern cvar_t   *r_dxrFallbackLight;    // optional camera-side test light for verification
+ extern cvar_t   *r_dxrFallbackLightRadius;
+ extern cvar_t   *r_dxrFallbackLightIntensity;

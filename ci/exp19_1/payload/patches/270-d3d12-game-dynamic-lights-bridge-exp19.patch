@@ -1,0 +1,143 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 83f0465..08ffeb3 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -2958,8 +2958,11 @@ void RayGen()
+             float NdotLWrap = saturate((dot(N, L) + wrap) / (1.0 + wrap));
+ 
+             const bool fillOnly = (Lgt.pad1 >= GL_RAYTRACING_LIGHT_FLAG_FILL_ONLY);
++            // Experiment 19: point lights reserve samples==0 for an explicit
++            // no-shadow control. Existing point lights keep samples==1.
++            const bool castsPointShadows = (Lgt.samples != 0u);
+             float shadow = 1.0;
+-            if (!fillOnly && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
++            if (!fillOnly && castsPointShadows && NdotLWrap > 0.0001 && atten > 0.0 && dist > 0.01)
+             {
+                 shadow = TraceSoftShadow(worldPos, N, Lgt, toLight, dist);
+             }
+diff --git a/src/renderer/tr_init.cpp b/src/renderer/tr_init.cpp
+index 312aabe..26870de 100644
+--- a/src/renderer/tr_init.cpp
++++ b/src/renderer/tr_init.cpp
+@@ -81,6 +81,11 @@ cvar_t  *r_dxrExposure;
+ cvar_t  *r_dxrDebug;
+ cvar_t  *r_dxrDebugMode;
+ cvar_t  *r_dxrDynamicLightQualityMode;
++cvar_t  *r_dxrGameDynamicLights;
++cvar_t  *r_dxrGameDynamicLightStrength;
++cvar_t  *r_dxrGameDynamicLightRadiusScale;
++cvar_t  *r_dxrGameDynamicLightShadows;
++cvar_t  *r_dxrGameDynamicLightDebug;
+ cvar_t  *r_dxrMaterialSpecularMode;
+ cvar_t  *r_dxrToneMappingMode;
+ cvar_t  *r_dxrToneMapWhitePoint;
+@@ -1041,6 +1046,11 @@ void R_Register( void ) {
+ 	r_dxrDebug = ri.Cvar_Get( "r_dxrDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrDebugMode = ri.Cvar_Get( "r_dxrDebugMode", "0", CVAR_ARCHIVE );
+ 	r_dxrDynamicLightQualityMode = ri.Cvar_Get( "r_dxrDynamicLightQualityMode", "0", CVAR_ARCHIVE );
++	r_dxrGameDynamicLights = ri.Cvar_Get( "r_dxrGameDynamicLights", "1", CVAR_ARCHIVE );
++	r_dxrGameDynamicLightStrength = ri.Cvar_Get( "r_dxrGameDynamicLightStrength", "1.0", CVAR_ARCHIVE );
++	r_dxrGameDynamicLightRadiusScale = ri.Cvar_Get( "r_dxrGameDynamicLightRadiusScale", "1.0", CVAR_ARCHIVE );
++	r_dxrGameDynamicLightShadows = ri.Cvar_Get( "r_dxrGameDynamicLightShadows", "1", CVAR_ARCHIVE );
++	r_dxrGameDynamicLightDebug = ri.Cvar_Get( "r_dxrGameDynamicLightDebug", "0", CVAR_ARCHIVE );
+ 	r_dxrMaterialSpecularMode = ri.Cvar_Get( "r_dxrMaterialSpecularMode", "0", CVAR_ARCHIVE );
+ 	r_dxrToneMappingMode = ri.Cvar_Get( "r_dxrToneMappingMode", "0", CVAR_ARCHIVE );
+ 	r_dxrToneMapWhitePoint = ri.Cvar_Get( "r_dxrToneMapWhitePoint", "4.0", CVAR_ARCHIVE );
+diff --git a/src/renderer/tr_local.h b/src/renderer/tr_local.h
+index e3fc51d..c2801e7 100644
+--- a/src/renderer/tr_local.h
++++ b/src/renderer/tr_local.h
+@@ -1139,6 +1139,11 @@ extern cvar_t   *r_dxrExposure;         // post exposure applied to the DXR reso
+ extern cvar_t   *r_dxrDebug;            // periodic DXR state logging to the console
+ extern cvar_t   *r_dxrDebugMode;        // 0 normal, 1 lighting only, 2 AO/sky visibility, 3 albedo, 4 lighting heatmap, 5 shadow mask
+ extern cvar_t   *r_dxrDynamicLightQualityMode; // 0 baseline, 1 smooth falloff, 2 warm authored lights, 3 highlight clamp, 4 authored-light focus, 5 balanced, 6 cinematic
++extern cvar_t   *r_dxrGameDynamicLights; // Experiment 19: submit RTCW game dlights to DXR
++extern cvar_t   *r_dxrGameDynamicLightStrength; // intensity multiplier for submitted game dlights
++extern cvar_t   *r_dxrGameDynamicLightRadiusScale; // radius multiplier for submitted game dlights
++extern cvar_t   *r_dxrGameDynamicLightShadows; // point-shadow rays for game dlights
++extern cvar_t   *r_dxrGameDynamicLightDebug; // one-second bridge diagnostics
+ extern cvar_t   *r_dxrMaterialSpecularMode; // 0 legacy, 1 roughness only, 2 material F0, 3 characters matte, 4 world matte, 5 balanced, 6 strict
+ extern cvar_t   *r_dxrToneMappingMode; // 0 legacy clamp, 1 Reinhard, 2 ACES, 3 Hable, 4 neutral, 5 balanced HDR, 6 cinematic HDR
+ extern cvar_t   *r_dxrToneMapWhitePoint; // highlight shoulder reference point
+diff --git a/src/renderer/tr_scene.cpp b/src/renderer/tr_scene.cpp
+index a2f5eae..2d93272 100644
+--- a/src/renderer/tr_scene.cpp
++++ b/src/renderer/tr_scene.cpp
+@@ -27,15 +27,66 @@ void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, fl
+ 		}
+ 	}
+ 
+-	glRaytracingLight_t light = {};
+-	light.color.x = r;
+-	light.color.y = g;
+-	light.color.z = b;
+-	light.type = GL_RAYTRACING_LIGHT_TYPE_POINT;
+-	light.radius = intensity;
+-	light.intensity = 1;
+-	light.position.x = org[0];
+-	light.position.y = org[1];
+-	light.position.z = org[2];
+-	glRaytracingLightingAddLight(&light);
++	// GAME_DYNAMIC_LIGHTS_EXP19: retain the legacy bridge defaults while
++	// exposing isolated control over game-authored transient lights.
++	const int bridgeEnabled = r_dxrGameDynamicLights ? r_dxrGameDynamicLights->integer : 1;
++	const int bridgeShadows = r_dxrGameDynamicLightShadows ? r_dxrGameDynamicLightShadows->integer : 1;
++	const int bridgeDebug = r_dxrGameDynamicLightDebug ? r_dxrGameDynamicLightDebug->integer : 0;
++	float bridgeStrength = r_dxrGameDynamicLightStrength ? r_dxrGameDynamicLightStrength->value : 1.0f;
++	float bridgeRadiusScale = r_dxrGameDynamicLightRadiusScale ? r_dxrGameDynamicLightRadiusScale->value : 1.0f;
++
++	if ( bridgeStrength < 0.0f ) bridgeStrength = 0.0f;
++	if ( bridgeStrength > 8.0f ) bridgeStrength = 8.0f;
++	if ( bridgeRadiusScale < 0.05f ) bridgeRadiusScale = 0.05f;
++	if ( bridgeRadiusScale > 4.0f ) bridgeRadiusScale = 4.0f;
++
++	static int exp19WindowStart = 0;
++	static int exp19Calls = 0;
++	static int exp19Accepted = 0;
++	static float exp19MaxSourceRadius = 0.0f;
++	static float exp19MaxSubmittedRadius = 0.0f;
++	static vec3_t exp19LastOrg = { 0.0f, 0.0f, 0.0f };
++	static vec3_t exp19LastColor = { 0.0f, 0.0f, 0.0f };
++	static int exp19LastOverdraw = 0;
++	const int exp19Now = ri.Milliseconds();
++
++	if ( exp19WindowStart == 0 ) {
++		exp19WindowStart = exp19Now;
++	}
++	exp19Calls++;
++	if ( intensity > exp19MaxSourceRadius ) exp19MaxSourceRadius = intensity;
++	VectorCopy( org, exp19LastOrg );
++	exp19LastColor[0] = r;
++	exp19LastColor[1] = g;
++	exp19LastColor[2] = b;
++	exp19LastOverdraw = overdraw;
++
++	if ( bridgeEnabled && bridgeStrength > 0.0f ) {
++		const float submittedRadius = intensity * bridgeRadiusScale;
++		glRaytracingLight_t light = glRaytracingLightingMakePointLight(
++			org[0], org[1], org[2], submittedRadius,
++			r, g, b, bridgeStrength );
++		// Point lights use samples==0 only as the Experiment 19 shadow-off bit.
++		light.samples = bridgeShadows ? 1u : 0u;
++		if ( glRaytracingLightingAddLight( &light ) ) {
++			exp19Accepted++;
++			if ( submittedRadius > exp19MaxSubmittedRadius ) exp19MaxSubmittedRadius = submittedRadius;
++		}
++	}
++
++	if ( bridgeDebug && exp19Now - exp19WindowStart >= 1000 ) {
++		ri.Printf( PRINT_ALL,
++			"GAME_DYNAMIC_LIGHTS_EXP19 enabled=%d calls=%d accepted=%d strength=%.3f radiusScale=%.3f shadows=%d maxSourceRadius=%.3f maxSubmittedRadius=%.3f lastOrg=(%.2f %.2f %.2f) lastColor=(%.3f %.3f %.3f) lastOverdraw=%d\n",
++			bridgeEnabled ? 1 : 0, exp19Calls, exp19Accepted,
++			bridgeStrength, bridgeRadiusScale, bridgeShadows ? 1 : 0,
++			exp19MaxSourceRadius, exp19MaxSubmittedRadius,
++			exp19LastOrg[0], exp19LastOrg[1], exp19LastOrg[2],
++			exp19LastColor[0], exp19LastColor[1], exp19LastColor[2],
++			exp19LastOverdraw );
++		exp19WindowStart = exp19Now;
++		exp19Calls = 0;
++		exp19Accepted = 0;
++		exp19MaxSourceRadius = 0.0f;
++		exp19MaxSubmittedRadius = 0.0f;
++	}
+ #if 0
