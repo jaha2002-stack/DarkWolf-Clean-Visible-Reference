@@ -833,14 +833,22 @@ try {
     if ($sceneLf.Contains('EXP191_FindTrackedLight') -or $sceneLf.Contains('GAME_DYNAMIC_LIGHTS_EXP19_1')) {
       throw 'Experiment 19.1 tr_scene transformation appears to be already applied.'
     }
-    foreach ($requiredExp19Marker in @(
-      'GAME_DYNAMIC_LIGHTS_EXP19: retain the legacy bridge defaults',
-      'static int exp19WindowStart = 0;',
-      'glRaytracingLightingMakePointLight(',
-      'exp19Accepted++'
-    )) {
-      if (-not $sceneLf.Contains($requiredExp19Marker)) {
-        throw "Post-Experiment-19 tr_scene marker is missing: $requiredExp19Marker"
+    $requiredExp19Patterns = [ordered]@{
+      'bridgeEnabled assignment' = '(?m)^[\t ]*const\s+int\s+bridgeEnabled\s*=\s*r_dxrGameDynamicLights\s*\?\s*r_dxrGameDynamicLights->integer\s*:\s*1\s*;'
+      'Experiment 19 diagnostics state' = 'static\s+int\s+exp19WindowStart\s*=\s*0\s*;'
+      'point-light bridge call' = 'glRaytracingLightingMakePointLight\s*\('
+      'accepted-light counter' = 'exp19Accepted\s*\+\+'
+    }
+    foreach ($requiredExp19Pattern in $requiredExp19Patterns.GetEnumerator()) {
+      if (-not [regex]::IsMatch($sceneLf, $requiredExp19Pattern.Value)) {
+        $exp19Index = $sceneLf.IndexOf('GAME_DYNAMIC_LIGHTS_EXP19', [StringComparison]::Ordinal)
+        if ($exp19Index -ge 0) {
+          $excerptStart = [Math]::Max(0, $exp19Index - 160)
+          $excerptLength = [Math]::Min(720, $sceneLf.Length - $excerptStart)
+          $excerpt = $sceneLf.Substring($excerptStart, $excerptLength)
+          Write-Host "Post-Experiment-19 tr_scene excerpt:`n$excerpt"
+        }
+        throw "Post-Experiment-19 tr_scene structure is missing: $($requiredExp19Pattern.Key)"
       }
     }
 
@@ -925,14 +933,51 @@ static exp191TrackedLight_t *EXP191_FindTrackedLight(
     if ($functionIndex -lt 0) { throw 'RE_AddLightToScene insertion point was not found.' }
     $sceneLf = $sceneLf.Insert($functionIndex, $helperBlock + "`n`n")
 
-    $bridgeStartMarker = '// GAME_DYNAMIC_LIGHTS_EXP19: retain the legacy bridge defaults while'
-    $bridgeStart = $sceneLf.IndexOf($bridgeStartMarker, [StringComparison]::Ordinal)
-    if ($bridgeStart -lt 0) { throw 'Experiment 19 bridge start marker was not found.' }
-    $bridgeEnd = $sceneLf.IndexOf('#if 0', $bridgeStart, [StringComparison]::Ordinal)
-    if ($bridgeEnd -lt 0) { throw 'Experiment 19 bridge end marker was not found.' }
+    # Locate the actual Experiment 19 code, not a prose comment. Comments are
+    # intentionally treated as optional because line-ending/encoding conversion
+    # and earlier patch revisions may alter or omit them while leaving the code
+    # block itself intact.
+    $bridgeCodePattern = '(?m)^[\t ]*const\s+int\s+bridgeEnabled\s*=\s*r_dxrGameDynamicLights\s*\?\s*r_dxrGameDynamicLights->integer\s*:\s*1\s*;'
+    $bridgeCodeMatch = [regex]::Match($sceneLf, $bridgeCodePattern)
+    if (-not $bridgeCodeMatch.Success) {
+      throw 'Experiment 19 bridge code start was not found.'
+    }
+    $bridgeStart = $bridgeCodeMatch.Index
+
+    # Include the adjacent Experiment 19 comment in the replacement when it is
+    # present, but never require that comment for correctness.
+    $prefixStart = [Math]::Max($functionIndex, $bridgeStart - 512)
+    $prefixLength = $bridgeStart - $prefixStart
+    if ($prefixLength -gt 0) {
+      $bridgePrefix = $sceneLf.Substring($prefixStart, $prefixLength)
+      $commentMatches = [regex]::Matches(
+        $bridgePrefix,
+        '(?m)^[\t ]*//\s*GAME_DYNAMIC_LIGHTS_EXP19:[^\n]*(?:\n[\t ]*//[^\n]*)?\n'
+      )
+      if ($commentMatches.Count -gt 0) {
+        $lastComment = $commentMatches[$commentMatches.Count - 1]
+        $candidateStart = $prefixStart + $lastComment.Index
+        if ($candidateStart -lt $bridgeStart) {
+          $bridgeStart = $candidateStart
+        }
+      }
+    }
+
+    $bridgeEndMatch = [regex]::Match(
+      $sceneLf.Substring($bridgeCodeMatch.Index),
+      '(?m)^[\t ]*#if\s+0\b'
+    )
+    if (-not $bridgeEndMatch.Success) {
+      throw 'Experiment 19 bridge end (#if 0) was not found.'
+    }
+    $bridgeEnd = $bridgeCodeMatch.Index + $bridgeEndMatch.Index
+    if ($bridgeEnd -le $bridgeStart) {
+      throw 'Experiment 19 bridge bounds are invalid.'
+    }
 
     $newBridgeBlock = @'
-const int bridgeEnabled = r_dxrGameDynamicLights ? r_dxrGameDynamicLights->integer : 1;
+// GAME_DYNAMIC_LIGHTS_EXP19_1: classify and reserve transient game-authored lights.
+	const int bridgeEnabled = r_dxrGameDynamicLights ? r_dxrGameDynamicLights->integer : 1;
 	const int bridgeShadows = r_dxrGameDynamicLightShadows ? r_dxrGameDynamicLightShadows->integer : 1;
 	const int bridgeDebug = r_dxrGameDynamicLightDebug ? r_dxrGameDynamicLightDebug->integer : 0;
 	const int filterMode = r_dxrGameLightFilterMode ? r_dxrGameLightFilterMode->integer : 0;
