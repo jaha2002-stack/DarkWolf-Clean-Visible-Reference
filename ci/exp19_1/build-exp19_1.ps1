@@ -921,13 +921,13 @@ try {
     seta r_dxrBloomScatter "0.72"
     seta r_dxrBloomHdrWeight "1.00"
     seta r_dxrBloomTransparentWeight "1.20"
-    '@
+'@
     Set-Content -LiteralPath 'main/darkwolf_dxr_enhanced.cfg' -Value $defaultCfg -Encoding ASCII
 
     $bloomOff = @'
     // Bloom disabled; all other production effects remain active.
     seta r_dxrBloomMode "0"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_bloom_off.cfg' -Value $bloomOff -Encoding ASCII
 
     $bloomSubtle = @'
@@ -942,7 +942,7 @@ try {
     seta r_dxrBloomScatter "0.55"
     seta r_dxrBloomHdrWeight "0.75"
     seta r_dxrBloomTransparentWeight "0.80"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_bloom_subtle.cfg' -Value $bloomSubtle -Encoding ASCII
 
     $bloomBalanced = @'
@@ -957,7 +957,7 @@ try {
     seta r_dxrBloomScatter "0.72"
     seta r_dxrBloomHdrWeight "1.00"
     seta r_dxrBloomTransparentWeight "1.20"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_bloom_balanced.cfg' -Value $bloomBalanced -Encoding ASCII
 
     $bloomStrong = @'
@@ -972,67 +972,67 @@ try {
     seta r_dxrBloomScatter "0.88"
     seta r_dxrBloomHdrWeight "1.30"
     seta r_dxrBloomTransparentWeight "1.70"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_bloom_strong.cfg' -Value $bloomStrong -Encoding ASCII
 
     $materialBalanced = @'
     // Recommended material-aware response.
     seta r_dxrMaterialSpecularMode "5"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_material_balanced.cfg' -Value $materialBalanced -Encoding ASCII
 
     $materialStrict = @'
     // Stronger suppression of specular on stone, cloth and characters.
     seta r_dxrMaterialSpecularMode "6"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_material_strict.cfg' -Value $materialStrict -Encoding ASCII
 
     $materialWorldMatte = @'
     // Matte world surfaces while retaining the less modified character response.
     seta r_dxrMaterialSpecularMode "4"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_material_world_matte.cfg' -Value $materialWorldMatte -Encoding ASCII
 
     $toneNeutral = @'
     // Recommended production tone mapper.
     seta r_dxrToneMappingMode "4"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_tonemap_neutral.cfg' -Value $toneNeutral -Encoding ASCII
 
     $toneReinhard = @'
     // Softer highlight compression.
     seta r_dxrToneMappingMode "1"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_tonemap_reinhard.cfg' -Value $toneReinhard -Encoding ASCII
 
     $toneHable = @'
     // Darker cinematic contrast.
     seta r_dxrToneMappingMode "3"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_tonemap_hable.cfg' -Value $toneHable -Encoding ASCII
 
     $toneBright = @'
     // Brighter HDR-like presentation.
     seta r_dxrToneMappingMode "5"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_tonemap_bright.cfg' -Value $toneBright -Encoding ASCII
 
     $lightLegacy = @'
     // Original dynamic-light response for compatibility/A-B comparison.
     seta r_dxrDynamicLightQualityMode "0"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_lighting_legacy.cfg' -Value $lightLegacy -Encoding ASCII
 
     $lightBalanced = @'
     // Approved Dynamic Light Quality 14 production mode.
     seta r_dxrDynamicLightQualityMode "5"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_lighting_balanced.cfg' -Value $lightBalanced -Encoding ASCII
 
     $fogOff = @'
     // Disable the added atmospheric-fog pass only.
     seta r_dxrAtmosphereMode "0"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_fog_off.cfg' -Value $fogOff -Encoding ASCII
 
     $fogAuthored = @'
@@ -1043,7 +1043,7 @@ try {
     seta r_dxrAtmosphereMaxOpacity "0.80"
     seta r_dxrFogBaseHeight "0.0"
     seta r_dxrFogHeightFalloff "320.0"
-    '@
+'@
     Set-Content -LiteralPath 'main/dxr_profile_fog_authored.cfg' -Value $fogAuthored -Encoding ASCII
 
     $launcher = @'
@@ -1052,7 +1052,7 @@ try {
     cd /d "%~dp0"
     WolfSP.exe +set developer 1 +set logfile 2 +set r_dxr 1 +set r_picmip 0 +set r_picmip2 0 +set r_roundImagesDown 0 +set r_simpleMipMaps 0 +set r_texturebits 32 +set r_textureMode GL_LINEAR_MIPMAP_LINEAR +exec darkwolf_dxr_enhanced.cfg
     endlocal
-    '@
+'@
     Set-Content -LiteralPath 'RUN_DARKWOLF_DXR_ENHANCED.bat' -Value $launcher -Encoding ASCII
 
     $launcherOff = @'
@@ -1061,7 +1061,7 @@ try {
     cd /d "%~dp0"
     WolfSP.exe +set developer 1 +set logfile 2 +set r_dxr 1 +set r_picmip 0 +set r_picmip2 0 +set r_roundImagesDown 0 +set r_simpleMipMaps 0 +set r_texturebits 32 +set r_textureMode GL_LINEAR_MIPMAP_LINEAR +exec darkwolf_dxr_enhanced.cfg +exec dxr_profile_bloom_off.cfg
     endlocal
-    '@
+'@
     Set-Content -LiteralPath 'RUN_DARKWOLF_DXR_ENHANCED_BLOOM_OFF.bat' -Value $launcherOff -Encoding ASCII
 
     $launcherSubtle = @'
@@ -1070,7 +1070,7 @@ try {
     cd /d "%~dp0"
     WolfSP.exe +set developer 1 +set logfile 2 +set r_dxr 1 +set r_picmip 0 +set r_picmip2 0 +set r_roundImagesDown 0 +set r_simpleMipMaps 0 +set r_texturebits 32 +set r_textureMode GL_LINEAR_MIPMAP_LINEAR +exec darkwolf_dxr_enhanced.cfg +exec dxr_profile_bloom_subtle.cfg
     endlocal
-    '@
+'@
     Set-Content -LiteralPath 'RUN_DARKWOLF_DXR_ENHANCED_SUBTLE_BLOOM.bat' -Value $launcherSubtle -Encoding ASCII
 
     Write-Stage 'Build Enhanced Production runtime'
