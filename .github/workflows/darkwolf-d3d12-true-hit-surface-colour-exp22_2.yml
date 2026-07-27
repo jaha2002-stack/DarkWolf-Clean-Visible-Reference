@@ -1,4 +1,4 @@
-name: DarkWolf Experiment 22.2 True Hit-Surface Colour
+name: DarkWolf Experiment 22.2 True Hit-Surface Colour Corrected v2
 
 on:
   workflow_dispatch:
@@ -13,6 +13,7 @@ on:
           - Debug
   push:
     branches:
+      - main
       - agent/exp222-true-hit-surface-colour
     paths:
       - .github/workflows/darkwolf-d3d12-true-hit-surface-colour-exp22_2.yml
@@ -1743,8 +1744,10 @@ jobs:
           if ($actualArchiveHash -ne '18FB904D6F6BF5623D8699FD643EBBCC85303893EF5216C06EE5ECE8F9C92CED') {
             throw "Experiment 22.2 payload archive hash mismatch: $actualArchiveHash"
           }
-          Expand-Archive -LiteralPath $archive -DestinationPath 'work' -Force
-          Push-Location 'work'
+          $payloadRoot = Join-Path $env:RUNNER_TEMP 'exp222-payload'
+          New-Item -ItemType Directory -Path $payloadRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $payloadRoot -Force
+          Push-Location $payloadRoot
           try {
             $manifestPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             foreach ($line in Get-Content -LiteralPath 'PAYLOAD_SHA256SUMS.txt') {
@@ -1785,7 +1788,25 @@ jobs:
           } finally {
             Pop-Location
           }
+          $workRoot = (Resolve-Path 'work').Path
+          foreach ($entry in Get-ChildItem -LiteralPath $payloadRoot -Force) {
+            Copy-Item -LiteralPath $entry.FullName -Destination $workRoot -Recurse -Force
+          }
+          foreach ($relative in $manifestPaths) {
+            $path = $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $sourcePath = Join-Path $payloadRoot $path
+            $workPath = Join-Path $workRoot $path
+            if (-not (Test-Path -LiteralPath $workPath -PathType Leaf)) {
+              throw "Payload copy missing in checkout: $relative"
+            }
+            $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourcePath).Hash
+            $workHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $workPath).Hash
+            if ($workHash -ne $sourceHash) {
+              throw "Payload copy hash mismatch in checkout: $relative"
+            }
+          }
           Write-Host "EXP22_2_PAYLOAD_SHA256=$actualArchiveHash"
+          Write-Host "EXP22_2_PAYLOAD_FILE_COUNT=$($manifestPaths.Count)"
           Write-Host 'EXP22_2_PAYLOAD_VALIDATION=PASS'
 
       - name: Validate PowerShell syntax and line endings
