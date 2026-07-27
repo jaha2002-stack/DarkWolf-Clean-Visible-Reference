@@ -1,0 +1,387 @@
+name: DarkWolf EXP22.5 Full Production Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwolf-exp22-5-full-production-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout current workflow kit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: kit
+
+      - name: Checkout exact Stable Clear v2.2 source
+        uses: actions/checkout@v4
+        with:
+          ref: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          fetch-depth: 1
+          path: work
+
+      - name: Recover and verify the proven EXP22.4 payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $donor = Join-Path $PWD 'kit/.github/workflows/darkwolf-d3d12-native-hit-production-composite-exp22_4.yml'
+          if (-not (Test-Path -LiteralPath $donor -PathType Leaf)) {
+            throw "Required donor workflow is missing: $donor"
+          }
+
+          $expectedDonorSha = 'DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A'
+          $workflowText = [IO.File]::ReadAllText((Resolve-Path $donor), [Text.Encoding]::UTF8)
+          $normalizedWorkflowText = $workflowText.Replace("`r`n", "`n").Replace("`r", "`n")
+          $utf8NoBomForHash = [Text.UTF8Encoding]::new($false)
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualDonorSha = ([BitConverter]::ToString(
+              $sha256.ComputeHash($utf8NoBomForHash.GetBytes($normalizedWorkflowText))
+            )).Replace('-', '')
+          }
+          finally {
+            $sha256.Dispose()
+          }
+          if ($actualDonorSha -ne $expectedDonorSha) {
+            throw "EXP22.4 donor workflow normalized hash mismatch. Expected=$expectedDonorSha Actual=$actualDonorSha"
+          }
+          $workflowText = $normalizedWorkflowText
+          $payloadMatch = [regex]::Match(
+            $workflowText,
+            "(?ms)^\s*\`$base64\s*=\s*@'\s*(?<payload>.*?)^\s*'@\s*$"
+          )
+          if (-not $payloadMatch.Success) {
+            throw 'Unable to locate the EXP22.4 embedded payload here-string.'
+          }
+
+          $payloadBase64 = $payloadMatch.Groups['payload'].Value -replace '\s', ''
+          $payloadArchive = Join-Path $env:RUNNER_TEMP 'exp22_4-proven-payload.zip'
+          [IO.File]::WriteAllBytes($payloadArchive, [Convert]::FromBase64String($payloadBase64))
+
+          $expectedPayloadSha = '2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393'
+          $actualPayloadSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadArchive).Hash
+          if ($actualPayloadSha -ne $expectedPayloadSha) {
+            throw "EXP22.4 payload hash mismatch. Expected=$expectedPayloadSha Actual=$actualPayloadSha"
+          }
+
+          Expand-Archive -LiteralPath $payloadArchive -DestinationPath 'work' -Force
+
+          $manifest = Join-Path $PWD 'work/PAYLOAD_SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw 'EXP22.4 payload manifest is missing after extraction.'
+          }
+
+          $verified = 0
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $manifest))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\s{2,}', 2
+            if ($parts.Count -ne 2) {
+              throw "Malformed payload manifest line: $line"
+            }
+            $relative = $parts[1].Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $path = Join-Path $PWD (Join-Path 'work' $relative)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Payload file is missing after extraction: $($parts[1])"
+            }
+            $fileSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($fileSha -ne $parts[0]) {
+              throw "Payload file hash mismatch: $($parts[1])"
+            }
+            ++$verified
+          }
+
+          if ($verified -ne 29) {
+            throw "Payload manifest count mismatch. Expected=29 Actual=$verified"
+          }
+
+          $required = @(
+            'work/patches/330-d3d12-hit-surface-binding-repair-exp22_3.patch',
+            'work/patches/340-d3d12-native-hit-production-composite-exp22_4.patch',
+            'work/scripts/build_exp224.ps1'
+          )
+          foreach ($requiredPath in $required) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required EXP22.4 build component is missing: $requiredPath"
+            }
+          }
+
+          Write-Host "EXP22_5_DONOR_WORKFLOW=PASS SHA256=$actualDonorSha"
+          Write-Host "EXP22_5_PAYLOAD=PASS SHA256=$actualPayloadSha FILES=$verified"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Rebuild the exact validated chain through EXP22.4
+        shell: pwsh
+        working-directory: work
+        run: ./scripts/build_exp224.ps1 -Configuration 'Release'
+
+      - name: Create complete production runtime release
+        shell: pwsh
+        working-directory: work
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $sourceRelease = Join-Path $PWD 'release-rt-reflection-native-composite-exp22_4'
+          $sourceExe = Join-Path $sourceRelease 'WolfSP.exe'
+          if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+            throw "EXP22.4 build completed without the expected WolfSP.exe: $sourceExe"
+          }
+
+          $release = Join-Path $PWD 'release-darkwolf-exp22_5-full-production'
+          if (Test-Path -LiteralPath $release) {
+            Remove-Item -LiteralPath $release -Recurse -Force
+          }
+          $mainDir = Join-Path $release 'main'
+          New-Item -ItemType Directory -Path $mainDir -Force | Out-Null
+
+          Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $release 'WolfSP.exe') -Force
+
+          # Copy every runtime DLL stored at the canonical repository root. This
+          # preserves OpenAL, DXC/DXIL, D3D12 Agility and NVIDIA/Streamline files
+          # without relying on a fragile hand-maintained optional-file list.
+          $vmNameRegex = '^(cgamex64|qagamex64|uix64).*\.dll$'
+          $rootRuntimeDlls = @(
+            Get-ChildItem -LiteralPath $PWD -File -Filter '*.dll' |
+              Where-Object { $_.Name -notmatch $vmNameRegex } |
+              Sort-Object Name
+          )
+          if ($rootRuntimeDlls.Count -eq 0) {
+            throw 'No root runtime DLLs were found in the exact source checkout.'
+          }
+          foreach ($dll in $rootRuntimeDlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $release $dll.Name) -Force
+            Write-Host "ROOT_RUNTIME_DLL $($dll.Name) $($dll.Length)"
+          }
+
+          # These four files were required by the last known complete DarkWolf
+          # runtime package and must never silently disappear from production.
+          $requiredRootRuntime = @(
+            'OpenAL32.dll',
+            'dxcompiler.dll',
+            'dxil.dll',
+            'sl.interposer.dll'
+          )
+          foreach ($required in $requiredRootRuntime) {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $required) -PathType Leaf)) {
+              throw "Required production runtime file was not packaged: $required"
+            }
+          }
+
+          # Package the three freshly built x64 game modules into the standard
+          # RTCW main folder. Prefer work/main and fail on ambiguous/missing output.
+          $vmPatterns = [ordered]@{
+            cgame = 'cgamex64*.dll'
+            qagame = 'qagamex64*.dll'
+            ui = 'uix64*.dll'
+          }
+          foreach ($entry in $vmPatterns.GetEnumerator()) {
+            $preferred = @(
+              Get-ChildItem -LiteralPath (Join-Path $PWD 'main') -File -Filter $entry.Value -ErrorAction SilentlyContinue |
+                Sort-Object Name
+            )
+            if ($preferred.Count -eq 0) {
+              $preferred = @(
+                Get-ChildItem -LiteralPath $PWD -Recurse -File -Filter $entry.Value -ErrorAction SilentlyContinue |
+                  Where-Object {
+                    $_.FullName -notlike "$release*" -and
+                    $_.FullName -notlike "$sourceRelease*"
+                  } |
+                  Sort-Object FullName
+              )
+            }
+            if ($preferred.Count -eq 0) {
+              throw "Built $($entry.Key) x64 module was not found: $($entry.Value)"
+            }
+            $selected = $preferred[0]
+            Copy-Item -LiteralPath $selected.FullName -Destination (Join-Path $mainDir $selected.Name) -Force
+            Write-Host "MAIN_VM_DLL $($selected.Name) $($selected.Length) SOURCE=$($selected.FullName)"
+          }
+
+          $utf8NoBom = [Text.UTF8Encoding]::new($false)
+          $cfgLines = @(
+            '// DarkWolf EXP22.5 final production profile',
+            '// Accepted from the EXP22.4 F8 MATERIAL_BALANCED runtime test.',
+            'seta developer "0"',
+            'seta r_dxr "1"',
+            'seta r_dxrDebug "0"',
+            'seta r_dxrReflectionDiagnosticMode "0"',
+            'seta r_dxrMaterialSpecularMode "5"',
+            'seta r_dxrReflectionMode "5"',
+            'seta r_dxrReflectionStrength "1.00"',
+            'seta r_dxrReflectionMaxDistance "1100"',
+            'seta r_dxrReflectionRoughnessScale "1.00"',
+            'seta r_dxrLegacyBlend "0.45"'
+          )
+          $cfgName = 'darkwolf_exp22_5_full_production.cfg'
+          $cfgPath = Join-Path $mainDir $cfgName
+          [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`r`n") + "`r`n"), $utf8NoBom)
+
+          $launcherLines = @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'echo Starting DarkWolf EXP22.5 Full Production...',
+            "WolfSP.exe +set r_dxr 1 +exec $cfgName",
+            'endlocal'
+          )
+          $launcherName = 'RUN_DARKWOLF_EXP22_5_FULL_PRODUCTION.bat'
+          [IO.File]::WriteAllText(
+            (Join-Path $release $launcherName),
+            (($launcherLines -join "`r`n") + "`r`n"),
+            [Text.Encoding]::ASCII
+          )
+
+          $exeSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $release 'WolfSP.exe')).Hash
+          $readme = @"
+          DarkWolf Experiment 22.5 - Full Production Release
+          ==================================================
+
+          This is the complete engine/runtime package, not the earlier compact overlay.
+
+          Included:
+          - WolfSP.exe built from the exact validated chain through EXP22.4;
+          - all runtime DLL files stored at the canonical repository root;
+          - freshly built cgamex64, qagamex64 and uix64 modules in main;
+          - the accepted EXP22.4 F8 material-balanced production profile;
+          - launcher, build manifest and SHA-256 file manifest.
+
+          Start:
+            $launcherName
+
+          The archive intentionally does not contain original commercial RTCW PK3 game data.
+          If your existing game installation contains original PK3 files, keep them in main.
+
+          EXP20 stabilization compiled into WolfSP.exe:
+          - selection mode: 2
+          - hysteresis: 0.25
+          - minimum hold: 12 frames
+
+          Production reflection profile:
+          - diagnostic mode: 0
+          - material specular mode: 5
+          - reflection mode: 5
+          - reflection strength: 1.00
+          - maximum distance: 1100
+          - roughness scale: 1.00
+          - legacy blend: 0.45
+
+          WolfSP.exe SHA-256: $exeSha
+          Canonical base: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          EXP22.4 donor workflow SHA-256: DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          EXP22.4 payload SHA-256: 2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          "@
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'README_EXP22_5_FULL_PRODUCTION_RU.txt'),
+            ($readme.Trim() + "`r`n"),
+            $utf8NoBom
+          )
+
+          $manifest = @"
+          DARKWOLF_EXP22_5_FULL_PRODUCTION_RELEASE
+          Configuration=Release
+          CanonicalBase=229cd5d93b4c24ba705c9821a871cccf31b34b96
+          DonorWorkflowSHA256=DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          PayloadSHA256=2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          EXP20_SelectionMode=2
+          EXP20_Hysteresis=0.25
+          EXP20_HoldFrames=12
+          EXP21_Included=0
+          EXP22_Included=1
+          EXP22_1_DiagnosticCodeIncluded=1
+          EXP22_2_DirectNativeHitColourIncluded=1
+          EXP22_3_HitSurfaceBindingRepairIncluded=1
+          EXP22_4_BoundedProductionCompositeIncluded=1
+          EXP22_5_Profile=F8_MATERIAL_BALANCED
+          ReflectionMode=5
+          ReflectionStrength=1.00
+          ReflectionMaxDistance=1100
+          ReflectionRoughnessScale=1.00
+          LegacyBlend=0.45
+          PackageType=FULL_ENGINE_RUNTIME
+          OriginalCommercialPK3Included=0
+          WolfSP_SHA256=$exeSha
+          "@
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'BUILD_MANIFEST.txt'),
+            ($manifest.Trim() + "`r`n"),
+            $utf8NoBom
+          )
+
+          # Reject build products and sources that must never leak into a runtime artifact.
+          $forbiddenExtensions = @('.pdb', '.obj', '.lib', '.exp', '.ilk', '.vcxproj', '.sln', '.patch', '.py', '.ps1')
+          $forbidden = @(
+            Get-ChildItem -LiteralPath $release -Recurse -File |
+              Where-Object { $_.Extension.ToLowerInvariant() -in $forbiddenExtensions }
+          )
+          if ($forbidden.Count -ne 0) {
+            throw "Forbidden non-runtime files found: $($forbidden.FullName -join ', ')"
+          }
+
+          foreach ($requiredMainPattern in @('cgamex64*.dll', 'qagamex64*.dll', 'uix64*.dll')) {
+            $matches = @(Get-ChildItem -LiteralPath $mainDir -File -Filter $requiredMainPattern)
+            if ($matches.Count -ne 1) {
+              throw "main module count mismatch for $requiredMainPattern. Expected=1 Actual=$($matches.Count)"
+            }
+          }
+
+          $filesBeforeSums = @(Get-ChildItem -LiteralPath $release -Recurse -File | Sort-Object FullName)
+          $sumLines = foreach ($file in $filesBeforeSums) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $relative"
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'SHA256SUMS.txt'),
+            (($sumLines -join "`r`n") + "`r`n"),
+            $utf8NoBom
+          )
+
+          $finalFiles = @(Get-ChildItem -LiteralPath $release -Recurse -File | Sort-Object FullName)
+          $totalBytes = [int64](($finalFiles | Measure-Object -Property Length -Sum).Sum)
+          $totalMiB = [math]::Round($totalBytes / 1MB, 2)
+
+          # A compact overlay was about 3-5 MiB. The complete runtime is expected
+          # to be roughly 57 MiB; broad bounds catch incomplete or accidental source packages.
+          if ($totalBytes -lt 40MB) {
+            throw "Full production release is unexpectedly small: $totalMiB MiB. Runtime DLLs or main modules are missing."
+          }
+          if ($totalBytes -gt 120MB) {
+            throw "Full production release is unexpectedly large: $totalMiB MiB. Non-runtime files may have been included."
+          }
+
+          $contentsLines = foreach ($file in $finalFiles) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            '{0,12}  {1}' -f $file.Length, $relative
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'FULL_RELEASE_CONTENTS.txt'),
+            ((@("TOTAL_BYTES=$totalBytes", "TOTAL_MIB=$totalMiB", '') + $contentsLines) -join "`r`n") + "`r`n",
+            $utf8NoBom
+          )
+
+          Write-Host "EXP22_5_FULL_PRODUCTION_PACKAGE=PASS FILES=$($finalFiles.Count) TOTAL_BYTES=$totalBytes TOTAL_MIB=$totalMiB WolfSP_SHA256=$exeSha"
+          foreach ($file in $finalFiles) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            Write-Host ("ARTIFACT_FILE {0} {1}" -f $file.Length, $relative)
+          }
+
+      - name: Upload complete production game runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.5-Full-Production-Release
+          path: work/release-darkwolf-exp22_5-full-production/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
