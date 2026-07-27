@@ -1,0 +1,273 @@
+name: DarkWolf Experiment 22.5 Production RT Reflections Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwolf-exp22-5-production-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout current workflow kit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: kit
+
+      - name: Checkout exact Stable Clear v2.2 source
+        uses: actions/checkout@v4
+        with:
+          ref: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          fetch-depth: 1
+          path: work
+
+      - name: Recover and verify the proven EXP22.4 payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $donor = Join-Path $PWD 'kit/.github/workflows/darkwolf-d3d12-native-hit-production-composite-exp22_4.yml'
+          if (-not (Test-Path -LiteralPath $donor -PathType Leaf)) {
+            throw "Required donor workflow is missing: $donor"
+          }
+
+          $expectedDonorSha = 'DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A'
+          $workflowText = [IO.File]::ReadAllText((Resolve-Path $donor), [Text.Encoding]::UTF8)
+          $normalizedWorkflowText = $workflowText.Replace("`r`n", "`n").Replace("`r", "`n")
+          $utf8NoBomForHash = [Text.UTF8Encoding]::new($false)
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualDonorSha = ([BitConverter]::ToString(
+              $sha256.ComputeHash($utf8NoBomForHash.GetBytes($normalizedWorkflowText))
+            )).Replace('-', '')
+          }
+          finally {
+            $sha256.Dispose()
+          }
+          if ($actualDonorSha -ne $expectedDonorSha) {
+            throw "EXP22.4 donor workflow normalized hash mismatch. Expected=$expectedDonorSha Actual=$actualDonorSha"
+          }
+          $workflowText = $normalizedWorkflowText
+          $payloadMatch = [regex]::Match(
+            $workflowText,
+            "(?ms)^\s*\`$base64\s*=\s*@'\s*(?<payload>.*?)^\s*'@\s*$"
+          )
+          if (-not $payloadMatch.Success) {
+            throw 'Unable to locate the EXP22.4 embedded payload here-string.'
+          }
+
+          $payloadBase64 = $payloadMatch.Groups['payload'].Value -replace '\s', ''
+          $payloadArchive = Join-Path $env:RUNNER_TEMP 'exp22_4-proven-payload.zip'
+          [IO.File]::WriteAllBytes($payloadArchive, [Convert]::FromBase64String($payloadBase64))
+
+          $expectedPayloadSha = '2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393'
+          $actualPayloadSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadArchive).Hash
+          if ($actualPayloadSha -ne $expectedPayloadSha) {
+            throw "EXP22.4 payload hash mismatch. Expected=$expectedPayloadSha Actual=$actualPayloadSha"
+          }
+
+          Expand-Archive -LiteralPath $payloadArchive -DestinationPath 'work' -Force
+
+          $manifest = Join-Path $PWD 'work/PAYLOAD_SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw 'EXP22.4 payload manifest is missing after extraction.'
+          }
+
+          $verified = 0
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $manifest))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\s{2,}', 2
+            if ($parts.Count -ne 2) {
+              throw "Malformed payload manifest line: $line"
+            }
+            $relative = $parts[1].Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $path = Join-Path $PWD (Join-Path 'work' $relative)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Payload file is missing after extraction: $($parts[1])"
+            }
+            $fileSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($fileSha -ne $parts[0]) {
+              throw "Payload file hash mismatch: $($parts[1])"
+            }
+            ++$verified
+          }
+
+          if ($verified -ne 29) {
+            throw "Payload manifest count mismatch. Expected=29 Actual=$verified"
+          }
+
+          $required = @(
+            'work/patches/330-d3d12-hit-surface-binding-repair-exp22_3.patch',
+            'work/patches/340-d3d12-native-hit-production-composite-exp22_4.patch',
+            'work/scripts/build_exp224.ps1'
+          )
+          foreach ($requiredPath in $required) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required EXP22.4 build component is missing: $requiredPath"
+            }
+          }
+
+          Write-Host "EXP22_5_DONOR_WORKFLOW=PASS SHA256=$actualDonorSha"
+          Write-Host "EXP22_5_PAYLOAD=PASS SHA256=$actualPayloadSha FILES=$verified"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Rebuild the exact validated chain through EXP22.4
+        shell: pwsh
+        working-directory: work
+        run: ./scripts/build_exp224.ps1 -Configuration '${{ inputs.configuration }}'
+
+      - name: Create compact production reflections release
+        shell: pwsh
+        working-directory: work
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $sourceRelease = Join-Path $PWD 'release-rt-reflection-native-composite-exp22_4'
+          $sourceExe = Join-Path $sourceRelease 'WolfSP.exe'
+          if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+            throw "EXP22.4 build completed without the expected WolfSP.exe: $sourceExe"
+          }
+
+          $release = Join-Path $PWD 'release-darkwolf-exp22_5-production-reflections'
+          if (Test-Path -LiteralPath $release) {
+            Remove-Item -LiteralPath $release -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path (Join-Path $release 'main') -Force | Out-Null
+          Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $release 'WolfSP.exe') -Force
+
+          $utf8NoBom = [Text.UTF8Encoding]::new($false)
+          $cfgLines = @(
+            '// DarkWolf EXP22.5 production reflection profile',
+            '// Accepted from EXP22.4 F8 MATERIAL_BALANCED test.',
+            'seta developer "0"',
+            'seta r_dxr "1"',
+            'seta r_dxrDebug "0"',
+            'seta r_dxrReflectionDiagnosticMode "0"',
+            'seta r_dxrMaterialSpecularMode "5"',
+            'seta r_dxrReflectionMode "5"',
+            'seta r_dxrReflectionStrength "1.00"',
+            'seta r_dxrReflectionMaxDistance "1100"',
+            'seta r_dxrReflectionRoughnessScale "1.00"',
+            'seta r_dxrLegacyBlend "0.45"'
+          )
+          $cfgPath = Join-Path $release 'main/game_rt_reflection_production_exp22_5.cfg'
+          [IO.File]::WriteAllText($cfgPath, (($cfgLines -join "`r`n") + "`r`n"), $utf8NoBom)
+
+          $launcherLines = @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'WolfSP.exe +set r_dxr 1 +exec game_rt_reflection_production_exp22_5.cfg',
+            'endlocal'
+          )
+          $launcherPath = Join-Path $release 'RUN_DARKWOLF_RT_REFLECTIONS_PRODUCTION_EXP22_5.bat'
+          [IO.File]::WriteAllText($launcherPath, (($launcherLines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
+
+          $exeSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $release 'WolfSP.exe')).Hash
+          $readme = @"
+          DarkWolf Experiment 22.5 - Production RT Reflections
+          ====================================================
+
+          This is a compact overlay. It contains no DLL, PK3, PAK or original game data.
+
+          Installation:
+          1. Back up the current WolfSP.exe.
+          2. Extract this artifact over the working DarkWolf folder.
+          3. Start RUN_DARKWOLF_RT_REFLECTIONS_PRODUCTION_EXP22_5.bat once.
+
+          The launcher applies and archives the accepted EXP22.4 F8 production profile:
+          - reflection diagnostic mode: 0
+          - material specular mode: 5
+          - reflection mode: 5
+          - reflection strength: 1.00
+          - reflection maximum distance: 1100
+          - reflection roughness scale: 1.00
+          - legacy blend: 0.45
+
+          EXP20 persistent-light stabilization remains compiled into WolfSP.exe:
+          selection mode 2, hysteresis 0.25, minimum hold 12 frames.
+
+          WolfSP.exe SHA-256: $exeSha
+          Canonical base: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          EXP22.4 donor workflow SHA-256: DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          EXP22.4 payload SHA-256: 2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          "@
+          [IO.File]::WriteAllText((Join-Path $release 'README_EXP22_5_PRODUCTION_RU.txt'), ($readme.Trim() + "`r`n"), $utf8NoBom)
+
+          $manifest = @"
+          DARKWOLF_EXP22_5_PRODUCTION_REFLECTIONS
+          Configuration=${{ inputs.configuration }}
+          CanonicalBase=229cd5d93b4c24ba705c9821a871cccf31b34b96
+          DonorWorkflowSHA256=DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          PayloadSHA256=2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          EXP20_SelectionMode=2
+          EXP20_Hysteresis=0.25
+          EXP20_HoldFrames=12
+          EXP21_Included=0
+          EXP22_Included=1
+          EXP22_1_DiagnosticCodeIncluded=1
+          EXP22_2_DirectNativeHitColourIncluded=1
+          EXP22_3_HitSurfaceBindingRepairIncluded=1
+          EXP22_4_BoundedProductionCompositeIncluded=1
+          EXP22_5_Profile=F8_MATERIAL_BALANCED
+          ReflectionMode=5
+          ReflectionStrength=1.00
+          ReflectionMaxDistance=1100
+          ReflectionRoughnessScale=1.00
+          LegacyBlend=0.45
+          WolfSP_SHA256=$exeSha
+          "@
+          [IO.File]::WriteAllText((Join-Path $release 'BUILD_MANIFEST.txt'), ($manifest.Trim() + "`r`n"), $utf8NoBom)
+
+          $forbidden = @(Get-ChildItem -LiteralPath $release -Recurse -File | Where-Object {
+            $_.Extension.ToLowerInvariant() -in @('.dll', '.pk3', '.pak')
+          })
+          if ($forbidden.Count -ne 0) {
+            throw "Forbidden compact-overlay files found: $($forbidden.FullName -join ', ')"
+          }
+
+          $filesBeforeSums = @(Get-ChildItem -LiteralPath $release -Recurse -File | Sort-Object FullName)
+          $sumLines = foreach ($file in $filesBeforeSums) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $relative"
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'SHA256SUMS.txt'),
+            (($sumLines -join "`r`n") + "`r`n"),
+            $utf8NoBom
+          )
+
+          $finalFiles = @(Get-ChildItem -LiteralPath $release -Recurse -File)
+          if ($finalFiles.Count -ne 6) {
+            throw "Production release file count mismatch. Expected=6 Actual=$($finalFiles.Count)"
+          }
+
+          Write-Host "EXP22_5_PRODUCTION_PACKAGE=PASS FILES=$($finalFiles.Count) WolfSP_SHA256=$exeSha"
+
+      - name: Upload compact production overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.5-Production-RT-Reflections-${{ inputs.configuration }}
+          path: work/release-darkwolf-exp22_5-production-reflections/**
+          if-no-files-found: error
+          retention-days: 30
