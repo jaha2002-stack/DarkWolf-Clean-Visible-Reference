@@ -1,12 +1,19 @@
 param(
-  [Parameter(Mandatory=$true)][string]$RepositoryRoot
+  [Parameter(Mandatory=$true)][string]$DonorRoot,
+  [Parameter(Mandatory=$true)][string]$WorkRoot
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
-$donor = Join-Path $root 'kit/.github/workflows/darkwolf-d3d12-native-hit-production-composite-exp22_4.yml'
-$work = Join-Path $root 'work'
+$donorRootResolved = (Resolve-Path -LiteralPath $DonorRoot).Path
+$work = (Resolve-Path -LiteralPath $WorkRoot).Path
+$expectedDonorCommit = '7a5b93de850c2ac2d172af53ac26923fad9af1cd'
+$actualDonorCommit = (& git -C $donorRootResolved rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $actualDonorCommit -ne $expectedDonorCommit) {
+  throw "EXP22.4 donor checkout mismatch. Expected=$expectedDonorCommit Actual=$actualDonorCommit"
+}
+
+$donor = Join-Path $donorRootResolved '.github/workflows/darkwolf-d3d12-native-hit-production-composite-exp22_4.yml'
 if (-not (Test-Path -LiteralPath $donor -PathType Leaf)) {
   throw "Required donor workflow is missing: $donor"
 }
@@ -81,5 +88,5 @@ foreach ($requiredPath in @(
   }
 }
 
-Write-Host "EXP22_6_DONOR_WORKFLOW=PASS SHA256=$actualDonorSha"
+Write-Host "EXP22_6_DONOR_SNAPSHOT=PASS COMMIT=$actualDonorCommit SHA256=$actualDonorSha"
 Write-Host "EXP22_6_PAYLOAD=PASS SHA256=$actualPayloadSha FILES=$verified"
