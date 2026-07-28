@@ -1,0 +1,171 @@
+name: DarkWolf EXP22.6 Exact-Patch Performance and Lifecycle Production Release v8
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v8.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwolf-exp22-6-exact-v8-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout control files from main
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+          path: control
+
+      - name: Checkout exact EXP22.4 donor snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 7a5b93de850c2ac2d172af53ac26923fad9af1cd
+          fetch-depth: 1
+          persist-credentials: false
+          path: donor
+
+      - name: Checkout exact Stable Clear v2.2 source
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          fetch-depth: 1
+          persist-credentials: false
+          path: work
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Recover and verify the proven EXP22.4 payload
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Recover and verify the proven EXP22.4 payload' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 failed while recovering the EXP22.4 payload: $LASTEXITCODE" }
+
+      - name: Materialize the embedded EXP22.6 exact-patch kit
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Materialize the embedded EXP22.6 exact-patch kit' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 failed while materializing the exact-patch kit: $LASTEXITCODE" }
+
+      - name: Verify the EXP22.6 exact-patch kit
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Verify the EXP22.6 exact-patch kit' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 failed while verifying the exact-patch kit: $LASTEXITCODE" }
+
+      - name: Rebuild the exact validated chain through EXP22.4
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Rebuild the exact validated chain through EXP22.4' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 failed while rebuilding EXP22.4: $LASTEXITCODE" }
+
+      - name: Apply and validate the hash-locked EXP22.6 exact patch
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Apply and validate the hash-locked EXP22.6 exact patch' `
+            --workspace "$env:GITHUB_WORKSPACE" `
+            --scope-diff-check
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 failed while applying the exact patch: $LASTEXITCODE" }
+
+      - name: Rebuild EXP22.6 WolfSP Release x64
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Rebuild EXP22.6 WolfSP Release x64' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 WolfSP Release x64 build failed: $LASTEXITCODE" }
+
+      - name: Rebuild and verify exact Release x64 VM modules
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Rebuild and verify exact Release x64 VM modules' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 Release VM build failed: $LASTEXITCODE" }
+
+      - name: Create complete production runtime release
+        shell: pwsh
+        run: |
+          python control/ci/exp22_6/run_v7_step.py `
+            --workflow control/.github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml `
+            --step 'Create complete production runtime release' `
+            --workspace "$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "EXP22.6 v8 production packaging failed: $LASTEXITCODE" }
+
+      - name: Upload EXP22.6 v8 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Exact-v8-Failure-Diagnostics
+          path: |
+            kit/ci/exp22_6/SOURCE_CONTRACT_SUMMARY.txt
+            kit/ci/exp22_6/SOURCE_INPUT_SHA256SUMS.txt
+            kit/ci/exp22_6/SOURCE_OUTPUT_SHA256SUMS.txt
+            kit/ci/exp22_6/350-d3d12-performance-lifecycle-exp22_6-exact.patch
+            work/EXP22_6_SOURCE_CONTRACT.txt
+            work/EXP22_6_SOURCE_INPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_OUTPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_DIFF.patch
+            work/src/opengl/opengl.h
+            work/src/opengl/gl_d3d12raylight.cpp
+            work/src/opengl/gl_d3d12shim.cpp
+            work/src/renderer/tr_backend.cpp
+            work/src/renderer/tr_cmds.cpp
+            work/src/renderer/tr_cmesh.cpp
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 14
+
+      - name: Upload complete production game runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Performance-Lifecycle-Release-v8
+          path: work/release-darkwolf-exp22_6-performance-lifecycle/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+      - name: Upload EXP22.6 v8 source audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Source-Audit-v8
+          path: |
+            work/EXP22_6_SOURCE_DIFF.patch
+            work/EXP22_6_SOURCE_CONTRACT.txt
+            work/EXP22_6_SOURCE_INPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_OUTPUT_SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
