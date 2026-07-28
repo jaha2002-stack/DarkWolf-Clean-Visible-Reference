@@ -1,0 +1,1154 @@
+name: DarkWolf EXP22.6 Exact-Patch Performance and Lifecycle Production Release v7
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwolf-exp22-6-exact-patch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout exact EXP22.4 donor snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 7a5b93de850c2ac2d172af53ac26923fad9af1cd
+          fetch-depth: 1
+          persist-credentials: false
+          path: donor
+
+      - name: Checkout exact Stable Clear v2.2 source
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          fetch-depth: 1
+          persist-credentials: false
+          path: work
+
+      - name: Recover and verify the proven EXP22.4 payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $expectedDonorCommit = '7a5b93de850c2ac2d172af53ac26923fad9af1cd'
+          $actualDonorCommit = (git -C 'donor' rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualDonorCommit -ne $expectedDonorCommit) {
+            throw "EXP22.4 donor checkout mismatch. Expected=$expectedDonorCommit Actual=$actualDonorCommit"
+          }
+
+          $donor = Join-Path $PWD 'donor/.github/workflows/darkwolf-d3d12-native-hit-production-composite-exp22_4.yml'
+          if (-not (Test-Path -LiteralPath $donor -PathType Leaf)) {
+            throw "Required donor workflow is missing: $donor"
+          }
+
+          $expectedDonorSha = 'DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A'
+          $workflowText = [IO.File]::ReadAllText((Resolve-Path $donor), [Text.Encoding]::UTF8)
+          $normalizedWorkflowText = $workflowText.Replace("`r`n", "`n").Replace("`r", "`n")
+          $utf8NoBomForHash = [Text.UTF8Encoding]::new($false)
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try {
+            $actualDonorSha = ([BitConverter]::ToString(
+              $sha256.ComputeHash($utf8NoBomForHash.GetBytes($normalizedWorkflowText))
+            )).Replace('-', '')
+          }
+          finally {
+            $sha256.Dispose()
+          }
+          if ($actualDonorSha -ne $expectedDonorSha) {
+            throw "EXP22.4 donor workflow normalized hash mismatch. Expected=$expectedDonorSha Actual=$actualDonorSha"
+          }
+          $workflowText = $normalizedWorkflowText
+          $payloadMatch = [regex]::Match(
+            $workflowText,
+            "(?ms)^\s*\`$base64\s*=\s*@'\s*(?<payload>.*?)^\s*'@\s*$"
+          )
+          if (-not $payloadMatch.Success) {
+            throw 'Unable to locate the EXP22.4 embedded payload here-string.'
+          }
+
+          $payloadBase64 = $payloadMatch.Groups['payload'].Value -replace '\s', ''
+          $payloadArchive = Join-Path $env:RUNNER_TEMP 'exp22_4-proven-payload.zip'
+          [IO.File]::WriteAllBytes($payloadArchive, [Convert]::FromBase64String($payloadBase64))
+
+          $expectedPayloadSha = '2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393'
+          $actualPayloadSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $payloadArchive).Hash
+          if ($actualPayloadSha -ne $expectedPayloadSha) {
+            throw "EXP22.4 payload hash mismatch. Expected=$expectedPayloadSha Actual=$actualPayloadSha"
+          }
+
+          Expand-Archive -LiteralPath $payloadArchive -DestinationPath 'work' -Force
+
+          $manifest = Join-Path $PWD 'work/PAYLOAD_SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw 'EXP22.4 payload manifest is missing after extraction.'
+          }
+
+          $verified = 0
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $manifest))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\s{2,}', 2
+            if ($parts.Count -ne 2) {
+              throw "Malformed payload manifest line: $line"
+            }
+            $relative = $parts[1].Replace('/', [IO.Path]::DirectorySeparatorChar)
+            $path = Join-Path $PWD (Join-Path 'work' $relative)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Payload file is missing after extraction: $($parts[1])"
+            }
+            $fileSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($fileSha -ne $parts[0]) {
+              throw "Payload file hash mismatch: $($parts[1])"
+            }
+            ++$verified
+          }
+
+          if ($verified -ne 29) {
+            throw "Payload manifest count mismatch. Expected=29 Actual=$verified"
+          }
+
+          $required = @(
+            'work/patches/330-d3d12-hit-surface-binding-repair-exp22_3.patch',
+            'work/patches/340-d3d12-native-hit-production-composite-exp22_4.patch',
+            'work/scripts/build_exp224.ps1'
+          )
+          foreach ($requiredPath in $required) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required EXP22.4 build component is missing: $requiredPath"
+            }
+          }
+
+          Write-Host "EXP22_6_DONOR_SNAPSHOT=PASS COMMIT=$actualDonorCommit SHA256=$actualDonorSha"
+          Write-Host "EXP22_6_PAYLOAD=PASS SHA256=$actualPayloadSha FILES=$verified"
+
+      - name: Materialize the embedded EXP22.6 exact-patch kit
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $archive = Join-Path $env:RUNNER_TEMP 'exp22_6-exact-patch-kit.zip'
+          $base64 = @'
+          UEsDBBQAAAAIAAAA/Fwu1vXudwAAAH0AAAAhAAAAY2kvZXhwMjJfNi8wMV9jb21wcmVzc2lvbl9v
+          ZmYuY2ZnS61ITVZISSzKLs/PSYtPrSgwMoo3iy8oyk8pTS7JzM/TS05L5+UqTi1JVCgCSpfEJ+fn
+          FhSlFhenpsSXAPmlQLaCkoESL1dZZko8kFOSWFTCy5WanJGv4BoRADYtxDU4xNbAMN7Z3zcgyDU4
+          2NPfL97fzY2XCwBQSwMEFAAAAAgAAAD8XC9UBJx2AAAAfAAAACAAAABjaS9leHAyMl82LzAyX2Nv
+          bXByZXNzaW9uX29uLmNmZ0utSE1WSEksyi7Pz0mLT60oMDKKN4svKMpPKU0uyczP00tOS+flKk4t
+          SVQoAkqXxCfn5xYUpRYXp6bElwD5pUC2gpKhEi9XWWZKPJBTklhUwsuVmpyRr+AaEQA2LcQ1OMTW
+          wCje2d83IMg1ONjT3y/e34+XCwBQSwMEFAAAAAgAAAD8XGEzZz1wAAAAjAAAACEAAABjaS9leHAy
+          Ml82LzAzX3JlZmxlY3Rpb25zX29mZi5jZmdLrUhNVkhJLMouz89Ji0+tKDAyijeLLyjKTylNLsnM
+          z9NLTkvn5SpOLUlUKIpPqSgKSk3LSQXL+OanpCooGShhlw0uKUrNSy/JgKhITc7IV3CNCAAbHuIa
+          HGJrYBwf5Orm4+oc4unvFxzv7+bGywUAUEsDBBQAAAAIAAAA/FytFSXmawAAAJMAAAAZAAAAY2kv
+          ZXhwMjJfNi8wNF9keHJfb2ZmLmNmZytOLUlUSEktS83JL0gtUlAyUOLlKgaJ5eSnp2XmpCooGcFE
+          ktPjU4oSy90CghWUDGGCRfFpmXmZxRlIOoviUyqKnAtKgyvzktGFIfzU5Ix8BdeIACOjeLP4ENfg
+          EFsDk3iXiKB4fzc3Xi4AUEsDBBQAAAAIAAAA/FyoajAxrCcAACWlAAA+AAAAY2kvZXhwMjJfNi8z
+          NTAtZDNkMTItcGVyZm9ybWFuY2UtbGlmZWN5Y2xlLWV4cDIyXzYtZXhhY3QucGF0Y2jVfWt32ziS
+          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
+          XzYvMDFfY29tcHJlc3Npb25fb2ZmLmNmZ1BLAQIUAxQAAAAIAAAA/FwvVAScdgAAAHwAAAAgAAAA
+          AAAAAAAAAACkgbYAAABjaS9leHAyMl82LzAyX2NvbXByZXNzaW9uX29uLmNmZ1BLAQIUAxQAAAAI
+          AAAA/FxhM2c9cAAAAIwAAAAhAAAAAAAAAAAAAACkgWoBAABjaS9leHAyMl82LzAzX3JlZmxlY3Rp
+          b25zX29mZi5jZmdQSwECFAMUAAAACAAAAPxcrRUl5msAAACTAAAAGQAAAAAAAAAAAAAApIEZAgAA
+          Y2kvZXhwMjJfNi8wNF9keHJfb2ZmLmNmZ1BLAQIUAxQAAAAIAAAA/FyoajAxrCcAACWlAAA+AAAA
+          AAAAAAAAAACkgbsCAABjaS9leHAyMl82LzM1MC1kM2QxMi1wZXJmb3JtYW5jZS1saWZlY3ljbGUt
+          ZXhwMjJfNi1leGFjdC5wYXRjaFBLAQIUAxQAAAAIAAAA/FyactO/egIAAMAEAAAmAAAAAAAAAAAA
+          AACkgcMqAABjaS9leHAyMl82L0VYUDIyXzZfQ09MTEVDVF9SRVNVTFRTLnBzMVBLAQIUAxQAAAAI
+          AAAA/Fz3yYytCwMAAFgFAAAlAAAAAAAAAAAAAACkgYEtAABjaS9leHAyMl82L0VYUDIyXzZfS0lU
+          X1NIQTI1NlNVTVMudHh0UEsBAhQDFAAAAAgAAAD8XPqDLlVqAAAAcAAAACUAAAAAAAAAAAAAAKSB
+          zzAAAGNpL2V4cDIyXzYvUlVOX0VYUDIyXzZfUFJPRFVDVElPTi5iYXRQSwECFAMUAAAACAAAAPxc
+          PKfHtAoBAAAEAgAAIAAAAAAAAAAAAAAApIF8MQAAY2kvZXhwMjJfNi9SVU5fRVhQMjJfNl9URVNU
+          Uy5iYXRQSwECFAMUAAAACAAAAPxc8+GRs40BAADzAgAAIwAAAAAAAAAAAAAApIHEMgAAY2kvZXhw
+          MjJfNi9SVU5fV0lUSE9VVF80S19QQUNLUy5wczFQSwECFAMUAAAACAAAAPxcc4veEoABAABoAgAA
+          JgAAAAAAAAAAAAAApIGSNAAAY2kvZXhwMjJfNi9TT1VSQ0VfQ09OVFJBQ1RfU1VNTUFSWS50eHRQ
+          SwECFAMUAAAACAAAAPxcu+N0Z0gBAAArAgAAJgAAAAAAAAAAAAAApIFWNgAAY2kvZXhwMjJfNi9T
+          T1VSQ0VfSU5QVVRfU0hBMjU2U1VNUy50eHRQSwECFAMUAAAACAAAAPxcRW5p3ksBAAArAgAAJwAA
+          AAAAAAAAAAAApIHiNwAAY2kvZXhwMjJfNi9TT1VSQ0VfT1VUUFVUX1NIQTI1NlNVTVMudHh0UEsB
+          AhQDFAAAAAgAAAD8XNaLug5KAQAACwMAACoAAAAAAAAAAAAAAKSBcjkAAGNpL2V4cDIyXzYvZGFy
+          a3dvbGZfZXhwMjJfNl9wcm9kdWN0aW9uLmNmZ1BLBQYAAAAADgAOAI0EAAAEOwAAAAA=
+          '@
+          $payload = $base64 -replace '\s', ''
+          [IO.File]::WriteAllBytes($archive, [Convert]::FromBase64String($payload))
+
+          $expectedArchiveSha = '459B7A90D171CAC002D7D87AFFD4F90C160A744C46893D71E47EB5503A74E284'
+          $actualArchiveSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+          if ($actualArchiveSha -ne $expectedArchiveSha) {
+            throw "Embedded EXP22.6 exact-patch kit hash mismatch. Expected=$expectedArchiveSha Actual=$actualArchiveSha"
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath 'kit' -Force
+          $manifest = Join-Path $PWD 'kit/ci/exp22_6/EXP22_6_KIT_SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw "Embedded EXP22.6 exact-patch kit extraction failed: $manifest"
+          }
+          Write-Host "EXP22_6_EMBEDDED_KIT=PASS SHA256=$actualArchiveSha"
+
+      - name: Verify the EXP22.6 exact-patch kit
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $manifest = Join-Path $PWD 'kit/ci/exp22_6/EXP22_6_KIT_SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw "EXP22.6 exact-patch manifest is missing: $manifest"
+          }
+          $expectedManifestSha = 'B15C3A9079350E12DDEBDC0EBDEC89262D4491DEF42D9C819D9D41865878E79C'
+          $actualManifestSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash
+          if ($actualManifestSha -ne $expectedManifestSha) {
+            throw "EXP22.6 kit manifest hash mismatch. Expected=$expectedManifestSha Actual=$actualManifestSha"
+          }
+
+          $verified = 0
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $manifest))) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split '\s{2,}', 2
+            if ($parts.Count -ne 2) { throw "Malformed EXP22.6 kit manifest line: $line" }
+            $path = Join-Path $PWD (Join-Path 'kit' $parts[1].Replace('/', [IO.Path]::DirectorySeparatorChar))
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "EXP22.6 kit file is missing: $($parts[1])"
+            }
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($actual -ne $parts[0]) {
+              throw "EXP22.6 kit file hash mismatch: $($parts[1])"
+            }
+            ++$verified
+          }
+          if ($verified -ne 13) {
+            throw "EXP22.6 kit file count mismatch. Expected=13 Actual=$verified"
+          }
+
+          $patch = 'kit/ci/exp22_6/350-d3d12-performance-lifecycle-exp22_6-exact.patch'
+          $inputManifest = 'kit/ci/exp22_6/SOURCE_INPUT_SHA256SUMS.txt'
+          $outputManifest = 'kit/ci/exp22_6/SOURCE_OUTPUT_SHA256SUMS.txt'
+          foreach ($required in @($patch, $inputManifest, $outputManifest)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Required exact-patch component is missing: $required"
+            }
+          }
+          $patchPaths = @(git apply --numstat -- $patch | ForEach-Object { ($_ -split "`t", 3)[2] })
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to parse EXP22.6 exact patch.' }
+          $expectedPaths = @(
+            'src/opengl/gl_d3d12raylight.cpp',
+            'src/opengl/gl_d3d12shim.cpp',
+            'src/opengl/opengl.h',
+            'src/renderer/tr_backend.cpp',
+            'src/renderer/tr_cmds.cpp',
+            'src/renderer/tr_cmesh.cpp'
+          ) | Sort-Object
+          $actualPaths = @($patchPaths | Sort-Object)
+          if (($actualPaths -join '|') -ne ($expectedPaths -join '|')) {
+            throw "Exact patch path contract mismatch. Actual=$($actualPaths -join ',')"
+          }
+          Write-Host "EXP22_6_EXACT_KIT=PASS SHA256=$actualManifestSha FILES=$verified PATCH_PATHS=$($actualPaths.Count)"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Rebuild the exact validated chain through EXP22.4
+        shell: pwsh
+        working-directory: work
+        run: ./scripts/build_exp224.ps1 -Configuration 'Release'
+
+      - name: Apply and validate the hash-locked EXP22.6 exact patch
+        shell: pwsh
+        working-directory: work
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $kit = Join-Path $PWD '../kit/ci/exp22_6'
+          $patch = Join-Path $kit '350-d3d12-performance-lifecycle-exp22_6-exact.patch'
+          $inputManifest = Join-Path $kit 'SOURCE_INPUT_SHA256SUMS.txt'
+          $outputManifest = Join-Path $kit 'SOURCE_OUTPUT_SHA256SUMS.txt'
+          $sourceFiles = @(
+            'src/opengl/opengl.h',
+            'src/opengl/gl_d3d12raylight.cpp',
+            'src/opengl/gl_d3d12shim.cpp',
+            'src/renderer/tr_backend.cpp',
+            'src/renderer/tr_cmds.cpp',
+            'src/renderer/tr_cmesh.cpp'
+          )
+
+          git config core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to disable Git CRLF conversion for the exact patch stage.' }
+          git config core.eol lf
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to select LF for the exact patch stage.' }
+
+          # Windows checkout uses CRLF, while the inspected Source Contract and
+          # exact patch use canonical LF/no-BOM. Normalize only these six files
+          # after the proven EXP22.4 chain has completed. This keeps the donor
+          # build unchanged and makes hashes plus patch context deterministic.
+          function Convert-ToCanonicalLfNoBom {
+            param([Parameter(Mandatory=$true)][string]$Path)
+
+            $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+            [byte[]]$inputBytes = [IO.File]::ReadAllBytes($resolvedPath)
+            $start = 0
+            $hadBom = $false
+            if ($inputBytes.Length -ge 3 -and
+                $inputBytes[0] -eq 0xEF -and
+                $inputBytes[1] -eq 0xBB -and
+                $inputBytes[2] -eq 0xBF) {
+              $start = 3
+              $hadBom = $true
+            }
+
+            $outputBytes = [System.Collections.Generic.List[byte]]::new($inputBytes.Length)
+            $crlfCount = 0
+            $bareCrCount = 0
+            for ($i = $start; $i -lt $inputBytes.Length; ++$i) {
+              $value = $inputBytes[$i]
+              if ($value -eq 13) {
+                if (($i + 1) -lt $inputBytes.Length -and $inputBytes[$i + 1] -eq 10) {
+                  ++$crlfCount
+                  ++$i
+                }
+                else {
+                  ++$bareCrCount
+                }
+                $outputBytes.Add([byte]10)
+              }
+              else {
+                $outputBytes.Add($value)
+              }
+            }
+
+            [IO.File]::WriteAllBytes($resolvedPath, $outputBytes.ToArray())
+            $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedPath).Hash
+            Write-Host "EXP22_6_SOURCE_NORMALIZED $Path CRLF=$crlfCount CR=$bareCrCount BOM=$([int]$hadBom) BYTES=$($outputBytes.Count) SHA256=$sha"
+          }
+
+          foreach ($sourceFile in $sourceFiles) {
+            if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+              throw "Exact source file missing before normalization: $sourceFile"
+            }
+            Convert-ToCanonicalLfNoBom -Path $sourceFile
+          }
+          Write-Host 'EXP22_6_SOURCE_NORMALIZATION=PASS MODE=LF_NO_BOM FILES=6'
+
+          function Test-ExactSourceManifest {
+            param(
+              [Parameter(Mandatory=$true)][string]$Manifest,
+              [Parameter(Mandatory=$true)][string]$Phase
+            )
+            if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
+              throw "$Phase source manifest is missing: $Manifest"
+            }
+            $verified = 0
+            foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $Manifest))) {
+              if ([string]::IsNullOrWhiteSpace($line)) { continue }
+              $parts = $line -split '\s{2,}', 2
+              if ($parts.Count -ne 2) { throw "$Phase malformed source manifest line: $line" }
+              $relative = $parts[1].Replace('/', [IO.Path]::DirectorySeparatorChar)
+              if (-not (Test-Path -LiteralPath $relative -PathType Leaf)) {
+                throw "$Phase source file missing: $($parts[1])"
+              }
+              $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $relative).Hash
+              if ($actual -ne $parts[0]) {
+                throw "$Phase source hash mismatch: $($parts[1]) Expected=$($parts[0]) Actual=$actual"
+              }
+              Write-Host "EXP22_6_SOURCE_${Phase}_SHA256 $actual $($parts[1])"
+              ++$verified
+            }
+            if ($verified -ne 6) { throw "$Phase source manifest count mismatch. Expected=6 Actual=$verified" }
+          }
+
+          Test-ExactSourceManifest -Manifest $inputManifest -Phase 'INPUT'
+          if (-not (Test-Path -LiteralPath $patch -PathType Leaf)) {
+            throw "EXP22.6 exact patch is missing: $patch"
+          }
+
+          git add -- $sourceFiles
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to stage the exact post-EXP22.4 source snapshot.' }
+          git -c user.name='DarkWolf EXP22.6 CI' -c user.email='exp226-ci@localhost' commit --allow-empty --no-gpg-sign -m 'CI snapshot: exact post-EXP22.4 canonical LF source'
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to create the local post-EXP22.4 source snapshot.' }
+
+          git apply --check --whitespace=error-all -- $patch
+          if ($LASTEXITCODE -ne 0) { throw 'EXP22.6 exact patch pre-apply check failed.' }
+          git apply --whitespace=error-all -- $patch
+          if ($LASTEXITCODE -ne 0) { throw 'EXP22.6 exact patch application failed.' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'EXP22.6 source diff contains whitespace errors.' }
+          git apply --reverse --check -- $patch
+          if ($LASTEXITCODE -ne 0) { throw 'EXP22.6 reverse patch verification failed.' }
+
+          Test-ExactSourceManifest -Manifest $outputManifest -Phase 'OUTPUT'
+
+          $diff = git diff -- $sourceFiles
+          $diffText = $diff -join "`n"
+          if ([string]::IsNullOrWhiteSpace($diffText)) {
+            throw 'EXP22.6 exact patch produced no source diff.'
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $PWD 'EXP22_6_SOURCE_DIFF.patch'),
+            ($diffText + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          Copy-Item -LiteralPath $inputManifest -Destination (Join-Path $PWD 'EXP22_6_SOURCE_INPUT_SHA256SUMS.txt') -Force
+          Copy-Item -LiteralPath $outputManifest -Destination (Join-Path $PWD 'EXP22_6_SOURCE_OUTPUT_SHA256SUMS.txt') -Force
+          Copy-Item -LiteralPath (Join-Path $kit 'SOURCE_CONTRACT_SUMMARY.txt') -Destination (Join-Path $PWD 'EXP22_6_SOURCE_CONTRACT.txt') -Force
+
+          $requiredMarkers = @(
+            @{ Path='src/opengl/gl_d3d12raylight.cpp'; Marker='int glRaytracingPrepareHitSurfaceResources(void)' },
+            @{ Path='src/opengl/gl_d3d12raylight.cpp'; Marker='static int glRaytracingLightingBuildHitTable(void)' },
+            @{ Path='src/opengl/gl_d3d12raylight.cpp'; Marker='glRaytracingExp226TouchInstance' },
+            @{ Path='src/opengl/gl_d3d12raylight.cpp'; Marker='minimal shadow-compatible SBT' },
+            @{ Path='src/opengl/gl_d3d12raylight.cpp'; Marker='bindingDataChanged' },
+            @{ Path='src/opengl/gl_d3d12shim.cpp'; Marker='D3D12_QUERY_HEAP_TYPE_TIMESTAMP' },
+            @{ Path='src/renderer/tr_backend.cpp'; Marker='glRaytracingExp226TouchInstance' },
+            @{ Path='src/renderer/tr_cmds.cpp'; Marker='EXP22_6_PERF avgFps=' },
+            @{ Path='src/renderer/tr_cmesh.cpp'; Marker='EXP22_6_MODEL_FRAME_WRAP' }
+          )
+          foreach ($check in $requiredMarkers) {
+            $body = [IO.File]::ReadAllText((Resolve-Path $check.Path))
+            if (-not $body.Contains($check.Marker)) {
+              throw "EXP22.6 required marker missing: $($check.Path) :: $($check.Marker)"
+            }
+          }
+          $patchSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $patch).Hash
+          Write-Host "EXP22_6_EXACT_PATCH=PASS SHA256=$patchSha"
+          Write-Host 'EXP22_6_SOURCE_AUDIT=PASS'
+
+      - name: Rebuild EXP22.6 WolfSP Release x64
+        shell: pwsh
+        working-directory: work
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $project = Join-Path $PWD 'src/wolf.vcxproj'
+          if (-not (Test-Path -LiteralPath $project -PathType Leaf)) {
+            throw "WolfSP project is missing: $project"
+          }
+          $projectText = [IO.File]::ReadAllText((Resolve-Path $project))
+          if (-not $projectText.Contains('<OutputFile>../WolfSP.exe</OutputFile>')) {
+            throw 'Release x64 WolfSP output contract changed; expected ../WolfSP.exe.'
+          }
+
+          # Remove the exact Release x64 output before MSBuild. This prevents a
+          # stale repository binary from ever satisfying the post-build check.
+          $rebuiltPath = Join-Path $PWD 'WolfSP.exe'
+          if (Test-Path -LiteralPath $rebuiltPath) {
+            Remove-Item -LiteralPath $rebuiltPath -Force
+          }
+
+          $msbuild = (Get-Command msbuild.exe -ErrorAction Stop).Source
+          & $msbuild $project '/t:Rebuild' '/p:Configuration=Release' '/p:Platform=x64' '/m' '/verbosity:minimal'
+          if ($LASTEXITCODE -ne 0) {
+            throw "EXP22.6 WolfSP Release x64 build failed: $LASTEXITCODE"
+          }
+          if (-not (Test-Path -LiteralPath $rebuiltPath -PathType Leaf)) {
+            throw "EXP22.6 build completed without the exact Release x64 output: $rebuiltPath"
+          }
+
+          $rebuilt = Get-Item -LiteralPath $rebuiltPath
+          if ($rebuilt.Length -lt 1MB) {
+            throw "Rebuilt WolfSP.exe is unexpectedly small: $($rebuilt.FullName) $($rebuilt.Length)"
+          }
+
+          $sourceRelease = Join-Path $PWD 'release-rt-reflection-native-composite-exp22_4'
+          if (-not (Test-Path -LiteralPath $sourceRelease -PathType Container)) {
+            throw "EXP22.4 release directory is missing before EXP22.6 packaging: $sourceRelease"
+          }
+          Copy-Item -LiteralPath $rebuilt.FullName -Destination (Join-Path $sourceRelease 'WolfSP.exe') -Force
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $sourceRelease 'WolfSP.exe')).Hash
+          Write-Host "EXP22_6_WOLFSP_BUILD=PASS SOURCE=$($rebuilt.FullName) SHA256=$sha"
+
+      - name: Rebuild and verify exact Release x64 VM modules
+        shell: pwsh
+        working-directory: work
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $msbuildCommand = Get-Command msbuild.exe -ErrorAction Stop
+          $msbuild = $msbuildCommand.Source
+
+          $releaseOutputs = [ordered]@{
+            'src/cgame/cgame.vcxproj' = 'main/cgamex64.dll'
+            'src/game/game.vcxproj'   = 'main/qagamex64.dll'
+            'src/ui/ui.vcxproj'       = 'main/uix64.dll'
+          }
+
+          # Remove only the exact Release outputs so a stale repository binary can
+          # never satisfy the package audit. Debug *_d.dll files may remain in the
+          # checkout, but they are explicitly forbidden from the final artifact.
+          foreach ($output in $releaseOutputs.Values) {
+            if (Test-Path -LiteralPath $output) {
+              Remove-Item -LiteralPath $output -Force
+            }
+          }
+
+          function Invoke-ReleaseVmBuild {
+            param(
+              [Parameter(Mandatory=$true)][string]$Project,
+              [switch]$AllowSingleRetry
+            )
+
+            $arguments = @(
+              $Project,
+              '/t:Build',
+              '/p:Configuration=Release',
+              '/p:Platform=x64',
+              '/p:BuildProjectReferences=false',
+              '/m',
+              '/verbosity:minimal'
+            )
+
+            & $msbuild @arguments
+            $firstExit = $LASTEXITCODE
+            if ($firstExit -eq 0) { return }
+
+            if (-not $AllowSingleRetry) {
+              throw "Release x64 VM build failed: Project=$Project ExitCode=$firstExit"
+            }
+
+            Write-Warning "First Release x64 VM build failed for $Project. Retrying once after generated-table update."
+            & $msbuild @arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "Release x64 VM build failed after retry: Project=$Project ExitCode=$LASTEXITCODE"
+            }
+          }
+
+          Invoke-ReleaseVmBuild -Project 'src/cgame/cgame.vcxproj'
+          Invoke-ReleaseVmBuild -Project 'src/ui/ui.vcxproj'
+          Invoke-ReleaseVmBuild -Project 'src/game/game.vcxproj' -AllowSingleRetry
+
+          foreach ($entry in $releaseOutputs.GetEnumerator()) {
+            $output = $entry.Value
+            if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {
+              throw "Exact Release x64 VM output is missing: $output"
+            }
+            $item = Get-Item -LiteralPath $output
+            if ($item.Name -match '_d\.dll$') {
+              throw "Debug VM module cannot be used in production: $($item.FullName)"
+            }
+            if ($item.Length -lt 524288) {
+              throw "Release VM module is unexpectedly small: $($item.FullName) Size=$($item.Length)"
+            }
+            Write-Host "RELEASE_VM_MODULE $($item.Name) $($item.Length) SOURCE=$($item.FullName)"
+          }
+
+          Write-Host 'EXP22_6_RELEASE_VM_BUILD=PASS'
+
+      - name: Create complete production runtime release
+        shell: pwsh
+        working-directory: work
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $sourceRelease = Join-Path $PWD 'release-rt-reflection-native-composite-exp22_4'
+          $sourceExe = Join-Path $sourceRelease 'WolfSP.exe'
+          if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
+            throw "EXP22.4 build completed without the expected WolfSP.exe: $sourceExe"
+          }
+
+          $release = Join-Path $PWD 'release-darkwolf-exp22_6-performance-lifecycle'
+          if (Test-Path -LiteralPath $release) {
+            Remove-Item -LiteralPath $release -Recurse -Force
+          }
+          $mainDir = Join-Path $release 'main'
+          New-Item -ItemType Directory -Path $mainDir -Force | Out-Null
+
+          Copy-Item -LiteralPath $sourceExe -Destination (Join-Path $release 'WolfSP.exe') -Force
+
+          # Copy every runtime DLL stored at the canonical repository root. This
+          # preserves OpenAL, DXC/DXIL, D3D12 Agility and NVIDIA/Streamline files
+          # without relying on a fragile hand-maintained optional-file list.
+          $vmNameRegex = '^(cgamex64|qagamex64|uix64).*\.dll$'
+          $rootRuntimeDlls = @(
+            Get-ChildItem -LiteralPath $PWD -File -Filter '*.dll' |
+              Where-Object { $_.Name -notmatch $vmNameRegex } |
+              Sort-Object Name
+          )
+          if ($rootRuntimeDlls.Count -eq 0) {
+            throw 'No root runtime DLLs were found in the exact source checkout.'
+          }
+          foreach ($dll in $rootRuntimeDlls) {
+            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $release $dll.Name) -Force
+            Write-Host "ROOT_RUNTIME_DLL $($dll.Name) $($dll.Length)"
+          }
+
+          # These four files were required by the last known complete DarkWolf
+          # runtime package and must never silently disappear from production.
+          $requiredRootRuntime = @(
+            'OpenAL32.dll',
+            'dxcompiler.dll',
+            'dxil.dll',
+            'sl.interposer.dll'
+          )
+          foreach ($required in $requiredRootRuntime) {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $required) -PathType Leaf)) {
+              throw "Required production runtime file was not packaged: $required"
+            }
+          }
+
+          # Package only the exact Release x64 VM outputs. Wildcards are not
+          # permitted here because they previously selected stale *_d.dll binaries.
+          $releaseVmNames = @(
+            'cgamex64.dll',
+            'qagamex64.dll',
+            'uix64.dll'
+          )
+          foreach ($vmName in $releaseVmNames) {
+            $sourceVm = Join-Path $PWD (Join-Path 'main' $vmName)
+            if (-not (Test-Path -LiteralPath $sourceVm -PathType Leaf)) {
+              throw "Exact Release VM module is missing before packaging: $sourceVm"
+            }
+            $selected = Get-Item -LiteralPath $sourceVm
+            Copy-Item -LiteralPath $selected.FullName -Destination (Join-Path $mainDir $selected.Name) -Force
+            Write-Host "MAIN_VM_DLL $($selected.Name) $($selected.Length) SOURCE=$($selected.FullName)"
+          }
+
+          $debugVmFiles = @(
+            Get-ChildItem -LiteralPath $mainDir -File -Filter '*x64_d.dll' -ErrorAction SilentlyContinue
+          )
+          if ($debugVmFiles.Count -ne 0) {
+            throw "Debug VM modules leaked into production: $($debugVmFiles.Name -join ', ')"
+          }
+
+          $utf8NoBom = [Text.UTF8Encoding]::new($false)
+          $exp226Kit = Join-Path $PWD '../kit/ci/exp22_6'
+          $cfgName = 'darkwolf_exp22_6_production.cfg'
+          $cfgSource = Join-Path $exp226Kit $cfgName
+          if (-not (Test-Path -LiteralPath $cfgSource -PathType Leaf)) {
+            throw "EXP22.6 production profile missing: $cfgSource"
+          }
+          Copy-Item -LiteralPath $cfgSource -Destination (Join-Path $mainDir $cfgName) -Force
+
+          $testToolDir = Join-Path $release 'exp22_6_tests'
+          $testCfgDir = Join-Path $mainDir 'exp22_6_tests'
+          New-Item -ItemType Directory -Path $testToolDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $testCfgDir -Force | Out-Null
+
+          $testCfgFiles = @(
+            '01_compression_off.cfg',
+            '02_compression_on.cfg',
+            '03_reflections_off.cfg',
+            '04_dxr_off.cfg'
+          )
+          foreach ($testFile in $testCfgFiles) {
+            $testSource = Join-Path $exp226Kit $testFile
+            if (-not (Test-Path -LiteralPath $testSource -PathType Leaf)) {
+              throw "EXP22.6 test config missing: $testSource"
+            }
+            Copy-Item -LiteralPath $testSource -Destination (Join-Path $testCfgDir $testFile) -Force
+          }
+
+          $testToolFiles = @(
+            'RUN_EXP22_6_PRODUCTION.bat',
+            'RUN_EXP22_6_TESTS.bat',
+            'RUN_WITHOUT_4K_PACKS.ps1',
+            'EXP22_6_COLLECT_RESULTS.ps1'
+          )
+          foreach ($testFile in $testToolFiles) {
+            $testSource = Join-Path $exp226Kit $testFile
+            if (-not (Test-Path -LiteralPath $testSource -PathType Leaf)) {
+              throw "EXP22.6 test tool missing: $testSource"
+            }
+            Copy-Item -LiteralPath $testSource -Destination (Join-Path $testToolDir $testFile) -Force
+          }
+
+          $launcherName = 'RUN_DARKWOLF_EXP22_6_PRODUCTION.bat'
+          $launcherLines = @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'echo Starting DarkWolf EXP22.6 Performance and Lifecycle Release...',
+            "WolfSP.exe +set r_dxr 1 +exec $cfgName",
+            'endlocal'
+          )
+          [IO.File]::WriteAllText(
+            (Join-Path $release $launcherName),
+            (($launcherLines -join "`r`n") + "`r`n"),
+            [Text.Encoding]::ASCII
+          )
+
+          $exeSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $release 'WolfSP.exe')).Hash
+          $sourceDiffSha = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PWD 'EXP22_6_SOURCE_DIFF.patch')).Hash
+          $readme = @"
+          DarkWolf Experiment 22.6 - Performance and Lifecycle Release
+          ==================================================
+
+          This is the complete engine/runtime package, not the earlier compact overlay.
+
+          Included:
+          - WolfSP.exe built from the exact validated chain through EXP22.4;
+          - all runtime DLL files stored at the canonical repository root;
+          - freshly built cgamex64, qagamex64 and uix64 modules in main;
+          - the accepted EXP22.4 F8 material-balanced production profile;
+          - launcher, build manifest and SHA-256 file manifest.
+
+          Start:
+            $launcherName
+
+          The archive intentionally does not contain original commercial RTCW PK3 game data.
+          If your existing game installation contains original PK3 files, keep them in main.
+
+          EXP20 stabilization compiled into WolfSP.exe:
+          - selection mode: 2
+          - hysteresis: 0.25
+          - minimum hold: 12 frames
+
+          Performance synchronization:
+          - r_finish: 0
+          - r_dxrCpuSync: 0
+          - true D3D12 GPU timestamp telemetry enabled
+
+          Production reflection profile:
+          - diagnostic mode: 0
+          - material specular mode: 5
+          - reflection mode: 5
+          - reflection strength: 0.75
+          - maximum distance: 700
+          - roughness scale: 1.00
+          - legacy blend: 0.55
+
+          WolfSP.exe SHA-256: $exeSha
+          EXP22.6 exact-patch source diff SHA-256: $sourceDiffSha
+          Canonical base: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          EXP22.4 donor snapshot commit: 7a5b93de850c2ac2d172af53ac26923fad9af1cd
+          EXP22.4 donor workflow SHA-256: DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          EXP22.4 payload SHA-256: 2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          "@
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'README_EXP22_6_PERFORMANCE_LIFECYCLE_RU.txt'),
+            ($readme.Trim() + "`r`n"),
+            $utf8NoBom
+          )
+
+          $manifest = @"
+          DARKWOLF_EXP22_6_PERFORMANCE_LIFECYCLE_RELEASE
+          Configuration=Release
+          CanonicalBase=229cd5d93b4c24ba705c9821a871cccf31b34b96
+          DonorSnapshotCommit=7a5b93de850c2ac2d172af53ac26923fad9af1cd
+          DonorWorkflowSHA256=DB30552F3B2663A41892CDD434370A58F468F82C1A5229358E14E09BE2425D0A
+          PayloadSHA256=2B2A7C867CDA10D6324AC114F0F5F9AEE05D20FAA50341F417F7C87A6330D393
+          EXP20_SelectionMode=2
+          EXP20_Hysteresis=0.25
+          EXP20_HoldFrames=12
+          EXP21_Included=0
+          EXP22_Included=1
+          EXP22_1_DiagnosticCodeIncluded=1
+          EXP22_2_DirectNativeHitColourIncluded=1
+          EXP22_3_HitSurfaceBindingRepairIncluded=1
+          EXP22_4_BoundedProductionCompositeIncluded=1
+          EXP22_5_Profile=F8_MATERIAL_BALANCED
+          EXP22_6_Instrumentation=1
+          EXP22_6_ExactHashLockedPatch=1
+          EXP22_6_BindingCache=1
+          EXP22_6_LifecycleCompaction=1
+          EXP22_6_GpuTimestampQueries=1
+          EXP22_6_VramTelemetry=1
+          EXP22_6_ModelFrameWrap=1
+          ReflectionMode=5
+          ReflectionStrength=0.75
+          ReflectionMaxDistance=700
+          ReflectionRoughnessScale=1.00
+          LegacyBlend=0.55
+          PackageType=FULL_ENGINE_RUNTIME
+          OriginalCommercialPK3Included=0
+          WolfSP_SHA256=$exeSha
+          EXP22_6_ExactPatchSourceDiffSHA256=$sourceDiffSha
+          "@
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'BUILD_MANIFEST.txt'),
+            ($manifest.Trim() + "`r`n"),
+            $utf8NoBom
+          )
+
+          # Reject build products and sources that must never leak into a runtime artifact.
+          $forbiddenExtensions = @('.pdb', '.obj', '.lib', '.exp', '.ilk', '.vcxproj', '.sln', '.patch', '.py')
+          $allowedRuntimePs1 = @('RUN_WITHOUT_4K_PACKS.ps1', 'EXP22_6_COLLECT_RESULTS.ps1')
+          $forbidden = @(
+            Get-ChildItem -LiteralPath $release -Recurse -File |
+              Where-Object {
+                $_.Extension.ToLowerInvariant() -in $forbiddenExtensions -or
+                ($_.Extension.ToLowerInvariant() -eq '.ps1' -and $_.Name -notin $allowedRuntimePs1)
+              }
+          )
+          if ($forbidden.Count -ne 0) {
+            throw "Forbidden non-runtime files found: $($forbidden.FullName -join ', ')"
+          }
+
+          foreach ($requiredMainName in @('cgamex64.dll', 'qagamex64.dll', 'uix64.dll')) {
+            $requiredMainPath = Join-Path $mainDir $requiredMainName
+            if (-not (Test-Path -LiteralPath $requiredMainPath -PathType Leaf)) {
+              throw "Required Release main module is missing: $requiredMainName"
+            }
+          }
+          $unexpectedVmModules = @(
+            Get-ChildItem -LiteralPath $mainDir -File -Filter '*x64*.dll' |
+              Where-Object { $_.Name -notin @('cgamex64.dll', 'qagamex64.dll', 'uix64.dll') }
+          )
+          if ($unexpectedVmModules.Count -ne 0) {
+            throw "Unexpected or Debug VM modules found: $($unexpectedVmModules.Name -join ', ')"
+          }
+
+          $filesBeforeSums = @(Get-ChildItem -LiteralPath $release -Recurse -File | Sort-Object FullName)
+          $sumLines = foreach ($file in $filesBeforeSums) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            "$hash  $relative"
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'SHA256SUMS.txt'),
+            (($sumLines -join "`r`n") + "`r`n"),
+            $utf8NoBom
+          )
+
+          $finalFiles = @(Get-ChildItem -LiteralPath $release -Recurse -File | Sort-Object FullName)
+          $totalBytes = [int64](($finalFiles | Measure-Object -Property Length -Sum).Sum)
+          $totalMiB = [math]::Round($totalBytes / 1MB, 2)
+
+          # The often-quoted ~57 MiB is the compressed GitHub artifact size.
+          # The directory itself is expected to be about 124 MiB because the
+          # production package contains DLSS, DLSSD, DLSS-G, DXC/DXIL and
+          # Streamline runtime DLLs. Validate the uncompressed package separately.
+          if ($totalBytes -lt 100MB) {
+            throw "Full production runtime is unexpectedly small: $totalMiB MiB. DLSS/Streamline DLLs or main modules may be missing."
+          }
+          if ($totalBytes -gt 160MB) {
+            throw "Full production runtime is unexpectedly large: $totalMiB MiB. Non-runtime files may have been included."
+          }
+
+          # Produce a temporary compressed-size audit without nesting a ZIP in the
+          # downloadable artifact. upload-artifact performs its own compression.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $auditZip = Join-Path $env:RUNNER_TEMP 'DarkWolf-Exp22.6-Performance-Lifecycle-Release-audit.zip'
+          if (Test-Path -LiteralPath $auditZip) {
+            Remove-Item -LiteralPath $auditZip -Force
+          }
+          [IO.Compression.ZipFile]::CreateFromDirectory(
+            $release,
+            $auditZip,
+            [IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
+          $compressedBytes = (Get-Item -LiteralPath $auditZip).Length
+          $compressedMiB = [math]::Round($compressedBytes / 1MB, 2)
+          Write-Host "EXP22_6_COMPRESSED_SIZE_AUDIT BYTES=$compressedBytes MIB=$compressedMiB"
+          if ($compressedBytes -lt 30MB -or $compressedBytes -gt 90MB) {
+            Write-Warning "Compressed-size audit is outside the expected broad range: $compressedMiB MiB"
+          }
+
+          $contentsLines = foreach ($file in $finalFiles) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            '{0,12}  {1}' -f $file.Length, $relative
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $release 'FULL_RELEASE_CONTENTS.txt'),
+            ((@("TOTAL_BYTES=$totalBytes", "TOTAL_MIB=$totalMiB", '') + $contentsLines) -join "`r`n") + "`r`n",
+            $utf8NoBom
+          )
+
+          Write-Host "EXP22_6_FULL_PRODUCTION_PACKAGE=PASS FILES=$($finalFiles.Count) TOTAL_BYTES=$totalBytes TOTAL_MIB=$totalMiB COMPRESSED_AUDIT_MIB=$compressedMiB WolfSP_SHA256=$exeSha SOURCE_DIFF_SHA256=$sourceDiffSha"
+          foreach ($file in $finalFiles) {
+            $relative = $file.FullName.Substring($release.Length).TrimStart('\', '/').Replace('\', '/')
+            Write-Host ("ARTIFACT_FILE {0} {1}" -f $file.Length, $relative)
+          }
+
+      - name: Upload EXP22.6 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Exact-Patch-v7-Failure-Diagnostics
+          path: |
+            kit/ci/exp22_6/SOURCE_CONTRACT_SUMMARY.txt
+            kit/ci/exp22_6/SOURCE_INPUT_SHA256SUMS.txt
+            kit/ci/exp22_6/SOURCE_OUTPUT_SHA256SUMS.txt
+            kit/ci/exp22_6/350-d3d12-performance-lifecycle-exp22_6-exact.patch
+            work/EXP22_6_SOURCE_CONTRACT.txt
+            work/EXP22_6_SOURCE_INPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_OUTPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_DIFF.patch
+            work/src/opengl/opengl.h
+            work/src/opengl/gl_d3d12raylight.cpp
+            work/src/opengl/gl_d3d12shim.cpp
+            work/src/renderer/tr_backend.cpp
+            work/src/renderer/tr_cmds.cpp
+            work/src/renderer/tr_cmesh.cpp
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 14
+
+      - name: Upload complete production game runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Performance-Lifecycle-Release-v7
+          path: work/release-darkwolf-exp22_6-performance-lifecycle/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+      - name: Upload EXP22.6 source audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.6-Source-Audit-v7
+          path: |
+            work/EXP22_6_SOURCE_DIFF.patch
+            work/EXP22_6_SOURCE_CONTRACT.txt
+            work/EXP22_6_SOURCE_INPUT_SHA256SUMS.txt
+            work/EXP22_6_SOURCE_OUTPUT_SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
