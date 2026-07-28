@@ -1,4 +1,4 @@
-name: Start DarkWolf EXP22.6 Exact v7 Once
+name: Repair and Start DarkWolf EXP22.6 Exact v7 Once
 
 on:
   push:
@@ -12,9 +12,90 @@ permissions:
   contents: write
 
 jobs:
-  dispatch:
+  repair-dispatch-monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     steps:
+      - name: Repair v7 exact-patch validation scope
+        id: repair
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          WORKFLOW_PATH: .github/workflows/darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml
+        run: |
+          set -euo pipefail
+
+          response_file="$RUNNER_TEMP/workflow-response.json"
+          original_file="$RUNNER_TEMP/workflow-original.yml"
+          repaired_file="$RUNNER_TEMP/workflow-repaired.yml"
+
+          gh api "repos/${REPOSITORY}/contents/${WORKFLOW_PATH}?ref=main" > "$response_file"
+          workflow_sha=$(python3 - "$response_file" "$original_file" <<'PY'
+          import base64
+          import json
+          import sys
+
+          response_path, output_path = sys.argv[1:3]
+          with open(response_path, 'r', encoding='utf-8') as stream:
+              payload = json.load(stream)
+          content = base64.b64decode(payload['content']).decode('utf-8')
+          with open(output_path, 'w', encoding='utf-8', newline='') as stream:
+              stream.write(content)
+          print(payload['sha'])
+          PY
+          )
+
+          repair_result=$(python3 - "$original_file" "$repaired_file" <<'PY'
+          import sys
+
+          source_path, output_path = sys.argv[1:3]
+          with open(source_path, 'r', encoding='utf-8', newline='') as stream:
+              text = stream.read()
+
+          old = "          git diff --check\n"
+          new = "          git diff --check -- $sourceFiles\n"
+          old_count = text.count(old)
+          new_count = text.count(new)
+
+          if old_count == 1 and new_count == 0:
+              text = text.replace(old, new, 1)
+              result = 'UPDATED'
+          elif old_count == 0 and new_count == 1:
+              result = 'ALREADY_FIXED'
+          else:
+              raise SystemExit(
+                  f'Unexpected v7 validation markers: old_count={old_count} new_count={new_count}'
+              )
+
+          with open(output_path, 'w', encoding='utf-8', newline='') as stream:
+              stream.write(text)
+          print(result)
+          PY
+          )
+
+          echo "EXP22_6_V7_REPAIR_RESULT=${repair_result}"
+          if [[ "$repair_result" == 'UPDATED' ]]; then
+            encoded=$(base64 -w 0 < "$repaired_file")
+            gh api --method PUT "repos/${REPOSITORY}/contents/${WORKFLOW_PATH}" \
+              -f message='Fix EXP22.6 v7 whitespace validation scope' \
+              -f content="$encoded" \
+              -f sha="$workflow_sha" \
+              -f branch='main' >/dev/null
+          fi
+
+          for attempt in $(seq 1 30); do
+            current=$(gh api "repos/${REPOSITORY}/contents/${WORKFLOW_PATH}?ref=main" --jq '.content' | tr -d '\n' | base64 -d)
+            if grep -Fq 'git diff --check -- $sourceFiles' <<< "$current"; then
+              echo 'EXP22_6_V7_REPAIR=PASS'
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo 'The repaired v7 workflow was not visible on main after update.' >&2
+          exit 1
+
       - name: Dispatch and monitor EXP22.6 Exact v7
         id: exp226
         shell: bash
@@ -40,15 +121,15 @@ jobs:
             existing_sha=$(gh api "repos/${REPOSITORY}/contents/${STATUS_PATH}?ref=main" --jq '.sha' 2>/dev/null || true)
             if [[ -n "$existing_sha" ]]; then
               gh api --method PUT "repos/${REPOSITORY}/contents/${STATUS_PATH}" \
-                -f message="Update EXP22.6 child run status" \
+                -f message='Update EXP22.6 child run status' \
                 -f content="$encoded" \
                 -f sha="$existing_sha" \
-                -f branch="main" >/dev/null
+                -f branch='main' >/dev/null
             else
               gh api --method PUT "repos/${REPOSITORY}/contents/${STATUS_PATH}" \
-                -f message="Record EXP22.6 child run status" \
+                -f message='Record EXP22.6 child run status' \
                 -f content="$encoded" \
-                -f branch="main" >/dev/null
+                -f branch='main' >/dev/null
             fi
           }
 
@@ -56,12 +137,12 @@ jobs:
           gh workflow run "$WORKFLOW" --repo "$REPOSITORY" --ref main
 
           child_run_id=''
-          for attempt in $(seq 1 60); do
+          for attempt in $(seq 1 90); do
             child_run_id=$(gh run list \
               --repo "$REPOSITORY" \
               --workflow "$WORKFLOW" \
               --event workflow_dispatch \
-              --limit 20 \
+              --limit 30 \
               --json databaseId,createdAt \
               --jq ".[] | select((.createdAt | fromdateiso8601) >= ${start_epoch}) | .databaseId" \
               | head -n 1 || true)
@@ -100,7 +181,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: EXP22.6-v7-Collected-Child-Artifacts
+          name: EXP22.6-v7-Repaired-Collected-Child-Artifacts
           path: child-artifacts
           if-no-files-found: warn
           retention-days: 14
