@@ -1,0 +1,21 @@
+name: Start DarkWolf EXP22.6 Exact v7 Once
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/start-exp22_6-v7-once.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch EXP22.6 Exact v7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml --ref main
