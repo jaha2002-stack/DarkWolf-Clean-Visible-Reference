@@ -9,7 +9,7 @@ on:
 
 permissions:
   actions: write
-  contents: read
+  contents: write
 
 jobs:
   dispatch:
@@ -17,6 +17,90 @@ jobs:
     steps:
       - name: Dispatch and monitor EXP22.6 Exact v7
         id: exp226
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: j
+          REPOSITORY: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          WORKFLOW: darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml
+          STATUS_PATH: ci/EXP22_6_LAST_RUN.txt
+        run: |
+          set -euo pipefail
+
+          publish_status() {
+            local status="$1"
+            local conclusion="$2"
+            local child_run_id="$3"
+            local child_url="https://github.com/${REPOSITORY}/actions/runs/${child_run_id}"
+            local body
+            body=$(printf 'RUN_ID=%s\nSTATUS=%s\nCONCLUSION=%s\nURL=%s\nUPDATED_AT=%s\n' \
+              "$child_run_id" "$status" "$conclusion" "$child_url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+            local encoded
+            encoded=$(printf '%s' "$body" | base64 -w 0)
+            local existing_sha
+            existing_sha=$(gh api "repos/${REPOSITORY}/contents/${STATUS_PATH}?ref=main" --jq '.sha' 2>/dev/null || true)
+            if [[ -n "$existing_sha" ]]; then
+              gh api --method PUT "repos/${REPOSITORY}/contents/${STATUS_PATH}" \
+                -f message="Update EXP22.6 child run status" \
+                -f content="$encoded" \
+                -f sha="$existing_sha" \
+                -f branch="main" >/dev/null
+            else
+              gh api --method PUT "repos/${REPOSITORY}/contents/${STATUS_PATH}" \
+                -f message="Record EXP22.6 child run status" \
+                -f content="$encoded" \
+                -f branch="main" >/dev/null
+            fi
+          }
+
+          start_epoch=$(date -u +%s)
+          gh workflow run "$WORKFLOW" --repo "$REPOSITORY" --ref main
+
+          child_run_id=''
+          for attempt in $(seq 1 60); do
+            child_run_id=$(gh run list \
+              --repo "$REPOSITORY" \
+              --workflow "$WORKFLOW" \
+              --event workflow_dispatch \
+              --limit 20 \
+              --json databaseId,createdAt \
+              --jq ".[] | select((.createdAt | fromdateiso8601) >= ${start_epoch}) | .databaseId" \
+              | head -n 1 || true)
+            if [[ -n "$child_run_id" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ -z "$child_run_id" ]]; then
+            echo 'Unable to resolve the dispatched EXP22.6 child run ID.' >&2
+            exit 1
+          fi
+
+          echo "EXP22_6_CHILD_RUN_ID=${child_run_id}"
+          echo "run_id=${child_run_id}" >> "$GITHUB_OUTPUT"
+          publish_status 'IN_PROGRESS' '' "$child_run_id"
+
+          set +e
+          gh run watch "$child_run_id" --repo "$REPOSITORY" --exit-status --interval 10
+          watch_exit=$?
+          set -e
+
+          conclusion=$(gh run view "$child_run_id" --repo "$REPOSITORY" --json conclusion --jq '.conclusion // "unknown"')
+          echo "EXP22_6_CHILD_CONCLUSION=${conclusion}"
+
+          mkdir -p child-artifacts
+          gh run download "$child_run_id" --repo "$REPOSITORY" --dir child-artifacts || true
+          publish_status 'COMPLETED' "$conclusion" "$child_run_id"
+
+          if [[ $watch_exit -ne 0 ]]; then
+            exit "$watch_exit"
+          fi
+
+      - name: Upload collected EXP22.6 child artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EXP22.6-v7-Collected-Child-Artifacts
+          path: child-artifacts
+          if-no-files-found: warn
+          retention-days: 14
