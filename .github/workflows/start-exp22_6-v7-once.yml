@@ -15,7 +15,8 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch EXP22.6 Exact v7
+      - name: Dispatch and monitor EXP22.6 Exact v7
+        id: exp226
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run darkwolf-d3d12-performance-lifecycle-exp22_6-exact-v7.yml --ref main
+          REPOSITORY: j
