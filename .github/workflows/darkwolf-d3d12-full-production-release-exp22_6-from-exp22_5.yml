@@ -9,7 +9,8 @@ on:
       - '.github/workflows/darkwolf-d3d12-full-production-release-exp22_6-from-exp22_5.yml'
       - 'ci/exp22_6/recover_exp224_payload.ps1'
       - 'ci/exp22_6/apply_exact_patch.ps1'
-      - 'ci/exp22_6/build_and_package.ps1'
+      - 'ci/exp22_6/compile_exp226.ps1'
+      - 'ci/exp22_6/package_exp226.ps1'
 
 permissions:
   contents: read
@@ -73,10 +74,15 @@ jobs:
             -RepositoryRoot "$env:GITHUB_WORKSPACE/kit" `
             -WorkRoot "$env:GITHUB_WORKSPACE/work"
 
-      - name: Rebuild and package complete EXP22.6 Release x64 runtime
+      - name: Compile EXP22.6 with isolated deterministic project graph
         shell: pwsh
         run: |
-          ./kit/ci/exp22_6/build_and_package.ps1 -WorkRoot "$env:GITHUB_WORKSPACE/work"
+          ./kit/ci/exp22_6/compile_exp226.ps1 -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Package complete EXP22.6 Release x64 runtime
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_6/package_exp226.ps1 -WorkRoot "$env:GITHUB_WORKSPACE/work"
 
       - name: Upload EXP22.6 failure diagnostics
         if: failure()
@@ -89,6 +95,9 @@ jobs:
             work/ci/exp22_6/SOURCE_OUTPUT_SHA256SUMS.txt
             work/ci/exp22_6/350-d3d12-performance-lifecycle-exp22_6-exact.patch
             work/ci/exp22_6/EXP22_6_SOURCE_DIFF.patch
+            work/ci/exp22_6/BUILD_GRAPH_AUDIT.txt
+            work/ci/exp22_6/EXP22_6_COMPILE_MANIFEST.txt
+            work/ci/exp22_6/build_logs/**
             work/src/opengl/opengl.h
             work/src/opengl/gl_d3d12raylight.cpp
             work/src/opengl/gl_d3d12shim.cpp
@@ -117,6 +126,8 @@ jobs:
             work/ci/exp22_6/SOURCE_CONTRACT_SUMMARY.txt
             work/ci/exp22_6/SOURCE_INPUT_SHA256SUMS.txt
             work/ci/exp22_6/SOURCE_OUTPUT_SHA256SUMS.txt
+            work/ci/exp22_6/BUILD_GRAPH_AUDIT.txt
+            work/ci/exp22_6/EXP22_6_COMPILE_MANIFEST.txt
           if-no-files-found: error
           compression-level: 6
           retention-days: 30
