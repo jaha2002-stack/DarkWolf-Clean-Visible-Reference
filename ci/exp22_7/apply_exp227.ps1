@@ -8,21 +8,15 @@ $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath $RepositoryRoot).Path
 $work = (Resolve-Path -LiteralPath $WorkRoot).Path
 $kit = Join-Path $repo 'ci/exp22_7'
-$patch = Join-Path $kit '360-d3d12-static-dynamic-hit-table-exp22_7.patch'
+$patchSource = Join-Path $kit '360-d3d12-static-dynamic-hit-table-exp22_7.patch'
 $inputManifest = Join-Path $kit 'SOURCE_INPUT_SHA256SUMS.txt'
 $outputManifest = Join-Path $kit 'SOURCE_OUTPUT_SHA256SUMS.txt'
 $contract = Join-Path $kit 'SOURCE_CONTRACT_SUMMARY.txt'
 
-foreach ($required in @($patch,$inputManifest,$outputManifest,$contract)) {
+foreach ($required in @($patchSource,$inputManifest,$outputManifest,$contract)) {
   if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
     throw "Required EXP22.7 kit file is missing: $required"
   }
-}
-
-$expectedPatchSha = '04998D9BA9717F6D1612B3A8F39B48F0E8F92AE3494F8C037F376B176DC22444'
-$actualPatchSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $patch).Hash
-if ($actualPatchSha -ne $expectedPatchSha) {
-  throw "EXP22.7 patch hash mismatch. Expected=$expectedPatchSha Actual=$actualPatchSha"
 }
 
 $sourceFiles = @(
@@ -30,6 +24,79 @@ $sourceFiles = @(
   'src/opengl/opengl.h',
   'src/renderer/tr_cmds.cpp'
 )
+
+function Get-Sha256Hex {
+  param([Parameter(Mandatory=$true)][byte[]]$Bytes)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '')
+  }
+  finally {
+    $sha.Dispose()
+  }
+}
+
+# GitHub stores the patch as canonical LF text, but a Windows checkout can
+# materialize it as CRLF before this script starts. Raw-byte hashing therefore
+# produced a false mismatch even though the patch content was unchanged.
+# Validate the canonical UTF-8/LF representation and apply that exact copy.
+$expectedCanonicalPatchSha = '04998D9BA9717F6D1612B3A8F39B48F0E8F92AE3494F8C037F376B176DC22444'
+$rawPatchBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $patchSource))
+$rawPatchSha = Get-Sha256Hex -Bytes $rawPatchBytes
+$utf8Strict = [Text.UTF8Encoding]::new($false, $true)
+try {
+  $patchText = $utf8Strict.GetString($rawPatchBytes)
+}
+catch {
+  throw "EXP22.7 patch is not valid UTF-8 text: $($_.Exception.Message)"
+}
+if ($patchText.Length -gt 0 -and $patchText[0] -eq [char]0xFEFF) {
+  $patchText = $patchText.Substring(1)
+}
+$crlfCount = ([regex]::Matches($patchText, "`r`n")).Count
+$canonicalPatchText = $patchText.Replace("`r`n", "`n").Replace("`r", "`n")
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+$canonicalPatchBytes = $utf8NoBom.GetBytes($canonicalPatchText)
+$canonicalPatchSha = Get-Sha256Hex -Bytes $canonicalPatchBytes
+if ($canonicalPatchSha -ne $expectedCanonicalPatchSha) {
+  throw "EXP22.7 canonical patch hash mismatch. Expected=$expectedCanonicalPatchSha Actual=$canonicalPatchSha Raw=$rawPatchSha"
+}
+
+$canonicalPatch = Join-Path $env:RUNNER_TEMP 'exp22_7-static-dynamic-hit-table-canonical-lf.patch'
+[IO.File]::WriteAllBytes($canonicalPatch, $canonicalPatchBytes)
+
+$auditDir = Join-Path $work 'ci/exp22_7'
+New-Item -ItemType Directory -Path $auditDir -Force | Out-Null
+$transportAudit = @(
+  'DARKWOLF_EXP22_7_PATCH_TRANSPORT_AUDIT',
+  "SourcePath=$patchSource",
+  "RawSHA256=$rawPatchSha",
+  "CanonicalLFSHA256=$canonicalPatchSha",
+  "ExpectedCanonicalLFSHA256=$expectedCanonicalPatchSha",
+  "RawBytes=$($rawPatchBytes.Length)",
+  "CanonicalBytes=$($canonicalPatchBytes.Length)",
+  "CRLFSequences=$crlfCount",
+  'CanonicalEncoding=UTF-8-no-BOM',
+  'CanonicalLineEnding=LF'
+)
+[IO.File]::WriteAllLines(
+  (Join-Path $auditDir 'PATCH_TRANSPORT_AUDIT.txt'),
+  $transportAudit,
+  $utf8NoBom)
+[IO.File]::WriteAllBytes(
+  (Join-Path $auditDir '360-d3d12-static-dynamic-hit-table-exp22_7-canonical-lf.patch'),
+  $canonicalPatchBytes)
+
+function Normalize-SourceToCanonicalLf {
+  param([Parameter(Mandatory=$true)][string]$RelativePath)
+  $path = Join-Path $work $RelativePath
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    throw "EXP22.7 source file is missing before normalization: $RelativePath"
+  }
+  $body = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $path))
+  $normalized = $body.Replace("`r`n", "`n").Replace("`r", "`n")
+  [IO.File]::WriteAllText($path, $normalized, $utf8NoBom)
+}
 
 function Test-Manifest {
   param(
@@ -65,16 +132,20 @@ try {
   git config core.eol lf
   if ($LASTEXITCODE -ne 0) { throw 'Unable to select LF line endings.' }
 
+  foreach ($sourceFile in $sourceFiles) {
+    Normalize-SourceToCanonicalLf -RelativePath $sourceFile
+  }
+
   Test-Manifest -Manifest $inputManifest -Phase 'INPUT'
 
-  git apply --check --whitespace=error-all -- $patch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 patch pre-apply check failed.' }
-  git apply --whitespace=error-all -- $patch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 patch application failed.' }
+  git apply --check --whitespace=error-all -- $canonicalPatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical patch pre-apply check failed.' }
+  git apply --whitespace=error-all -- $canonicalPatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical patch application failed.' }
   git diff --check -- $sourceFiles
   if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 source diff contains whitespace errors.' }
-  git apply --reverse --check -- $patch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 reverse patch verification failed.' }
+  git apply --reverse --check -- $canonicalPatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical reverse patch verification failed.' }
 
   Test-Manifest -Manifest $outputManifest -Phase 'OUTPUT'
 
@@ -110,17 +181,16 @@ try {
   if ([string]::IsNullOrWhiteSpace($diffText)) {
     throw 'EXP22.7 patch produced no source diff.'
   }
-  $auditDir = Join-Path $work 'ci/exp22_7'
-  New-Item -ItemType Directory -Path $auditDir -Force | Out-Null
   [IO.File]::WriteAllText(
     (Join-Path $auditDir 'EXP22_7_SOURCE_DIFF.patch'),
     ($diffText + "`n"),
-    [Text.UTF8Encoding]::new($false))
+    $utf8NoBom)
   Copy-Item -LiteralPath $inputManifest -Destination (Join-Path $auditDir 'SOURCE_INPUT_SHA256SUMS.txt') -Force
   Copy-Item -LiteralPath $outputManifest -Destination (Join-Path $auditDir 'SOURCE_OUTPUT_SHA256SUMS.txt') -Force
   Copy-Item -LiteralPath $contract -Destination (Join-Path $auditDir 'SOURCE_CONTRACT_SUMMARY.txt') -Force
 
-  Write-Host "EXP22_7_PATCH=PASS SHA256=$actualPatchSha FILES=3"
+  Write-Host "EXP22_7_PATCH_TRANSPORT=PASS RAW_SHA256=$rawPatchSha CANONICAL_LF_SHA256=$canonicalPatchSha CRLF=$crlfCount"
+  Write-Host "EXP22_7_PATCH=PASS SHA256=$canonicalPatchSha FILES=3"
   Write-Host 'EXP22_7_SOURCE_AUDIT=PASS'
 }
 finally {
