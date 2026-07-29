@@ -30,23 +30,56 @@ jobs:
           persist-credentials: false
           path: kit
 
+      - name: Checkout exact EXP22.8 baseline kit source
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: ef4c951f2c880e41c88094e937aa91fcc4efea12
+          fetch-depth: 1
+          persist-credentials: false
+          path: exp228kit
+
       - name: Expand and verify EXP22.8 baseline kit
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'kit/ci/exp22_8/DarkWolf_EXP22_8_Persistent_Dynamic_SBT_GitHub_Kit.zip'
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'exp228kit/ci/exp22_8/DarkWolf_EXP22_8_Persistent_Dynamic_SBT_GitHub_Kit.zip'
           $expected = 'F7DEF4E8161FECBE8C35846B6101684074E47D87B800E5F4A6AF8392B26C302C'
-          if (-not (Test-Path $archive -PathType Leaf)) { throw "EXP22.8 baseline kit missing: $archive" }
-          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash
-          if ($actual -ne $expected) { throw "EXP22.8 baseline kit hash mismatch Expected=$expected Actual=$actual" }
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "EXP22.8 baseline kit missing at exact commit ef4c951f2c880e41c88094e937aa91fcc4efea12: $archive"
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
+          if ($actual -ne $expected) {
+            throw "EXP22.8 baseline kit hash mismatch. Expected=$expected Actual=$actual"
+          }
           $temp = Join-Path $env:RUNNER_TEMP 'exp22_8-baseline-kit'
-          if (Test-Path $temp) { Remove-Item $temp -Recurse -Force }
-          Expand-Archive $archive $temp -Force
+          if (Test-Path -LiteralPath $temp) {
+            Remove-Item -LiteralPath $temp -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $temp -Force
           $source = Join-Path $temp 'ci/exp22_8'
+          if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+            throw "Expanded EXP22.8 payload directory is missing: $source"
+          }
           $destination = Join-Path $env:GITHUB_WORKSPACE 'kit/ci/exp22_8'
-          Get-ChildItem $destination -Force | Where-Object Name -ne 'DarkWolf_EXP22_8_Persistent_Dynamic_SBT_GitHub_Kit.zip' | Remove-Item -Recurse -Force
-          Copy-Item (Join-Path $source '*') $destination -Recurse -Force
-          Write-Host "EXP22_8_BASELINE_PAYLOAD=PASS SHA256=$actual"
+          if (Test-Path -LiteralPath $destination) {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Copy-Item -LiteralPath (Join-Path $source '*') -Destination $destination -Recurse -Force
+          foreach ($required in @(
+            'apply_exp228.ps1',
+            'compile_exp228.ps1',
+            'package_exp228.ps1',
+            'SOURCE_INPUT_SHA256SUMS.txt',
+            'SOURCE_OUTPUT_SHA256SUMS.txt'
+          )) {
+            $requiredPath = Join-Path $destination $required
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+              throw "Required EXP22.8 baseline file is missing after extraction: $requiredPath"
+            }
+          }
+          Write-Host "EXP22_8_BASELINE_PAYLOAD=PASS COMMIT=ef4c951f2c880e41c88094e937aa91fcc4efea12 SHA256=$actual"
 
       - name: Checkout exact EXP22.4 donor
         uses: actions/checkout@v4
