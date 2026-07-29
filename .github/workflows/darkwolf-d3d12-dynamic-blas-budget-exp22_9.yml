@@ -30,67 +30,73 @@ jobs:
           persist-credentials: false
           path: kit
 
-      - name: Checkout exact EXP22.8 baseline kit source
+      - name: Checkout exact unpacked EXP22.8 payload
         uses: actions/checkout@v4
         with:
           repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
-          ref: ef4c951f2c880e41c88094e937aa91fcc4efea12
+          ref: 4e83e3e33faac038e5c9ee572d6f0f7c9e6ca523
           fetch-depth: 1
           persist-credentials: false
-          path: exp228kit
+          path: exp228payload
 
-      - name: Expand and verify EXP22.8 baseline kit
+      - name: Install and verify unpacked EXP22.8 payload
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $archive = Join-Path $env:GITHUB_WORKSPACE 'exp228kit/ci/exp22_8/DarkWolf_EXP22_8_Persistent_Dynamic_SBT_GitHub_Kit.zip'
-          $expected = 'F508891F491C4EAACF38BD1E41696FF6F7E8CC52971AF91631EA6EF9F3807754'
-          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-            throw "EXP22.8 baseline kit missing at exact commit ef4c951f2c880e41c88094e937aa91fcc4efea12: $archive"
-          }
-          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash
-          if ($actual -ne $expected) {
-            throw "EXP22.8 baseline kit hash mismatch. Expected=$expected Actual=$actual"
-          }
-          $temp = Join-Path $env:RUNNER_TEMP 'exp22_8-baseline-kit'
-          if (Test-Path -LiteralPath $temp) {
-            Remove-Item -LiteralPath $temp -Recurse -Force
-          }
-          New-Item -ItemType Directory -Path $temp -Force | Out-Null
-          $tar = (Get-Command tar.exe -ErrorAction Stop).Source
-          & $tar -tf $archive | Out-Null
-          $listExit = $LASTEXITCODE
-          if ($listExit -ne 0) {
-            throw "EXP22.8 baseline ZIP validation failed. tar exit code=$listExit"
-          }
-          & $tar -xf $archive -C $temp
-          $extractExit = $LASTEXITCODE
-          if ($extractExit -ne 0) {
-            throw "EXP22.8 baseline ZIP extraction failed. tar exit code=$extractExit"
-          }
-          $source = Join-Path $temp 'ci/exp22_8'
-          if (-not (Test-Path -LiteralPath $source -PathType Container)) {
-            throw "Expanded EXP22.8 payload directory is missing: $source"
-          }
+          Set-StrictMode -Version Latest
+
+          $source = Join-Path $env:GITHUB_WORKSPACE 'exp228payload/ci/exp22_8'
           $destination = Join-Path $env:GITHUB_WORKSPACE 'kit/ci/exp22_8'
+          if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+            throw "EXP22.8 unpacked payload directory is missing: $source"
+          }
+
+          $required = @(
+            'apply_exp228.ps1',
+            '420-d3d12-persistent-dynamic-sbt-exp22_8.patch',
+            'SOURCE_INPUT_SHA256SUMS.txt',
+            'SOURCE_OUTPUT_SHA256SUMS.txt',
+            'SOURCE_CONTRACT_SUMMARY.txt'
+          )
+          foreach ($name in $required) {
+            $path = Join-Path $source $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Required EXP22.8 payload file is missing: $path"
+            }
+          }
+
+          $patchPath = Join-Path $source '420-d3d12-persistent-dynamic-sbt-exp22_8.patch'
+          $patchText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $patchPath))
+          $patchText = $patchText.Replace("`r`n", "`n").Replace("`r", "`n")
+          $utf8NoBom = [Text.UTF8Encoding]::new($false)
+          $patchBytes = $utf8NoBom.GetBytes($patchText)
+          $sha = [Security.Cryptography.SHA256]::Create()
+          try {
+            $patchSha = ([BitConverter]::ToString($sha.ComputeHash($patchBytes))).Replace('-', '')
+          }
+          finally {
+            $sha.Dispose()
+          }
+          $expectedPatchSha = 'D9DAE13EA2DA365EFCFC11A9F42F5F78B1D0673516E589DEDB4F87287B660BE3'
+          if ($patchSha -ne $expectedPatchSha) {
+            throw "EXP22.8 unpacked patch hash mismatch. Expected=$expectedPatchSha Actual=$patchSha"
+          }
+
           if (Test-Path -LiteralPath $destination) {
             Remove-Item -LiteralPath $destination -Recurse -Force
           }
           New-Item -ItemType Directory -Path $destination -Force | Out-Null
-          Copy-Item -LiteralPath (Join-Path $source '*') -Destination $destination -Recurse -Force
-          foreach ($required in @(
-            'apply_exp228.ps1',
-            'compile_exp228.ps1',
-            'package_exp228.ps1',
-            'SOURCE_INPUT_SHA256SUMS.txt',
-            'SOURCE_OUTPUT_SHA256SUMS.txt'
-          )) {
-            $requiredPath = Join-Path $destination $required
-            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-              throw "Required EXP22.8 baseline file is missing after extraction: $requiredPath"
+          Get-ChildItem -LiteralPath $source -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
+          }
+
+          foreach ($name in $required) {
+            $path = Join-Path $destination $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "EXP22.8 payload copy verification failed: $path"
             }
           }
-          Write-Host "EXP22_8_BASELINE_PAYLOAD=PASS COMMIT=ef4c951f2c880e41c88094e937aa91fcc4efea12 SHA256=$actual EXTRACTOR=bsdtar"
+          Write-Host "EXP22_8_UNPACKED_PAYLOAD=PASS COMMIT=4e83e3e33faac038e5c9ee572d6f0f7c9e6ca523 PATCH_SHA256=$patchSha"
 
       - name: Checkout exact EXP22.4 donor
         uses: actions/checkout@v4
