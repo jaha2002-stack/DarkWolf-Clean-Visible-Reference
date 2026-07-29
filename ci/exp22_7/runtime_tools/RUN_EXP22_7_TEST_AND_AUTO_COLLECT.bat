@@ -1,19 +1,19 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 
-set "ROOT=%~dp0"
-set "SCRIPT=%ROOT%EXP22_7_TEST_AND_AUTO_COLLECT.ps1"
-set "RESULTS=%ROOT%EXP22_7_RESULTS"
+set "ROOT=%CD%"
+set "SCRIPT=%ROOT%\EXP22_7_TEST_AND_AUTO_COLLECT.ps1"
+set "RESULTS=%ROOT%\EXP22_7_RESULTS"
 set "LASTERROR=%RESULTS%\EXP22_7_COLLECTOR_LAST_ERROR.txt"
 
 if not exist "%RESULTS%" mkdir "%RESULTS%" >nul 2>nul
 if exist "%LASTERROR%" del /q "%LASTERROR%" >nul 2>nul
 
-if not exist "%ROOT%WolfSP.exe" (
+if not exist "%ROOT%\WolfSP.exe" (
   echo.
   echo ERROR: WolfSP.exe was not found next to this BAT file.
-  echo Expected: %ROOT%WolfSP.exe
+  echo Expected: %ROOT%\WolfSP.exe
   goto :failed
 )
 
@@ -24,16 +24,14 @@ if not exist "%SCRIPT%" (
   goto :failed
 )
 
-where pwsh.exe >nul 2>nul
-if errorlevel 1 (
-  set "PSEXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-) else (
-  set "PSEXE=pwsh.exe"
-)
+set "PSEXE="
+for /f "delims=" %%I in ('where pwsh.exe 2^>nul') do if not defined PSEXE set "PSEXE=%%I"
+if not defined PSEXE set "PSEXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-if not exist "%PSEXE%" if /i not "%PSEXE%"=="pwsh.exe" (
+if not exist "%PSEXE%" (
   echo.
   echo ERROR: PowerShell was not found.
+  echo Expected: %PSEXE%
   goto :failed
 )
 
@@ -43,11 +41,14 @@ echo ==============================================================
 echo Game root : %ROOT%
 echo PowerShell: %PSEXE%
 echo.
-echo The game should start now. Close the game normally when the test is done.
-echo The collector will then create a ZIP archive automatically.
+echo The game should start now. Close it normally after the test.
+echo A ZIP archive will then be created automatically.
 echo.
 
-"%PSEXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -GameRoot "%ROOT%" -Profile "darkwolf_exp22_7_production.cfg"
+rem Do not pass GameRoot here. The PowerShell script is stored beside WolfSP.exe
+rem and uses its own PSScriptRoot. This avoids Windows quoting problems caused
+rem by a quoted path ending in a backslash, for example "D:\DarkWolf\".
+"%PSEXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Profile "darkwolf_exp22_7_production.cfg"
 set "RC=%ERRORLEVEL%"
 
 if not "%RC%"=="0" (
