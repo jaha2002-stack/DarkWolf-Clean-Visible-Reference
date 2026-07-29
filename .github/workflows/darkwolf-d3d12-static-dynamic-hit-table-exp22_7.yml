@@ -1,0 +1,134 @@
+name: DarkWolf EXP22.7 Static Dynamic Hit Table Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/darkwolf-d3d12-static-dynamic-hit-table-exp22_7.yml'
+      - 'ci/exp22_7/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darkwolf-exp22-7-static-dynamic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout current workflow kit
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+          path: kit
+
+      - name: Checkout exact EXP22.4 donor snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 7a5b93de850c2ac2d172af53ac26923fad9af1cd
+          fetch-depth: 1
+          persist-credentials: false
+          path: donor
+
+      - name: Checkout exact Stable Clear v2.2 source
+        uses: actions/checkout@v4
+        with:
+          repository: jaha2002-stack/DarkWolf-Clean-Visible-Reference
+          ref: 229cd5d93b4c24ba705c9821a871cccf31b34b96
+          fetch-depth: 1
+          persist-credentials: false
+          path: work
+
+      - name: Recover and verify proven EXP22.4 payload
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_6/recover_exp224_payload.ps1 `
+            -DonorRoot "$env:GITHUB_WORKSPACE/donor" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Rebuild exact validated chain through EXP22.4
+        shell: pwsh
+        working-directory: work
+        run: ./scripts/build_exp224.ps1 -Configuration 'Release'
+
+      - name: Apply and verify EXP22.6 lifecycle baseline
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_6/apply_exact_patch.ps1 `
+            -RepositoryRoot "$env:GITHUB_WORKSPACE/kit" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Apply and verify EXP22.7 static dynamic incremental patch
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_7/apply_exp227.ps1 `
+            -RepositoryRoot "$env:GITHUB_WORKSPACE/kit" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Compile EXP22.7 with isolated Release x64 graph
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_7/compile_exp227.ps1 `
+            -RepositoryRoot "$env:GITHUB_WORKSPACE/kit" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Package complete EXP22.7 runtime
+        shell: pwsh
+        run: |
+          ./kit/ci/exp22_7/package_exp227.ps1 `
+            -RepositoryRoot "$env:GITHUB_WORKSPACE/kit" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/work"
+
+      - name: Upload EXP22.7 failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.7-Failure-Diagnostics
+          path: |
+            work/ci/exp22_6/build_logs/**
+            work/ci/exp22_6/BUILD_GRAPH_AUDIT.txt
+            work/ci/exp22_6/EXP22_6_COMPILE_MANIFEST.txt
+            work/ci/exp22_7/**
+            work/src/opengl/gl_d3d12raylight.cpp
+            work/src/opengl/opengl.h
+            work/src/renderer/tr_cmds.cpp
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 14
+
+      - name: Upload complete EXP22.7 production runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.7-Full-Production-Release
+          path: work/release-darkwolf-exp22_7-static-dynamic-hit-table/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
+
+      - name: Upload EXP22.7 source audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWolf-Exp22.7-Source-Audit
+          path: |
+            work/ci/exp22_7/EXP22_7_SOURCE_DIFF.patch
+            work/ci/exp22_7/SOURCE_CONTRACT_SUMMARY.txt
+            work/ci/exp22_7/SOURCE_INPUT_SHA256SUMS.txt
+            work/ci/exp22_7/SOURCE_OUTPUT_SHA256SUMS.txt
+            work/ci/exp22_7/EXP22_7_COMPILE_MANIFEST.txt
+            work/ci/exp22_6/BUILD_GRAPH_AUDIT.txt
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
