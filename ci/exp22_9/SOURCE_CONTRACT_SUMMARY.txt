@@ -1,0 +1,19 @@
+DARKWOLF EXP22.9 SOURCE CONTRACT
+================================
+Base: exact EXP22.8 output after EXP22.4 + EXP22.6 + EXP22.7 + EXP22.8.
+Changed files: exactly four.
+
+Implemented:
+- first-person/depth-hack view weapon exclusion before DXR mesh/BLAS creation;
+- fixed dynamic BLAS update budget of 24 resident updates per build tick;
+- first-time/unbuilt BLAS are never deferred;
+- smaller animated updates are prioritized within the budget;
+- dynamic BLAS use PREFER_FAST_BUILD | ALLOW_UPDATE;
+- resident BLAS changes request TLAS PERFORM_UPDATE instead of full rebuild;
+- ordered async BLAS/TLAS submission on one D3D12 queue;
+- upload-buffer overwrite and command allocator reset remain fence protected;
+- EXP22_9_PERF telemetry for builds, updates, deferred work, triangles,
+  submit time, mutation fence wait, budget and view-weapon skips.
+
+EXP22.9 patch SHA-256:
+10B24C26D4A061AFD69EA307FCF369A5AFB92650A0B1141321EDF2AD0A092AC4

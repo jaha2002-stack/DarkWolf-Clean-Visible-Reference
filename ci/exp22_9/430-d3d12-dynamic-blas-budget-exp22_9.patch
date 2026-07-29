@@ -1,0 +1,413 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 65d67e3..9b88085 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -353,15 +353,13 @@ void glRaytracingSetSafetyOptions(int safeMode, int errorLimit, int fenceWaitMs)
+ 
+ void glRaytracingSetPerformanceOptions(int asyncSubmit, int buildInterval, int dispatchInterval)
+ {
+-	// Async resource lifetime is not safe yet: animated meshes can replace upload
+-	// buffers or BLAS resources while the previous frame still references them.
+-	// Keep the proven ordered path until deferred destruction/ring buffering exists.
+-	(void)asyncSubmit;
+-	(void)buildInterval;
+-	(void)dispatchInterval;
+-	g_glRaytracingPerformance.asyncSubmit = 0;
+-	g_glRaytracingPerformance.buildInterval = 1;
+-	g_glRaytracingPerformance.dispatchInterval = 1;
++	// EXP22.9 ordered asynchronous submission. BLAS, TLAS and ray dispatch
++	// share one D3D12 queue, so queue order supplies the GPU dependency.
++	// Writable geometry buffers and command allocators remain fence protected
++	// at their mutation/reset points.
++	g_glRaytracingPerformance.asyncSubmit = asyncSubmit ? 1 : 0;
++	g_glRaytracingPerformance.buildInterval = glRaytracingClamp(buildInterval, 1, 8);
++	g_glRaytracingPerformance.dispatchInterval = glRaytracingClamp(dispatchInterval, 1, 8);
+ }
+ 
+ int glRaytracingHasDeviceLost(void)
+@@ -822,6 +820,21 @@ struct glRaytracingExp226State_t
+ 	uint32_t exp228SbtLiveRecords = 0;
+ 	double exp228TlasMs = 0.0;
+ 	double exp228BlasMs = 0.0;
++
++	// EXP22.9 dynamic BLAS budgeting, queue/fence and view-weapon telemetry.
++	uint64_t exp229BlasBatches = 0;
++	uint64_t exp229BlasBuilds = 0;
++	uint64_t exp229BlasUpdates = 0;
++	uint64_t exp229BlasDeferred = 0;
++	uint64_t exp229BlasTriangles = 0;
++	uint64_t exp229ViewWeaponSkipped = 0;
++	uint32_t exp229LastBlasBuilds = 0;
++	uint32_t exp229LastBlasUpdates = 0;
++	uint32_t exp229LastBlasDeferred = 0;
++	uint32_t exp229LastBlasTriangles = 0;
++	uint32_t exp229BlasUpdateBudget = 24;
++	double exp229BlasFenceWaitMs = 0.0;
++	double exp229BlasSubmitMs = 0.0;
+ };
+ 
+ static glRaytracingExp226State_t g_glRaytracingExp226;
+@@ -910,6 +923,11 @@ void glRaytracingExp228RecordTransientSkip(uint32_t instanceFlags)
+ 		++g_glRaytracingExp226.exp228MuzzleInstances;
+ }
+ 
++void glRaytracingExp229RecordViewWeaponSkip(void)
++{
++	++g_glRaytracingExp226.exp229ViewWeaponSkipped;
++}
++
+ static int glRaytracingExp228DescIsTransient(
+ 	const glRaytracingInstanceDesc_t* desc)
+ {
+@@ -1566,26 +1584,58 @@ static int glRaytracingUploadCachedInstanceDescs(void)
+ 
+ static int glRaytracingUploadMeshBuffers(glRaytracingMeshRecord_t* mesh);
+ 
++static void glRaytracingExp229WaitForBlasGeometryWrite(void)
++{
++	if (!g_glRaytracingCmd.blasLastFenceValue ||
++		!g_glRaytracingCmd.fence ||
++		g_glRaytracingCmd.fence->GetCompletedValue() >= g_glRaytracingCmd.blasLastFenceValue)
++		return;
++	const uint64_t waitStart = glRaytracingExp226NowTicks();
++	glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	g_glRaytracingExp226.exp229BlasFenceWaitMs +=
++		glRaytracingExp226ElapsedMs(waitStart);
++}
++
+ static int glRaytracingBuildDirtyMeshesInternal(void)
+ {
+ 	const uint64_t exp228BlasStartTicks = glRaytracingExp226NowTicks();
+ 	g_glRaytracingExp226.exp228BlasMs = 0.0;
+-	std::vector<glRaytracingMeshRecord_t*> dirtyMeshes;
+-	dirtyMeshes.reserve(g_glRaytracingScene.meshes.size());
+-
++	g_glRaytracingExp226.exp229BlasFenceWaitMs = 0.0;
++	g_glRaytracingExp226.exp229BlasSubmitMs = 0.0;
++	g_glRaytracingExp226.exp229LastBlasBuilds = 0;
++	g_glRaytracingExp226.exp229LastBlasUpdates = 0;
++	g_glRaytracingExp226.exp229LastBlasDeferred = 0;
++	g_glRaytracingExp226.exp229LastBlasTriangles = 0;
++
++	std::vector<glRaytracingMeshRecord_t*> mandatoryBuilds;
++	std::vector<glRaytracingMeshRecord_t*> updateCandidates;
++	mandatoryBuilds.reserve(g_glRaytracingScene.meshes.size());
++	updateCandidates.reserve(g_glRaytracingScene.meshes.size());
+ 	for (size_t i = 0; i < g_glRaytracingScene.meshes.size(); ++i)
+ 	{
+ 		glRaytracingMeshRecord_t& mesh = g_glRaytracingScene.meshes[i];
+-		if (!mesh.alive)
++		if (!mesh.alive || (!mesh.dirty && mesh.blasBuilt))
+ 			continue;
+-
+-		if (!mesh.blasBuilt || mesh.dirty)
+-			dirtyMeshes.push_back(&mesh);
++		if (!mesh.blasBuilt) mandatoryBuilds.push_back(&mesh);
++		else updateCandidates.push_back(&mesh);
+ 	}
+-
+-	if (dirtyMeshes.empty())
++	if (mandatoryBuilds.empty() && updateCandidates.empty())
+ 		return 1;
+ 
++	std::sort(updateCandidates.begin(), updateCandidates.end(),
++		[](const glRaytracingMeshRecord_t* a, const glRaytracingMeshRecord_t* b)
++		{ return a->indicesCpu.size() < b->indicesCpu.size(); });
++	const size_t updateBudget = (size_t)(std::max)(g_glRaytracingExp226.exp229BlasUpdateBudget, 1u);
++	const size_t selectedUpdates = (std::min)(updateCandidates.size(), updateBudget);
++	const size_t deferredUpdates = updateCandidates.size() - selectedUpdates;
++	std::vector<glRaytracingMeshRecord_t*> dirtyMeshes;
++	dirtyMeshes.reserve(mandatoryBuilds.size() + selectedUpdates);
++	dirtyMeshes.insert(dirtyMeshes.end(), mandatoryBuilds.begin(), mandatoryBuilds.end());
++	dirtyMeshes.insert(dirtyMeshes.end(), updateCandidates.begin(), updateCandidates.begin() + selectedUpdates);
++	g_glRaytracingExp226.exp229LastBlasDeferred = (uint32_t)deferredUpdates;
++	g_glRaytracingExp226.exp229BlasDeferred += deferredUpdates;
++	if (dirtyMeshes.empty()) return 1;
++
+ 	struct glRaytracingMeshBuildInfo_t
+ 	{
+ 		glRaytracingMeshRecord_t* mesh;
+@@ -1594,29 +1644,22 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc;
+ 		ID3D12Resource* barrierResource;
+ 		int newBlasIndex;
++		int updateExisting;
++		uint32_t triangleCount;
+ 	};
+-
+-	std::vector<glRaytracingMeshBuildInfo_t> builds;
+-	builds.resize(dirtyMeshes.size());
+-
++	std::vector<glRaytracingMeshBuildInfo_t> builds(dirtyMeshes.size());
++	bool allExistingUpdates = true;
+ 	for (size_t i = 0; i < dirtyMeshes.size(); ++i)
+ 	{
+ 		glRaytracingMeshRecord_t* mesh = dirtyMeshes[i];
+ 		if (!mesh->vertexBuffer.resource || !mesh->indexBuffer.resource)
+-		{
+-			if (!glRaytracingUploadMeshBuffers(mesh))
+-				return 0;
+-		}
+-
++			if (!glRaytracingUploadMeshBuffers(mesh)) return 0;
+ 		glRaytracingMeshBuildInfo_t& info = builds[i];
+ 		memset(&info, 0, sizeof(info));
+ 		info.mesh = mesh;
+-
++		info.triangleCount = (uint32_t)(mesh->indicesCpu.size() / 3u);
+ 		info.geomDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+-		info.geomDesc.Flags = mesh->descCpu.opaque
+-			? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+-			: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+-		info.geomDesc.Triangles.Transform3x4 = 0;
++		info.geomDesc.Flags = mesh->descCpu.opaque ? D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE : D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+ 		info.geomDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+ 		info.geomDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+ 		info.geomDesc.Triangles.IndexCount = (UINT)mesh->indicesCpu.size();
+@@ -1624,81 +1667,65 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 		info.geomDesc.Triangles.IndexBuffer = mesh->indexBuffer.gpuVA;
+ 		info.geomDesc.Triangles.VertexBuffer.StartAddress = mesh->vertexBuffer.gpuVA;
+ 		info.geomDesc.Triangles.VertexBuffer.StrideInBytes = sizeof(glRaytracingVertex_t);
+-
+ 		info.inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+ 		info.inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+ 		info.inputs.NumDescs = 1;
+ 		info.inputs.pGeometryDescs = &info.geomDesc;
+ 		info.inputs.Flags = mesh->descCpu.allowUpdate
+-			? (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+-				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
++			? (D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE)
+ 			: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+-
+-		const bool canUpdateInPlace = (mesh->blasBuilt != 0) && (mesh->descCpu.allowUpdate != 0);
+-		if (canUpdateInPlace)
+-			info.inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+-
++		const bool canUpdateInPlace = mesh->blasBuilt && mesh->descCpu.allowUpdate;
++		info.updateExisting = canUpdateInPlace ? 1 : 0;
++		if (canUpdateInPlace) info.inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
++		else allExistingUpdates = false;
+ 		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild = {};
+ 		g_glRaytracingCmd.device->GetRaytracingAccelerationStructurePrebuildInfo(&info.inputs, &prebuild);
+-		if (prebuild.ResultDataMaxSizeInBytes == 0)
+-		{
+-			glRaytracingFatal("BLAS prebuild size is zero");
+-			return 0;
+-		}
+-
+-		if (!glRaytracingEnsureMeshScratch(mesh, prebuild.ScratchDataSizeInBytes))
+-			return 0;
+-		if (!glRaytracingEnsureMeshResultBuffers(mesh, prebuild.ResultDataMaxSizeInBytes))
+-			return 0;
+-
++		if (!prebuild.ResultDataMaxSizeInBytes) return 0;
++		if (!glRaytracingEnsureMeshScratch(mesh, prebuild.ScratchDataSizeInBytes)) return 0;
++		if (!glRaytracingEnsureMeshResultBuffers(mesh, prebuild.ResultDataMaxSizeInBytes)) return 0;
+ 		const int oldIndex = mesh->currentBlasIndex & 1;
+-		info.newBlasIndex = (mesh->descCpu.allowUpdate && mesh->blasBuilt) ? (oldIndex ^ 1) : oldIndex;
+-
++		info.newBlasIndex = canUpdateInPlace ? (oldIndex ^ 1) : oldIndex;
+ 		info.buildDesc.Inputs = info.inputs;
+ 		info.buildDesc.ScratchAccelerationStructureData = mesh->blasScratch.gpuVA;
+ 		info.buildDesc.DestAccelerationStructureData = mesh->blasResult[info.newBlasIndex].gpuVA;
+-		info.buildDesc.SourceAccelerationStructureData = 0;
+-
+-		if (canUpdateInPlace)
+-			info.buildDesc.SourceAccelerationStructureData = mesh->blasResult[oldIndex].gpuVA;
+-
++		info.buildDesc.SourceAccelerationStructureData = canUpdateInPlace ? mesh->blasResult[oldIndex].gpuVA : 0;
+ 		info.barrierResource = mesh->blasResult[info.newBlasIndex].resource.Get();
+ 	}
+-
+-	if (!glRaytracingBeginBlasCmd())
+-		return 0;
+-
++	if (!glRaytracingBeginBlasCmd()) return 0;
++	const uint64_t submitStart = glRaytracingExp226NowTicks();
+ 	for (size_t i = 0; i < builds.size(); ++i)
+ 	{
+ 		g_glRaytracingCmd.blasCmdList->BuildRaytracingAccelerationStructure(&builds[i].buildDesc, 0, nullptr);
+-
+ 		D3D12_RESOURCE_BARRIER uav = {};
+ 		uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+ 		uav.UAV.pResource = builds[i].barrierResource;
+ 		g_glRaytracingCmd.blasCmdList->ResourceBarrier(1, &uav);
+ 	}
+-
+ 	const UINT64 blasFenceValue = glRaytracingEndBlasCmd();
+-	if (!blasFenceValue)
+-		return 0;
+-
+-	if (!g_glRaytracingPerformance.asyncSubmit)
+-		glRaytracingWaitFenceValue(blasFenceValue);
+-	if (glRaytracingShouldAbortWork())
+-		return 0;
+-
++	if (!blasFenceValue) return 0;
++	g_glRaytracingExp226.exp229BlasSubmitMs = glRaytracingExp226ElapsedMs(submitStart);
++	if (!g_glRaytracingPerformance.asyncSubmit) glRaytracingWaitFenceValue(blasFenceValue);
++	if (glRaytracingShouldAbortWork()) return 0;
++	uint32_t buildCount = 0, updateCount = 0, triangleCount = 0;
+ 	for (size_t i = 0; i < builds.size(); ++i)
+ 	{
+ 		glRaytracingMeshRecord_t* mesh = builds[i].mesh;
+ 		mesh->currentBlasIndex = builds[i].newBlasIndex;
+ 		mesh->blasBuilt = 1;
+ 		mesh->dirty = 0;
++		triangleCount += builds[i].triangleCount;
++		if (builds[i].updateExisting) ++updateCount; else ++buildCount;
+ 	}
+-
+-	g_glRaytracingScene.tlasNeedsRebuild = 1;
+-	g_glRaytracingScene.tlasNeedsUpdate = 0;
+-	g_glRaytracingExp226.exp228BlasMs =
+-		glRaytracingExp226ElapsedMs(exp228BlasStartTicks);
++	++g_glRaytracingExp226.exp229BlasBatches;
++	g_glRaytracingExp226.exp229BlasBuilds += buildCount;
++	g_glRaytracingExp226.exp229BlasUpdates += updateCount;
++	g_glRaytracingExp226.exp229BlasTriangles += triangleCount;
++	g_glRaytracingExp226.exp229LastBlasBuilds = buildCount;
++	g_glRaytracingExp226.exp229LastBlasUpdates = updateCount;
++	g_glRaytracingExp226.exp229LastBlasTriangles = triangleCount;
++	if (allExistingUpdates && g_glRaytracingScene.tlasBuilt) g_glRaytracingScene.tlasNeedsUpdate = 1;
++	else { g_glRaytracingScene.tlasNeedsRebuild = 1; g_glRaytracingScene.tlasNeedsUpdate = 0; }
++	g_glRaytracingExp226.exp228BlasMs = glRaytracingExp226ElapsedMs(exp228BlasStartTicks);
+ 	return 1;
+ }
+ 
+@@ -1897,8 +1924,8 @@ static int glRaytracingBuildSceneInternal(void)
+ 	glRaytracingBuffer_t* dstTLAS = glRaytracingGetBuildTLASBuffer();
+ 	const glRaytracingBuffer_t* srcTLAS = glRaytracingGetCurrentTLASBufferConst();
+ 
+-	if (!g_glRaytracingPerformance.asyncSubmit)
+-		glRaytracingWaitFenceValue(g_glRaytracingCmd.blasLastFenceValue);
++	// BLAS and TLAS are submitted to the same queue; queue order is the
++	// dependency, so async mode does not require a CPU wait here.
+ 	if (glRaytracingShouldAbortWork())
+ 		return 0;
+ 
+@@ -2092,6 +2119,9 @@ int glRaytracingUpdateMesh(glRaytracingMeshHandle_t meshHandle, const glRaytraci
+ 
+ 	if (canReuseGeometryBuffers)
+ 	{
++		// Protect upload buffers still consumed by the previous asynchronous
++		// BLAS batch before CPU overwrite.
++		glRaytracingExp229WaitForBlasGeometryWrite();
+ 		// Upload heaps are persistently CPU writable. Keep the existing BLAS
+ 		// allocations so BuildDirtyMeshes can use PERFORM_UPDATE and ping-pong
+ 		// results instead of allocating everything again.
+@@ -2613,6 +2643,19 @@ void glRaytracingExp226GetPerformanceStats(glRaytracingExp226PerformanceStats_t*
+ 	outStats->sbtLiveRecords = g_glRaytracingExp226.exp228SbtLiveRecords;
+ 	outStats->tlasBuildMs = g_glRaytracingExp226.exp228TlasMs;
+ 	outStats->blasBuildMs = g_glRaytracingExp226.exp228BlasMs;
++	outStats->blasBatches = g_glRaytracingExp226.exp229BlasBatches;
++	outStats->blasBuilds = g_glRaytracingExp226.exp229BlasBuilds;
++	outStats->blasUpdates = g_glRaytracingExp226.exp229BlasUpdates;
++	outStats->blasDeferred = g_glRaytracingExp226.exp229BlasDeferred;
++	outStats->blasTriangles = g_glRaytracingExp226.exp229BlasTriangles;
++	outStats->viewWeaponSkipped = g_glRaytracingExp226.exp229ViewWeaponSkipped;
++	outStats->lastBlasBuilds = g_glRaytracingExp226.exp229LastBlasBuilds;
++	outStats->lastBlasUpdates = g_glRaytracingExp226.exp229LastBlasUpdates;
++	outStats->lastBlasDeferred = g_glRaytracingExp226.exp229LastBlasDeferred;
++	outStats->lastBlasTriangles = g_glRaytracingExp226.exp229LastBlasTriangles;
++	outStats->blasUpdateBudget = g_glRaytracingExp226.exp229BlasUpdateBudget;
++	outStats->blasFenceWaitMs = g_glRaytracingExp226.exp229BlasFenceWaitMs;
++	outStats->blasSubmitMs = g_glRaytracingExp226.exp229BlasSubmitMs;
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+ 		const glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index 65c955f..17068cb 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1701,6 +1701,20 @@ typedef struct glRaytracingExp226PerformanceStats_s
+ 	uint32_t sbtLiveRecords;
+ 	double tlasBuildMs;
+ 	double blasBuildMs;
++	// EXP22.9 dynamic BLAS budgeting and view-weapon isolation telemetry.
++	uint64_t blasBatches;
++	uint64_t blasBuilds;
++	uint64_t blasUpdates;
++	uint64_t blasDeferred;
++	uint64_t blasTriangles;
++	uint64_t viewWeaponSkipped;
++	uint32_t lastBlasBuilds;
++	uint32_t lastBlasUpdates;
++	uint32_t lastBlasDeferred;
++	uint32_t lastBlasTriangles;
++	uint32_t blasUpdateBudget;
++	double blasFenceWaitMs;
++	double blasSubmitMs;
+ } glRaytracingExp226PerformanceStats_t;
+ 
+ static const uint32_t GL_RAYTRACING_MAX_LIGHTS = 256;
+@@ -1787,6 +1801,7 @@ int                        glRaytracingExp226TouchInstance(glRaytracingInstanceH
+ int                        glRaytracingExp228TouchInstance(
+ 	glRaytracingInstanceHandle_t instanceHandle, uint32_t instanceFlags);
+ void                       glRaytracingExp228RecordTransientSkip(uint32_t instanceFlags);
++void                       glRaytracingExp229RecordViewWeaponSkip(void);
+ uint64_t                   glRaytracingExp226GetBindingRevision(void);
+ uint32_t                   glRaytracingExp226GetActiveInstanceCount(void);
+ void                       glRaytracingExp226GetLifecycleStats(glRaytracingExp226LifecycleStats_t* outStats);
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 8466a3d..1081a86 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -959,6 +959,8 @@ static uint32_t RB_EXP228ClassifyTransientFlags(
+ 	uint32_t flags = GL_RAYTRACING_INSTANCE_FLAG_NONE;
+ 	const qboolean nonModelTransient =
+ 		entity && entity != &tr.worldEntity && entity->e.reType != RT_MODEL;
++	const qboolean viewWeapon = entity && entity != &tr.worldEntity &&
++		(entity->e.renderfx & (RF_FIRST_PERSON | RF_DEPTHHACK)) != 0;
+ 	const qboolean muzzle =
+ 		RB_EXP228ShaderNameContains(shader, "muzzle") ||
+ 		RB_EXP228ShaderNameContains(shader, "muzz") ||
+@@ -1000,11 +1002,13 @@ static uint32_t RB_EXP228ClassifyTransientFlags(
+ 		shader->sort >= SS_ALMOST_NEAREST ||
+ 		(shader->entityMergable && shader->sort > SS_OPAQUE);
+ 
+-	if (nonModelTransient || namedTransient || sortedTransient || additiveStage)
++	if (nonModelTransient || viewWeapon || namedTransient || sortedTransient || additiveStage)
+ 		flags |= GL_RAYTRACING_INSTANCE_FLAG_TRANSIENT |
+ 			GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION;
+ 	if (muzzle)
+ 		flags |= GL_RAYTRACING_INSTANCE_FLAG_MUZZLE;
++	if (viewWeapon)
++		glRaytracingExp229RecordViewWeaponSkip();
+ 	return flags;
+ }
+ 
+diff --git a/src/renderer/tr_cmds.cpp b/src/renderer/tr_cmds.cpp
+index 5d5169c..96b1041 100644
+--- a/src/renderer/tr_cmds.cpp
++++ b/src/renderer/tr_cmds.cpp
+@@ -96,13 +96,16 @@ static void EXP226_RecordAndReportFrame(void)
+ 	const double gpuMs = QD3D12_EXP226_GetGpuFrameMs();
+ 
+ 	ri.Printf(PRINT_ALL,
+-		"EXP22_8_PERF avgFps=%.2f low1Fps=%.2f cpuMs=%.3f gpuMs=%.3f "
++		"EXP22_9_PERF avgFps=%.2f low1Fps=%.2f cpuMs=%.3f gpuMs=%.3f "
+ 		"prepareMs=%.3f prepareAvgMs=%.3f hitTableMs=%.3f hitTableAvgMs=%.3f "
+ 		"preparedNow=%u updatedNow=%u tableBuilt=%d staticActive=%u dynamicActive=%u "
+ 		"dirtyPrep=%u dirtyTable=%u dispatchSlots=%u "
+ 		"fullRebuildReason=%u highWaterGrowthEvents=%llu newDynamicSlots=%llu "
+ 		"transientSkipped=%llu muzzleInstances=%llu sbtCapacity=%u sbtHighWater=%u "
+ 		"sbtActiveHighWater=%u sbtLiveRecords=%u tlasMs=%.3f blasMs=%.3f "
++		"blasBudget=%u blasBuildNow=%u blasUpdateNow=%u blasDeferredNow=%u blasTrianglesNow=%u "
++		"blasBatches=%llu blasBuilds=%llu blasUpdates=%llu blasDeferred=%llu blasTriangles=%llu "
++		"blasFenceWaitMs=%.3f blasSubmitMs=%.3f viewWeaponSkipped=%llu "
+ 		"fullRebuilds=%llu partialUpdates=%llu updatedRecords=%llu preparedRecords=%llu reusedSlots=%llu "
+ 		"staticFallbacks=%llu dynamicFallbacks=%llu "
+ 		"allocated=%u live=%u stale=%u active=%u built=%u meshAllocated=%u meshLive=%u meshStale=%u "
+@@ -119,6 +122,11 @@ static void EXP226_RecordAndReportFrame(void)
+ 		(unsigned long long)perf.newDynamicSlots, (unsigned long long)perf.transientSkipped,
+ 		(unsigned long long)perf.muzzleInstances, perf.sbtCapacitySlots, perf.sbtHighWater,
+ 		perf.sbtActiveHighWater, perf.sbtLiveRecords, perf.tlasBuildMs, perf.blasBuildMs,
++		perf.blasUpdateBudget, perf.lastBlasBuilds, perf.lastBlasUpdates, perf.lastBlasDeferred, perf.lastBlasTriangles,
++		(unsigned long long)perf.blasBatches, (unsigned long long)perf.blasBuilds,
++		(unsigned long long)perf.blasUpdates, (unsigned long long)perf.blasDeferred,
++		(unsigned long long)perf.blasTriangles, perf.blasFenceWaitMs, perf.blasSubmitMs,
++		(unsigned long long)perf.viewWeaponSkipped,
+ 		(unsigned long long)perf.fullTableRebuilds, (unsigned long long)perf.partialTableUpdates,
+ 		(unsigned long long)perf.updatedTableRecords, (unsigned long long)perf.preparedBindingRecords,
+ 		(unsigned long long)perf.reusedHitSlots, (unsigned long long)perf.staticSlotFallbacks,
