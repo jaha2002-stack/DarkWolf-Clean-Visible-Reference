@@ -13,7 +13,7 @@ if (-not (Test-Path -LiteralPath $basePackager -PathType Leaf)) {
 }
 
 & $basePackager -WorkRoot $work
-if ($LASTEXITCODE -ne 0) { throw "EXP22.6 base packager returned exit code $LASTEXITCODE" }
+if (-not $?) { throw "EXP22.6 base packager failed without a terminating exception." }
 
 $baseRelease = Join-Path $work 'release-darkwolf-exp22_6-performance-lifecycle'
 $release = Join-Path $work 'release-darkwolf-exp22_8-persistent-dynamic-sbt'
