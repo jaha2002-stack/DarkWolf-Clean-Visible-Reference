@@ -1,0 +1,23 @@
+DarkWolf EXP22.7 source contract
+=================================
+Base state: exact post-EXP22.6 sources verified by SOURCE_INPUT_SHA256SUMS.txt.
+Changed files: exactly 3.
+
+1. src/opengl/gl_d3d12raylight.cpp
+   - stable hit-table slots for instances;
+   - static range [0, 32768), dynamic range [32768, 131072);
+   - dead-slot reuse and 5%/256-record compaction threshold;
+   - per-instance prepare/table dirty flags;
+   - persistent CPU shadow and persistently mapped upload SBT;
+   - incremental descriptor and shader-record updates;
+   - one main-fence wait before descriptor/SBT mutation, no duplicate wait inside hit-table timing;
+   - stable TLAS InstanceContributionToHitGroupIndex;
+   - full/partial update telemetry.
+
+2. src/opengl/opengl.h
+   - EXP22.7 telemetry fields appended to the existing POD performance structure.
+
+3. src/renderer/tr_cmds.cpp
+   - machine-readable EXP22_7_PERF output.
+
+No renderer image-quality constants, shaders, light-selection parameters, EXP20 hysteresis, or EXP22.4 production reflection profile are changed.
