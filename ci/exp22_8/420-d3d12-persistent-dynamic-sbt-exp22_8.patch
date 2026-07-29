@@ -1,0 +1,946 @@
+diff --git a/src/opengl/gl_d3d12raylight.cpp b/src/opengl/gl_d3d12raylight.cpp
+index 665eb85..65d67e3 100644
+--- a/src/opengl/gl_d3d12raylight.cpp
++++ b/src/opengl/gl_d3d12raylight.cpp
+@@ -44,6 +44,21 @@ static const UINT GL_RAYTRACING_MAX_HIT_SURFACES = 131072;
+ static const UINT GL_RAYTRACING_EXP227_STATIC_SLOT_LIMIT =
+ 	GL_RAYTRACING_MAX_HIT_SURFACES / 4u;
+ static const UINT GL_RAYTRACING_EXP227_INVALID_SLOT = 0xFFFFFFFFu;
++// EXP22.8 reserves the complete shader-binding-table address space once.
++// With the current two-record layout this is a modest upload allocation and
++// prevents every new dynamic high-water slot from reallocating and rewriting
++// the complete static table.
++static const UINT GL_RAYTRACING_EXP228_SBT_CAPACITY_SLOTS =
++	GL_RAYTRACING_MAX_HIT_SURFACES;
++
++enum glRaytracingExp228FullRebuildReason_t
++{
++	GL_RAYTRACING_EXP228_REBUILD_NONE = 0,
++	GL_RAYTRACING_EXP228_REBUILD_INITIAL_ALLOCATION = 1,
++	GL_RAYTRACING_EXP228_REBUILD_RESOURCE_RECOVERY = 2,
++	GL_RAYTRACING_EXP228_REBUILD_SHADOW_RECOVERY = 3
++};
++
+ static const UINT GL_RAYTRACING_BASE_SRV_COUNT = 6;
+ static const UINT GL_RAYTRACING_HIT_TEXTURE_BASE = GL_RAYTRACING_BASE_SRV_COUNT;
+ static const UINT GL_RAYTRACING_OUTPUT_UAV_INDEX =
+@@ -648,6 +663,8 @@ struct glRaytracingInstanceRecord_t
+ 	int exp227PreparedExact;
+ 	int exp227ExactSrv;
+ 	int exp227TableResident;
++	int exp228TransientExcluded;
++	int exp228MuzzleInstance;
+ 	D3D12_GPU_VIRTUAL_ADDRESS cachedBlasGpuVA;
+ 	D3D12_RAYTRACING_INSTANCE_DESC cachedDescCpu;
+ 
+@@ -667,6 +684,8 @@ struct glRaytracingInstanceRecord_t
+ 		exp227PreparedExact = 0;
+ 		exp227ExactSrv = 0;
+ 		exp227TableResident = 0;
++		exp228TransientExcluded = 0;
++		exp228MuzzleInstance = 0;
+ 		cachedBlasGpuVA = 0;
+ 		memset(&cachedDescCpu, 0, sizeof(cachedDescCpu));
+ 	}
+@@ -791,6 +810,18 @@ struct glRaytracingExp226State_t
+ 	uint32_t exp227LastPreparedBindings = 0;
+ 	uint32_t exp227HitTableDispatchSlots = 0;
+ 	int exp227TableBuiltThisFrame = 0;
++
++	// EXP22.8 persistent-capacity, transient-isolation and AS timing telemetry.
++	uint64_t exp228HighWaterGrowthEvents = 0;
++	uint64_t exp228NewDynamicSlots = 0;
++	uint64_t exp228TransientSkipped = 0;
++	uint64_t exp228MuzzleInstances = 0;
++	uint32_t exp228FullRebuildReason = GL_RAYTRACING_EXP228_REBUILD_NONE;
++	uint32_t exp228SbtCapacitySlots = 0;
++	uint32_t exp228SbtActiveHighWater = 0;
++	uint32_t exp228SbtLiveRecords = 0;
++	double exp228TlasMs = 0.0;
++	double exp228BlasMs = 0.0;
+ };
+ 
+ static glRaytracingExp226State_t g_glRaytracingExp226;
+@@ -862,6 +893,32 @@ int glRaytracingExp226TouchInstance(glRaytracingInstanceHandle_t instanceHandle)
+ 	return 1;
+ }
+ 
++int glRaytracingExp228TouchInstance(
++	glRaytracingInstanceHandle_t instanceHandle,
++	uint32_t instanceFlags)
++{
++	glRaytracingInstanceRecord_t* inst = glRaytracingFindInstance(instanceHandle);
++	if (!inst) return 0;
++	inst->exp226LastTouchedSerial = g_glRaytracingExp226.lifecycleFrameSerial;
++	return inst->descCpu.flags == instanceFlags ? 1 : 2;
++}
++
++void glRaytracingExp228RecordTransientSkip(uint32_t instanceFlags)
++{
++	++g_glRaytracingExp226.exp228TransientSkipped;
++	if (instanceFlags & GL_RAYTRACING_INSTANCE_FLAG_MUZZLE)
++		++g_glRaytracingExp226.exp228MuzzleInstances;
++}
++
++static int glRaytracingExp228DescIsTransient(
++	const glRaytracingInstanceDesc_t* desc)
++{
++	if (!desc) return 0;
++	return (desc->flags & (
++		GL_RAYTRACING_INSTANCE_FLAG_TRANSIENT |
++		GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION)) ? 1 : 0;
++}
++
+ uint64_t glRaytracingExp226GetBindingRevision(void)
+ {
+ 	return g_glRaytracingExp226.bindingRevision;
+@@ -901,7 +958,7 @@ static void glRaytracingExp227MarkAllBindingsDirty(void)
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+ 		glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+-		if (!inst.alive)
++		if (!inst.alive || inst.exp228TransientExcluded)
+ 			continue;
+ 		inst.exp227PrepareDirty = 1;
+ 		inst.exp227TableDirty = 1;
+@@ -922,6 +979,7 @@ static uint32_t glRaytracingExp227AllocateHitSlot(int dynamicClass)
+ 	}
+ 
+ 	uint32_t slot = GL_RAYTRACING_EXP227_INVALID_SLOT;
++	int allocatedNewDynamicSlot = 0;
+ 	if (!dynamicClass &&
+ 		g_glRaytracingExp226.exp227NextStaticSlot < GL_RAYTRACING_EXP227_STATIC_SLOT_LIMIT)
+ 	{
+@@ -931,6 +989,7 @@ static uint32_t glRaytracingExp227AllocateHitSlot(int dynamicClass)
+ 		g_glRaytracingExp226.exp227NextDynamicSlot < GL_RAYTRACING_MAX_HIT_SURFACES)
+ 	{
+ 		slot = g_glRaytracingExp226.exp227NextDynamicSlot++;
++		allocatedNewDynamicSlot = 1;
+ 	}
+ 	else
+ 	{
+@@ -953,15 +1012,21 @@ static uint32_t glRaytracingExp227AllocateHitSlot(int dynamicClass)
+ 			g_glRaytracingExp226.exp227NextDynamicSlot < GL_RAYTRACING_MAX_HIT_SURFACES)
+ 		{
+ 			slot = g_glRaytracingExp226.exp227NextDynamicSlot++;
++			allocatedNewDynamicSlot = 1;
+ 			++g_glRaytracingExp226.exp227StaticSlotFallbacks;
+ 		}
+ 	}
+ 
+ 	if (slot != GL_RAYTRACING_EXP227_INVALID_SLOT)
+ 	{
+-		g_glRaytracingExp226.exp227HitSlotHighWater = (std::max)(
+-			g_glRaytracingExp226.exp227HitSlotHighWater,
+-			slot + 1u);
++		const uint32_t newHighWater = slot + 1u;
++		if (newHighWater > g_glRaytracingExp226.exp227HitSlotHighWater)
++		{
++			g_glRaytracingExp226.exp227HitSlotHighWater = newHighWater;
++			++g_glRaytracingExp226.exp228HighWaterGrowthEvents;
++		}
++		if (allocatedNewDynamicSlot)
++			++g_glRaytracingExp226.exp228NewDynamicSlots;
+ 	}
+ 	return slot;
+ }
+@@ -1305,6 +1370,7 @@ static void glRaytracingExp226LifecycleTick(void)
+ 	++g_glRaytracingExp226.lifecycleFrameSerial;
+ 	const uint64_t staleAfterFrames = 1800;
+ 	uint64_t pruned = 0;
++	uint64_t prunedParticipating = 0;
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+ 		glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+@@ -1312,6 +1378,8 @@ static void glRaytracingExp226LifecycleTick(void)
+ 			continue;
+ 		if (g_glRaytracingExp226.lifecycleFrameSerial <= inst.exp226LastTouchedSerial + staleAfterFrames)
+ 			continue;
++		if (!inst.exp228TransientExcluded)
++			++prunedParticipating;
+ 		glRaytracingInvalidateInstanceCache(&inst);
+ 		glRaytracingExp227ReleaseHitSlot(&inst);
+ 		inst.alive = 0;
+@@ -1322,11 +1390,13 @@ static void glRaytracingExp226LifecycleTick(void)
+ 	if (pruned)
+ 	{
+ 		g_glRaytracingExp226.prunedDynamicInstances += pruned;
+-		g_glRaytracingScene.tlasNeedsRebuild = 1;
+-		g_glRaytracingScene.tlasNeedsUpdate = 0;
+-		++g_glRaytracingExp226.sceneRevision;
+-		++g_glRaytracingExp226.bindingRevision;
+-		glRaytracingExp227InvalidateCacheFlags();
++		if (prunedParticipating)
++		{
++			g_glRaytracingScene.tlasNeedsRebuild = 1;
++			g_glRaytracingScene.tlasNeedsUpdate = 0;
++			++g_glRaytracingExp226.sceneRevision;
++			glRaytracingExp227InvalidateCacheFlags();
++		}
+ 	}
+ }
+ 
+@@ -1396,8 +1466,12 @@ static int glRaytracingRebuildActiveInstanceCache(void)
+ 		glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+ 		glRaytracingInvalidateInstanceCache(&inst);
+ 
+-		if (!inst.alive)
++		if (!inst.alive || inst.exp228TransientExcluded)
++		{
++			inst.cachedActive = 0;
++			inst.dirty = 0;
+ 			continue;
++		}
+ 
+ 		D3D12_RAYTRACING_INSTANCE_DESC desc = {};
+ 		D3D12_GPU_VIRTUAL_ADDRESS blasGpuVA = 0;
+@@ -1494,6 +1568,8 @@ static int glRaytracingUploadMeshBuffers(glRaytracingMeshRecord_t* mesh);
+ 
+ static int glRaytracingBuildDirtyMeshesInternal(void)
+ {
++	const uint64_t exp228BlasStartTicks = glRaytracingExp226NowTicks();
++	g_glRaytracingExp226.exp228BlasMs = 0.0;
+ 	std::vector<glRaytracingMeshRecord_t*> dirtyMeshes;
+ 	dirtyMeshes.reserve(g_glRaytracingScene.meshes.size());
+ 
+@@ -1621,6 +1697,8 @@ static int glRaytracingBuildDirtyMeshesInternal(void)
+ 
+ 	g_glRaytracingScene.tlasNeedsRebuild = 1;
+ 	g_glRaytracingScene.tlasNeedsUpdate = 0;
++	g_glRaytracingExp226.exp228BlasMs =
++		glRaytracingExp226ElapsedMs(exp228BlasStartTicks);
+ 	return 1;
+ }
+ 
+@@ -1727,6 +1805,8 @@ struct glRaytracingResolvedInstance_t
+ 
+ static int glRaytracingBuildSceneInternal(void)
+ {
++	const uint64_t exp228TlasStartTicks = glRaytracingExp226NowTicks();
++	g_glRaytracingExp226.exp228TlasMs = 0.0;
+ 	UINT aliveCount = 0;
+ 	int anyDirty = 0;
+ 	int needsRebuild = g_glRaytracingScene.tlasNeedsRebuild;
+@@ -1735,7 +1815,7 @@ static int glRaytracingBuildSceneInternal(void)
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+ 		const glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+-		if (!inst.alive)
++		if (!inst.alive || inst.exp228TransientExcluded)
+ 			continue;
+ 
+ 		++aliveCount;
+@@ -1866,6 +1946,8 @@ static int glRaytracingBuildSceneInternal(void)
+ 			g_glRaytracingScene.instances[i].dirty = 0;
+ 	}
+ 
++	g_glRaytracingExp226.exp228TlasMs =
++		glRaytracingExp226ElapsedMs(exp228TlasStartTicks);
+ 	return 1;
+ }
+ 
+@@ -1941,6 +2023,10 @@ void glRaytracingClear(void)
+ 	g_glRaytracingExp226.exp227LastPreparedBindings = 0;
+ 	g_glRaytracingExp226.exp227HitTableDispatchSlots = 0;
+ 	g_glRaytracingExp226.exp227TableBuiltThisFrame = 0;
++	g_glRaytracingExp226.exp228SbtActiveHighWater = 0;
++	g_glRaytracingExp226.exp228SbtLiveRecords = 0;
++	g_glRaytracingExp226.exp228TlasMs = 0.0;
++	g_glRaytracingExp226.exp228BlasMs = 0.0;
+ }
+ 
+ glRaytracingMeshHandle_t glRaytracingCreateMesh(const glRaytracingMeshDesc_t* desc)
+@@ -2097,7 +2183,6 @@ void glRaytracingDeleteMesh(glRaytracingMeshHandle_t meshHandle)
+ 
+ 	++g_glRaytracingExp226.deletes;
+ 	++g_glRaytracingExp226.sceneRevision;
+-	++g_glRaytracingExp226.bindingRevision;
+ 	glRaytracingExp227InvalidateCacheFlags();
+ }
+ 
+@@ -2116,26 +2201,43 @@ glRaytracingInstanceHandle_t glRaytracingCreateInstance(const glRaytracingInstan
+ 	inst.exp226LastTouchedSerial = g_glRaytracingExp226.lifecycleFrameSerial;
+ 	inst.exp226DynamicCandidate = glRaytracingExp226TransformIsIdentity(desc->transform) ? 0 : 1;
+ 	inst.exp227SlotClass = inst.exp226DynamicCandidate ? 1 : 0;
+-	inst.exp227HitSlot = glRaytracingExp227AllocateHitSlot(inst.exp227SlotClass);
+-	if (inst.exp227HitSlot == GL_RAYTRACING_EXP227_INVALID_SLOT)
+-		return 0;
+-	inst.exp227PrepareDirty = 1;
+-	inst.exp227TableDirty = 1;
+-	inst.exp227TableResident = 0;
+-	inst.dirty = 1;
++	inst.exp228TransientExcluded = glRaytracingExp228DescIsTransient(desc);
++	inst.exp228MuzzleInstance =
++		(desc->flags & GL_RAYTRACING_INSTANCE_FLAG_MUZZLE) ? 1 : 0;
++	if (!inst.exp228TransientExcluded)
++	{
++		inst.exp227HitSlot = glRaytracingExp227AllocateHitSlot(inst.exp227SlotClass);
++		if (inst.exp227HitSlot == GL_RAYTRACING_EXP227_INVALID_SLOT)
++			return 0;
++		inst.exp227PrepareDirty = 1;
++		inst.exp227TableDirty = 1;
++		inst.exp227TableResident = 0;
++		inst.dirty = 1;
++	}
++	else
++	{
++		inst.exp227HitSlot = GL_RAYTRACING_EXP227_INVALID_SLOT;
++		inst.exp227PrepareDirty = 0;
++		inst.exp227TableDirty = 0;
++		inst.exp227TableResident = 0;
++		inst.dirty = 0;
++	}
+ 
+ 	g_glRaytracingScene.instances.push_back(inst);
+ 	const size_t newIndex = g_glRaytracingScene.instances.size() - 1;
+ 	glRaytracingEnsureInstanceHandleTable(inst.handle);
+ 	g_glRaytracingScene.instanceHandleToIndex[inst.handle] = (int)newIndex;
+-	g_glRaytracingScene.tlasNeedsRebuild = 1;
+ 	// EXP22_6_CREATE_INSTANCE_TELEMETRY
+ 	const auto exp226CreateInstanceResult = (inst.handle);
+ 	if (exp226CreateInstanceResult)
+ 	{
+ 		++g_glRaytracingExp226.creates;
+-		glRaytracingExp227MarkBindingDirty(
+-			&g_glRaytracingScene.instances[newIndex], 1);
++		if (!inst.exp228TransientExcluded)
++		{
++			g_glRaytracingScene.tlasNeedsRebuild = 1;
++			glRaytracingExp227MarkBindingDirty(
++				&g_glRaytracingScene.instances[newIndex], 1);
++		}
+ 	}
+ 	return exp226CreateInstanceResult;
+ }
+@@ -2163,39 +2265,67 @@ int glRaytracingUpdateInstance(glRaytracingInstanceHandle_t instanceHandle, cons
+ 	const bool bindingDataChanged =
+ 		oldDesc.meshHandle != desc->meshHandle ||
+ 		oldDesc.albedoTexture != desc->albedoTexture;
+-	const bool becomesDynamic =
+-		!inst->exp226DynamicCandidate &&
+-		(transformChanged || !glRaytracingExp226TransformIsIdentity(desc->transform));
++	const int wasTransient = inst->exp228TransientExcluded;
++	const int isTransient = glRaytracingExp228DescIsTransient(desc);
+ 
+ 	inst->descCpu = *desc;
+ 	inst->exp226LastTouchedSerial = g_glRaytracingExp226.lifecycleFrameSerial;
++	inst->exp228TransientExcluded = isTransient;
++	inst->exp228MuzzleInstance =
++		(desc->flags & GL_RAYTRACING_INSTANCE_FLAG_MUZZLE) ? 1 : 0;
+ 	if (transformChanged || !glRaytracingExp226TransformIsIdentity(desc->transform))
++	{
+ 		inst->exp226DynamicCandidate = 1;
++		// Keep the original slot stable. A transform-only transition from an
++		// identity transform must not migrate the binding or raise bindingRev.
++		inst->exp227SlotClass = 1;
++	}
+ 
+-	if (becomesDynamic && inst->exp227HitSlot < GL_RAYTRACING_EXP227_STATIC_SLOT_LIMIT)
++	if (wasTransient != isTransient)
+ 	{
+-		const uint32_t oldSlot = inst->exp227HitSlot;
+-		inst->exp227HitSlot = GL_RAYTRACING_EXP227_INVALID_SLOT;
+-		g_glRaytracingExp226.exp227FreeStaticSlots.push_back(oldSlot);
+-		inst->exp227SlotClass = 1;
+-		inst->exp227HitSlot = glRaytracingExp227AllocateHitSlot(1);
+-		if (inst->exp227HitSlot == GL_RAYTRACING_EXP227_INVALID_SLOT)
++		if (isTransient)
+ 		{
+-			inst->exp227HitSlot = oldSlot;
+-			g_glRaytracingExp226.exp227FreeStaticSlots.pop_back();
+-			return 0;
++			glRaytracingInvalidateInstanceCache(inst);
++			glRaytracingExp227ReleaseHitSlot(inst);
++			inst->dirty = 0;
++		}
++		else
++		{
++			inst->exp227HitSlot = glRaytracingExp227AllocateHitSlot(inst->exp227SlotClass);
++			if (inst->exp227HitSlot == GL_RAYTRACING_EXP227_INVALID_SLOT)
++			{
++				inst->exp228TransientExcluded = wasTransient;
++				inst->descCpu = oldDesc;
++				return 0;
++			}
++			inst->exp227PrepareDirty = 1;
++			inst->exp227TableDirty = 1;
++			inst->exp227TableResident = 0;
++			inst->dirty = 1;
++			glRaytracingExp227MarkBindingDirty(inst, 0);
+ 		}
+-		inst->dirty = 1;
+-		inst->exp227TableResident = 0;
+-		glRaytracingExp227MarkBindingDirty(inst, 1);
++		++g_glRaytracingExp226.sceneRevision;
++		g_glRaytracingScene.tlasNeedsRebuild = 1;
++		g_glRaytracingScene.tlasNeedsUpdate = 0;
++		++g_glRaytracingExp226.updates;
++		return 1;
++	}
++
++	if (isTransient)
++	{
++		// The renderer may touch a skipped surface every frame. This keeps the
++		// logical handle alive without changing TLAS, SBT or binding revisions.
++		++g_glRaytracingExp226.updates;
++		return 1;
+ 	}
+-	else if (bindingDataChanged)
++
++	if (bindingDataChanged)
+ 	{
+ 		if (oldDesc.meshHandle != desc->meshHandle)
+ 			inst->exp227TableResident = 0;
+-		glRaytracingExp227MarkBindingDirty(inst, 1);
++		glRaytracingExp227MarkBindingDirty(inst, accelerationDataChanged ? 1 : 0);
+ 	}
+-	else
++	else if (accelerationDataChanged)
+ 	{
+ 		++g_glRaytracingExp226.sceneRevision;
+ 	}
+@@ -2205,7 +2335,8 @@ int glRaytracingUpdateInstance(glRaytracingInstanceHandle_t instanceHandle, cons
+ 	if (!accelerationDataChanged)
+ 	{
+ 		// Material-only changes update one prepared texture, one descriptor and
+-		// one pair of shader records. They do not force a TLAS update.
++		// one pair of shader records. Transform/touch/animation updates with an
++		// unchanged SRV do not raise bindingRevision.
+ 		return 1;
+ 	}
+ 
+@@ -2214,6 +2345,7 @@ int glRaytracingUpdateInstance(glRaytracingInstanceHandle_t instanceHandle, cons
+ 	{
+ 		glRaytracingInvalidateInstanceCache(inst);
+ 		g_glRaytracingScene.tlasNeedsRebuild = 1;
++		g_glRaytracingScene.tlasNeedsUpdate = 0;
+ 	}
+ 	else
+ 	{
+@@ -2223,25 +2355,27 @@ int glRaytracingUpdateInstance(glRaytracingInstanceHandle_t instanceHandle, cons
+ 	return 1;
+ }
+ 
+-
+ void glRaytracingDeleteInstance(glRaytracingInstanceHandle_t instanceHandle)
+ {
+ 	glRaytracingInstanceRecord_t* inst = glRaytracingFindInstance(instanceHandle);
+ 	if (!inst)
+ 		return;
+ 
++	const int participated = !inst->exp228TransientExcluded;
+ 	glRaytracingInvalidateInstanceCache(inst);
+ 	glRaytracingExp227ReleaseHitSlot(inst);
+ 	inst->alive = 0;
+ 	if (instanceHandle < g_glRaytracingScene.instanceHandleToIndex.size())
+ 		g_glRaytracingScene.instanceHandleToIndex[instanceHandle] = -1;
+-	g_glRaytracingScene.tlasNeedsRebuild = 1;
+-	g_glRaytracingScene.tlasNeedsUpdate = 0;
++	if (participated)
++	{
++		g_glRaytracingScene.tlasNeedsRebuild = 1;
++		g_glRaytracingScene.tlasNeedsUpdate = 0;
++		++g_glRaytracingExp226.sceneRevision;
++		glRaytracingExp227InvalidateCacheFlags();
++	}
+ 
+ 	++g_glRaytracingExp226.deletes;
+-	++g_glRaytracingExp226.sceneRevision;
+-	++g_glRaytracingExp226.bindingRevision;
+-	glRaytracingExp227InvalidateCacheFlags();
+ }
+ 
+ int glRaytracingBuildMesh(glRaytracingMeshHandle_t meshHandle)
+@@ -2468,10 +2602,21 @@ void glRaytracingExp226GetPerformanceStats(glRaytracingExp226PerformanceStats_t*
+ 	outStats->lastPreparedBindings = g_glRaytracingExp226.exp227LastPreparedBindings;
+ 	outStats->tableBuiltThisFrame = g_glRaytracingExp226.exp227TableBuiltThisFrame;
+ 	outStats->hitTableDispatchSlots = g_glRaytracingExp226.exp227HitTableDispatchSlots;
++	outStats->fullRebuildReason = g_glRaytracingExp226.exp228FullRebuildReason;
++	outStats->highWaterGrowthEvents = g_glRaytracingExp226.exp228HighWaterGrowthEvents;
++	outStats->newDynamicSlots = g_glRaytracingExp226.exp228NewDynamicSlots;
++	outStats->transientSkipped = g_glRaytracingExp226.exp228TransientSkipped;
++	outStats->muzzleInstances = g_glRaytracingExp226.exp228MuzzleInstances;
++	outStats->sbtCapacitySlots = g_glRaytracingExp226.exp228SbtCapacitySlots;
++	outStats->sbtHighWater = g_glRaytracingExp226.exp227HitSlotHighWater;
++	outStats->sbtActiveHighWater = g_glRaytracingExp226.exp228SbtActiveHighWater;
++	outStats->sbtLiveRecords = g_glRaytracingExp226.exp228SbtLiveRecords;
++	outStats->tlasBuildMs = g_glRaytracingExp226.exp228TlasMs;
++	outStats->blasBuildMs = g_glRaytracingExp226.exp228BlasMs;
+ 	for (size_t i = 0; i < g_glRaytracingScene.instances.size(); ++i)
+ 	{
+ 		const glRaytracingInstanceRecord_t& inst = g_glRaytracingScene.instances[i];
+-		if (!inst.alive) continue;
++		if (!inst.alive || inst.exp228TransientExcluded) continue;
+ 		if (inst.exp227SlotClass) ++outStats->dynamicActiveBindings;
+ 		else ++outStats->staticActiveBindings;
+ 		if (inst.exp227PrepareDirty) ++outStats->dirtyPrepareBindings;
+@@ -2565,6 +2710,7 @@ struct glRaytracingLightingState_t
+ 	glRaytracingBuffer_t missTable;
+ 	glRaytracingBuffer_t hitTable;
+ 	UINT64 hitTableCapacityBytes;
++	UINT hitTableCapacitySlotCount;
+ 	UINT hitTableDispatchSlotCount;
+ 	uint8_t* hitTableMapped;
+ 	std::vector<uint8_t> hitTableCpuShadow;
+@@ -2576,6 +2722,7 @@ struct glRaytracingLightingState_t
+ 		memset(&constants, 0, sizeof(constants));
+ 		descriptorStride = 0;
+ 		hitTableCapacityBytes = 0;
++		hitTableCapacitySlotCount = 0;
+ 		hitTableDispatchSlotCount = 0;
+ 		hitTableMapped = nullptr;
+ 		bloomHdrWidth = 0;
+@@ -5742,8 +5889,9 @@ static UINT glRaytracingLightingHitRecordSize(void)
+ 
+ static int glRaytracingLightingBuildHitTable(void)
+ {
+-	// EXP22.7 stable slots + incremental SBT updates. Static and dynamic
+-	// instances occupy separate slot ranges in one D3D12 hit-group table.
++	// EXP22.8 keeps the complete SBT allocation persistent. High-water growth
++	// changes only the DispatchRays byte range and initializes the newly dirty
++	// slot; previously resident static records are never rewritten.
+ 	const uint64_t startTicks = glRaytracingExp226NowTicks();
+ 	g_glRaytracingExp226.hitTableMs = 0.0;
+ 	g_glRaytracingExp226.exp227LastUpdatedTableRecords = 0;
+@@ -5774,7 +5922,8 @@ static int glRaytracingLightingBuildHitTable(void)
+ 			return 0;
+ 		glRaytracingInstanceRecord_t& inst =
+ 			g_glRaytracingScene.instances[(size_t)instanceIndex];
+-		if (!inst.alive || !glRaytracingExp227EnsureInstanceSlot(&inst))
++		if (!inst.alive || inst.exp228TransientExcluded ||
++			!glRaytracingExp227EnsureInstanceSlot(&inst))
+ 			return 0;
+ 		highestActiveSlot = (std::max)(highestActiveSlot, inst.exp227HitSlot + 1u);
+ 		if (inst.exp227TableDirty)
+@@ -5783,21 +5932,28 @@ static int glRaytracingLightingBuildHitTable(void)
+ 
+ 	const UINT shaderIdSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES;
+ 	const UINT recordSize = glRaytracingLightingHitRecordSize();
+-	const UINT64 requiredBytes =
+-		(UINT64)highestActiveSlot * 2u * (UINT64)recordSize;
++	const UINT64 fullCapacityBytes = glRaytracingAlignUp(
++		(UINT64)GL_RAYTRACING_EXP228_SBT_CAPACITY_SLOTS * 2u * (UINT64)recordSize,
++		256);
+ 	bool fullRebuild = false;
++	uint32_t fullRebuildReason = GL_RAYTRACING_EXP228_REBUILD_NONE;
++
+ 	if (!g_glRaytracingLighting.hitTable.resource ||
+-		g_glRaytracingLighting.hitTableCapacityBytes < requiredBytes)
++		!g_glRaytracingLighting.hitTableMapped ||
++		g_glRaytracingLighting.hitTableCapacityBytes < fullCapacityBytes)
+ 	{
++		fullRebuildReason = g_glRaytracingLighting.hitTable.resource
++			? GL_RAYTRACING_EXP228_REBUILD_RESOURCE_RECOVERY
++			: GL_RAYTRACING_EXP228_REBUILD_INITIAL_ALLOCATION;
+ 		if (g_glRaytracingLighting.hitTable.resource &&
+ 			g_glRaytracingLighting.hitTableMapped)
+ 		{
+ 			g_glRaytracingLighting.hitTable.resource->Unmap(0, nullptr);
+ 			g_glRaytracingLighting.hitTableMapped = nullptr;
+ 		}
+-		const UINT64 capacity = glRaytracingAlignUp(requiredBytes, 256);
++		g_glRaytracingLighting.hitTable.resource.Reset();
+ 		g_glRaytracingLighting.hitTable = glRaytracingCreateBuffer(
+-			g_glRaytracingCmd.device.Get(), capacity,
++			g_glRaytracingCmd.device.Get(), fullCapacityBytes,
+ 			D3D12_HEAP_TYPE_UPLOAD,
+ 			D3D12_RESOURCE_STATE_GENERIC_READ,
+ 			D3D12_RESOURCE_FLAG_NONE);
+@@ -5811,25 +5967,32 @@ static int glRaytracingLightingBuildHitTable(void)
+ 		{
+ 			glRaytracingHandleFailure(
+ 				FAILED(mapHr) ? mapHr : E_FAIL,
+-				"Map EXP22.7 persistent hit table", __FILE__, __LINE__);
++				"Map EXP22.8 persistent full-capacity hit table", __FILE__, __LINE__);
+ 			g_glRaytracingLighting.hitTable.resource.Reset();
+ 			return 0;
+ 		}
+ 		g_glRaytracingLighting.hitTableMapped = (uint8_t*)mapped;
+-		g_glRaytracingLighting.hitTableCapacityBytes = capacity;
++		g_glRaytracingLighting.hitTableCapacityBytes = fullCapacityBytes;
++		g_glRaytracingLighting.hitTableCapacitySlotCount =
++			GL_RAYTRACING_EXP228_SBT_CAPACITY_SLOTS;
+ 		fullRebuild = true;
+ 	}
+-	if (g_glRaytracingLighting.hitTableCpuShadow.size() < (size_t)requiredBytes)
++
++	if (g_glRaytracingLighting.hitTableCpuShadow.size() !=
++		(size_t)fullCapacityBytes)
+ 	{
+-		g_glRaytracingLighting.hitTableCpuShadow.resize((size_t)requiredBytes, 0);
+-		fullRebuild = true;
++		g_glRaytracingLighting.hitTableCpuShadow.assign(
++			(size_t)fullCapacityBytes, (uint8_t)0);
++		if (!fullRebuild)
++		{
++			fullRebuild = true;
++			fullRebuildReason = GL_RAYTRACING_EXP228_REBUILD_SHADOW_RECOVERY;
++		}
+ 	}
++
+ 	if (fullRebuild)
+ 	{
+-		std::fill(
+-			g_glRaytracingLighting.hitTableCpuShadow.begin(),
+-			g_glRaytracingLighting.hitTableCpuShadow.begin() + (size_t)requiredBytes,
+-			(uint8_t)0);
++		memset(g_glRaytracingLighting.hitTableMapped, 0, (size_t)fullCapacityBytes);
+ 		for (UINT listIndex = 0; listIndex < activeCount; ++listIndex)
+ 		{
+ 			const int instanceIndex = g_glRaytracingScene.activeInstanceIndices[listIndex];
+@@ -5839,10 +6002,15 @@ static int glRaytracingLightingBuildHitTable(void)
+ 			inst.exp227TableResident = 0;
+ 		}
+ 		dirtyCount = activeCount;
++		g_glRaytracingExp226.exp228FullRebuildReason = fullRebuildReason;
+ 	}
+ 
+ 	g_glRaytracingLighting.hitTableDispatchSlotCount = highestActiveSlot;
+ 	g_glRaytracingExp226.exp227HitTableDispatchSlots = highestActiveSlot;
++	g_glRaytracingExp226.exp228SbtCapacitySlots =
++		g_glRaytracingLighting.hitTableCapacitySlotCount;
++	g_glRaytracingExp226.exp228SbtActiveHighWater = highestActiveSlot;
++	g_glRaytracingExp226.exp228SbtLiveRecords = activeCount;
+ 	if (dirtyCount == 0)
+ 	{
+ 		++g_glRaytracingExp226.hitTableCacheHits;
+@@ -5853,9 +6021,8 @@ static int glRaytracingLightingBuildHitTable(void)
+ 	g_glRaytracingHitBindingStats.active = activeCount;
+ 
+ 	// glRaytracingLightingExecute waits for the previous main command list
+-	// before this function. Descriptor and upload-table writes are therefore
+-	// safe without a second fence wait inside the measured hit-table section.
+-
++	// before this function. Descriptor and persistently mapped upload writes are
++	// therefore safe without another fence wait in the measured SBT section.
+ 	D3D12_CPU_DESCRIPTOR_HANDLE cpuBase =
+ 		g_glRaytracingLighting.descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+ 	D3D12_GPU_DESCRIPTOR_HANDLE gpuBase =
+@@ -5877,6 +6044,8 @@ static int glRaytracingLightingBuildHitTable(void)
+ 			return 0;
+ 
+ 		const uint32_t slot = inst.exp227HitSlot;
++		if (slot >= g_glRaytracingLighting.hitTableCapacitySlotCount)
++			return 0;
+ 		uint8_t* shadowRecord = g_glRaytracingLighting.hitTableCpuShadow.data() +
+ 			(size_t)(slot * 2u) * recordSize;
+ 		uint8_t* reflectionRecord = shadowRecord + recordSize;
+@@ -5916,22 +6085,12 @@ static int glRaytracingLightingBuildHitTable(void)
+ 
+ 	if (!g_glRaytracingLighting.hitTableMapped)
+ 		return 0;
+-	if (fullRebuild)
++	for (size_t i = 0; i < updatedSlots.size(); ++i)
+ 	{
+-		memcpy(
+-			g_glRaytracingLighting.hitTableMapped,
+-			g_glRaytracingLighting.hitTableCpuShadow.data(),
+-			(size_t)requiredBytes);
+-	}
+-	else
+-	{
+-		for (size_t i = 0; i < updatedSlots.size(); ++i)
+-		{
+-			const size_t byteOffset = (size_t)(updatedSlots[i] * 2u) * recordSize;
+-			memcpy(g_glRaytracingLighting.hitTableMapped + byteOffset,
+-				g_glRaytracingLighting.hitTableCpuShadow.data() + byteOffset,
+-				(size_t)recordSize * 2u);
+-		}
++		const size_t byteOffset = (size_t)(updatedSlots[i] * 2u) * recordSize;
++		memcpy(g_glRaytracingLighting.hitTableMapped + byteOffset,
++			g_glRaytracingLighting.hitTableCpuShadow.data() + byteOffset,
++			(size_t)recordSize * 2u);
+ 	}
+ 
+ 	g_glRaytracingHitBindingStats.exactSrv = 0;
+@@ -5953,7 +6112,7 @@ static int glRaytracingLightingBuildHitTable(void)
+ 	if (memcmp(&lastLogged, &g_glRaytracingHitBindingStats, sizeof(lastLogged)) != 0)
+ 	{
+ 		glRaytracingLog(
+-			"RT_REFLECTION_BIND_EXP22_7 active=%u handles=%u prepared=%u exactSrv=%u fallback=%u",
++			"RT_REFLECTION_BIND_EXP22_8 active=%u handles=%u prepared=%u exactSrv=%u fallback=%u",
+ 			g_glRaytracingHitBindingStats.active,
+ 			g_glRaytracingHitBindingStats.nonZeroHandles,
+ 			g_glRaytracingHitBindingStats.preparedExact,
+@@ -5965,7 +6124,7 @@ static int glRaytracingLightingBuildHitTable(void)
+ 	const uint32_t updatedRecordCount = (uint32_t)updatedSlots.size();
+ 	g_glRaytracingExp226.exp227LastUpdatedTableRecords = updatedRecordCount;
+ 	g_glRaytracingExp226.exp227UpdatedTableRecords += updatedRecordCount;
+-	g_glRaytracingExp226.exp227TableBuiltThisFrame = 1;
++	g_glRaytracingExp226.exp227TableBuiltThisFrame = updatedRecordCount ? 1 : 0;
+ 	if (fullRebuild)
+ 		++g_glRaytracingExp226.exp227FullTableRebuilds;
+ 	else
+@@ -5975,7 +6134,6 @@ static int glRaytracingLightingBuildHitTable(void)
+ 	return 1;
+ }
+ 
+-
+ static void glRaytracingLightingCreatePerPassDescriptors(const glRaytracingLightingPassDesc_t* pass)
+ {
+ 	D3D12_CPU_DESCRIPTOR_HANDLE base = g_glRaytracingLighting.descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+diff --git a/src/opengl/opengl.h b/src/opengl/opengl.h
+index e2d1c88..65c955f 100644
+--- a/src/opengl/opengl.h
++++ b/src/opengl/opengl.h
+@@ -1610,6 +1610,14 @@ typedef struct glRaytracingMeshDesc_s
+ 	int                         opaque;
+ } glRaytracingMeshDesc_t;
+ 
++enum glRaytracingInstanceFlags_t
++{
++	GL_RAYTRACING_INSTANCE_FLAG_NONE = 0,
++	GL_RAYTRACING_INSTANCE_FLAG_TRANSIENT = 1u << 0,
++	GL_RAYTRACING_INSTANCE_FLAG_MUZZLE = 1u << 1,
++	GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION = 1u << 2
++};
++
+ typedef struct glRaytracingInstanceDesc_s
+ {
+ 	uint32_t meshHandle;
+@@ -1618,6 +1626,9 @@ typedef struct glRaytracingInstanceDesc_s
+ 	// EXP22.2: OpenGL material texture sampled by the reflection closest-hit
+ 	// shader. Zero selects the renderer's white fallback texture.
+ 	uint32_t albedoTexture;
++	// EXP22.8: renderer classification used to exclude transient/additive
++	// effects from BLAS/TLAS and the reflection shader binding table.
++	uint32_t flags;
+ 	float    transform[12];
+ } glRaytracingInstanceDesc_t;
+ 
+@@ -1678,6 +1689,18 @@ typedef struct glRaytracingExp226PerformanceStats_s
+ 	uint32_t dirtyTableBindings;
+ 	uint32_t hitTableDispatchSlots;
+ 	int tableBuiltThisFrame;
++	// EXP22.8 persistent SBT capacity, transient filtering and AS timings.
++	uint32_t fullRebuildReason;
++	uint64_t highWaterGrowthEvents;
++	uint64_t newDynamicSlots;
++	uint64_t transientSkipped;
++	uint64_t muzzleInstances;
++	uint32_t sbtCapacitySlots;
++	uint32_t sbtHighWater;
++	uint32_t sbtActiveHighWater;
++	uint32_t sbtLiveRecords;
++	double tlasBuildMs;
++	double blasBuildMs;
+ } glRaytracingExp226PerformanceStats_t;
+ 
+ static const uint32_t GL_RAYTRACING_MAX_LIGHTS = 256;
+@@ -1761,6 +1784,9 @@ uint32_t                   glRaytracingGetInstanceCount(void);
+ void                       glRaytracingExp226SetReflectionBindingsEnabled(int enabled);
+ int                        glRaytracingExp226ReflectionBindingsEnabled(void);
+ int                        glRaytracingExp226TouchInstance(glRaytracingInstanceHandle_t instanceHandle);
++int                        glRaytracingExp228TouchInstance(
++	glRaytracingInstanceHandle_t instanceHandle, uint32_t instanceFlags);
++void                       glRaytracingExp228RecordTransientSkip(uint32_t instanceFlags);
+ uint64_t                   glRaytracingExp226GetBindingRevision(void);
+ uint32_t                   glRaytracingExp226GetActiveInstanceCount(void);
+ void                       glRaytracingExp226GetLifecycleStats(glRaytracingExp226LifecycleStats_t* outStats);
+diff --git a/src/renderer/tr_backend.cpp b/src/renderer/tr_backend.cpp
+index 81092f4..8466a3d 100644
+--- a/src/renderer/tr_backend.cpp
++++ b/src/renderer/tr_backend.cpp
+@@ -934,6 +934,104 @@ static unsigned long long RB_HashDXRGeometry(
+ 	return h ? h : 1ULL;
+ }
+ 
++// EXP22.8 transient isolation. These effects are rendered by the legacy
++// transparent/additive pass and do not need BLAS/TLAS or reflection SBT entries.
++// Keep the classification conservative: opaque world/model materials remain
++// eligible, while decals, smoke/puffs, muzzle flashes and additive particles
++// are excluded before any mesh upload or acceleration-structure work.
++static qboolean RB_EXP228ShaderNameContains(const shader_t* shader, const char* token)
++{
++	char lowerName[MAX_QPATH];
++	if (!shader || !token || !token[0])
++		return qfalse;
++	Q_strncpyz(lowerName, shader->name, sizeof(lowerName));
++	Q_strlwr(lowerName);
++	return strstr(lowerName, token) ? qtrue : qfalse;
++}
++
++static uint32_t RB_EXP228ClassifyTransientFlags(
++	const shader_t* shader,
++	const trRefEntity_t* entity)
++{
++	if (!shader)
++		return GL_RAYTRACING_INSTANCE_FLAG_NONE;
++
++	uint32_t flags = GL_RAYTRACING_INSTANCE_FLAG_NONE;
++	const qboolean nonModelTransient =
++		entity && entity != &tr.worldEntity && entity->e.reType != RT_MODEL;
++	const qboolean muzzle =
++		RB_EXP228ShaderNameContains(shader, "muzzle") ||
++		RB_EXP228ShaderNameContains(shader, "muzz") ||
++		RB_EXP228ShaderNameContains(shader, "gunflash") ||
++		RB_EXP228ShaderNameContains(shader, "weaponflash") ||
++		RB_EXP228ShaderNameContains(shader, "mflash");
++	const qboolean namedTransient = muzzle ||
++		RB_EXP228ShaderNameContains(shader, "smoke") ||
++		RB_EXP228ShaderNameContains(shader, "puff") ||
++		RB_EXP228ShaderNameContains(shader, "particle") ||
++		RB_EXP228ShaderNameContains(shader, "spark") ||
++		RB_EXP228ShaderNameContains(shader, "tracer") ||
++		RB_EXP228ShaderNameContains(shader, "shell") ||
++		RB_EXP228ShaderNameContains(shader, "brass") ||
++		RB_EXP228ShaderNameContains(shader, "casing") ||
++		RB_EXP228ShaderNameContains(shader, "impact") ||
++		RB_EXP228ShaderNameContains(shader, "scorch") ||
++		RB_EXP228ShaderNameContains(shader, "blood") ||
++		RB_EXP228ShaderNameContains(shader, "dust") ||
++		RB_EXP228ShaderNameContains(shader, "debris") ||
++		RB_EXP228ShaderNameContains(shader, "explosion") ||
++		RB_EXP228ShaderNameContains(shader, "flare");
++	qboolean additiveStage = qfalse;
++	for (int stageIndex = 0; stageIndex < MAX_SHADER_STAGES; ++stageIndex)
++	{
++		const shaderStage_t* stage = shader->stages[stageIndex];
++		if (!stage || !stage->active)
++			continue;
++		const unsigned srcBlend = stage->stateBits & GLS_SRCBLEND_BITS;
++		const unsigned dstBlend = stage->stateBits & GLS_DSTBLEND_BITS;
++		if (dstBlend == GLS_DSTBLEND_ONE && srcBlend != GLS_SRCBLEND_ZERO)
++		{
++			additiveStage = qtrue;
++			break;
++		}
++	}
++	const qboolean sortedTransient =
++		shader->sort == SS_DECAL ||
++		shader->sort >= SS_ALMOST_NEAREST ||
++		(shader->entityMergable && shader->sort > SS_OPAQUE);
++
++	if (nonModelTransient || namedTransient || sortedTransient || additiveStage)
++		flags |= GL_RAYTRACING_INSTANCE_FLAG_TRANSIENT |
++			GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION;
++	if (muzzle)
++		flags |= GL_RAYTRACING_INSTANCE_FLAG_MUZZLE;
++	return flags;
++}
++
++static void RB_EXP228ExcludeDXRSurface(
++	trDXRMesh_t* mesh,
++	int surfaceId,
++	uint32_t instanceFlags)
++{
++	if (!mesh || surfaceId < 0 || surfaceId >= MAX_DXR_SURFACES)
++		return;
++	trDXRSurface_t* surf = &mesh->dxrSurfaces[surfaceId];
++	if (surf->dxrInstanceHandle)
++	{
++		glRaytracingDeleteInstance(surf->dxrInstanceHandle);
++		surf->dxrInstanceHandle = 0;
++	}
++	if (surf->dxrMeshHandle)
++	{
++		glRaytracingDeleteMesh(surf->dxrMeshHandle);
++		surf->dxrMeshHandle = 0;
++	}
++	surf->cachedTransformValid = 0;
++	surf->cachedAlbedoTexture = 0;
++	surf->geometryHash = 0;
++	glRaytracingExp228RecordTransientSkip(instanceFlags);
++}
++
+ // EXP22.2: select the authored colour map that supplies hit-surface colour.
+ // Lightmaps are deliberately skipped: the reflection path needs material
+ // albedo, while direct/indirect lighting is still evaluated by the DXR pass.
+@@ -995,13 +1093,15 @@ void RB_UpdateDXRInstance(trDXRMesh_t* mesh, int surfaceId, uint32_t instanceID,
+ 	desc.instanceID = instanceID;
+ 	desc.mask = 0xFF;
+ 	desc.albedoTexture = RB_GetDXRAlbedoTexture(tess.shader);
++	desc.flags = RB_EXP228ClassifyTransientFlags(tess.shader, backEnd.currentEntity);
+ 
+ 	RB_CopyModelMatrixToDXRTransform(modelMatrix, desc.transform);
+ 
+ 	int exp226InstanceAlive = 0;
+ 	if (surf->dxrInstanceHandle)
+ 	{
+-		exp226InstanceAlive = glRaytracingExp226TouchInstance(surf->dxrInstanceHandle);
++		exp226InstanceAlive = glRaytracingExp228TouchInstance(
++			surf->dxrInstanceHandle, desc.flags);
+ 		if (!exp226InstanceAlive)
+ 		{
+ 			surf->dxrInstanceHandle = 0;
+@@ -1009,7 +1109,7 @@ void RB_UpdateDXRInstance(trDXRMesh_t* mesh, int surfaceId, uint32_t instanceID,
+ 		}
+ 	}
+ 
+-	if (exp226InstanceAlive && surf->cachedTransformValid &&
++	if (exp226InstanceAlive == 1 && surf->cachedTransformValid &&
+ 		memcmp(surf->cachedTransform, desc.transform, sizeof(desc.transform)) == 0 &&
+ 		surf->cachedAlbedoTexture == desc.albedoTexture)
+ 	{
+@@ -1835,8 +1935,18 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
+ 		
+ 			if (dxrMesh)
+ 			{
+-				RB_UpdateDXRMesh(dxrMesh, backEnd.currentEntity->e.frame, drawSurf->dxrSurfaceId, oldNumVerts, tess.numVertexes, oldNumIndex, tess.numIndexes);
+-				RB_UpdateDXRInstance(dxrMesh, drawSurf->dxrSurfaceId, 0, entityMatrix.modelMatrix);
++				const uint32_t exp228Flags = RB_EXP228ClassifyTransientFlags(
++					tess.shader, backEnd.currentEntity);
++				if (exp228Flags & GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION)
++				{
++					RB_EXP228ExcludeDXRSurface(
++						dxrMesh, drawSurf->dxrSurfaceId, exp228Flags);
++				}
++				else
++				{
++					RB_UpdateDXRMesh(dxrMesh, backEnd.currentEntity->e.frame, drawSurf->dxrSurfaceId, oldNumVerts, tess.numVertexes, oldNumIndex, tess.numIndexes);
++					RB_UpdateDXRInstance(dxrMesh, drawSurf->dxrSurfaceId, 0, entityMatrix.modelMatrix);
++				}
+ 			}
+ /*
+ 			// RF, convert the newly created vertexes into dust particles, and overwrite
+@@ -1963,8 +2073,18 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
+ 		dxrMesh = drawSurf->dxrMesh;
+ 		if (dxrMesh)
+ 		{
+-			RB_UpdateDXRMesh(dxrMesh, backEnd.currentEntity->e.frame, drawSurf->dxrSurfaceId, oldNumVerts, tess.numVertexes, oldNumIndex, tess.numIndexes);
+-			RB_UpdateDXRInstance(dxrMesh, drawSurf->dxrSurfaceId, 0, entityMatrix.modelMatrix);
++			const uint32_t exp228Flags = RB_EXP228ClassifyTransientFlags(
++				tess.shader, backEnd.currentEntity);
++			if (exp228Flags & GL_RAYTRACING_INSTANCE_FLAG_NO_REFLECTION)
++			{
++				RB_EXP228ExcludeDXRSurface(
++					dxrMesh, drawSurf->dxrSurfaceId, exp228Flags);
++			}
++			else
++			{
++				RB_UpdateDXRMesh(dxrMesh, backEnd.currentEntity->e.frame, drawSurf->dxrSurfaceId, oldNumVerts, tess.numVertexes, oldNumIndex, tess.numIndexes);
++				RB_UpdateDXRInstance(dxrMesh, drawSurf->dxrSurfaceId, 0, entityMatrix.modelMatrix);
++			}
+ 		}
+ 
+ 		// RF, convert the newly created vertexes into dust particles, and overwrite
+diff --git a/src/renderer/tr_cmds.cpp b/src/renderer/tr_cmds.cpp
+index 050dfb2..5d5169c 100644
+--- a/src/renderer/tr_cmds.cpp
++++ b/src/renderer/tr_cmds.cpp
+@@ -96,10 +96,13 @@ static void EXP226_RecordAndReportFrame(void)
+ 	const double gpuMs = QD3D12_EXP226_GetGpuFrameMs();
+ 
+ 	ri.Printf(PRINT_ALL,
+-		"EXP22_7_PERF avgFps=%.2f low1Fps=%.2f cpuMs=%.3f gpuMs=%.3f "
++		"EXP22_8_PERF avgFps=%.2f low1Fps=%.2f cpuMs=%.3f gpuMs=%.3f "
+ 		"prepareMs=%.3f prepareAvgMs=%.3f hitTableMs=%.3f hitTableAvgMs=%.3f "
+ 		"preparedNow=%u updatedNow=%u tableBuilt=%d staticActive=%u dynamicActive=%u "
+ 		"dirtyPrep=%u dirtyTable=%u dispatchSlots=%u "
++		"fullRebuildReason=%u highWaterGrowthEvents=%llu newDynamicSlots=%llu "
++		"transientSkipped=%llu muzzleInstances=%llu sbtCapacity=%u sbtHighWater=%u "
++		"sbtActiveHighWater=%u sbtLiveRecords=%u tlasMs=%.3f blasMs=%.3f "
+ 		"fullRebuilds=%llu partialUpdates=%llu updatedRecords=%llu preparedRecords=%llu reusedSlots=%llu "
+ 		"staticFallbacks=%llu dynamicFallbacks=%llu "
+ 		"allocated=%u live=%u stale=%u active=%u built=%u meshAllocated=%u meshLive=%u meshStale=%u "
+@@ -112,6 +115,10 @@ static void EXP226_RecordAndReportFrame(void)
+ 		perf.lastPreparedBindings, perf.lastUpdatedTableRecords, perf.tableBuiltThisFrame,
+ 		perf.staticActiveBindings, perf.dynamicActiveBindings, perf.dirtyPrepareBindings, perf.dirtyTableBindings,
+ 		perf.hitTableDispatchSlots,
++		perf.fullRebuildReason, (unsigned long long)perf.highWaterGrowthEvents,
++		(unsigned long long)perf.newDynamicSlots, (unsigned long long)perf.transientSkipped,
++		(unsigned long long)perf.muzzleInstances, perf.sbtCapacitySlots, perf.sbtHighWater,
++		perf.sbtActiveHighWater, perf.sbtLiveRecords, perf.tlasBuildMs, perf.blasBuildMs,
+ 		(unsigned long long)perf.fullTableRebuilds, (unsigned long long)perf.partialTableUpdates,
+ 		(unsigned long long)perf.updatedTableRecords, (unsigned long long)perf.preparedBindingRecords,
+ 		(unsigned long long)perf.reusedHitSlots, (unsigned long long)perf.staticSlotFallbacks,
