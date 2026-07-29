@@ -50,6 +50,36 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $source '*') -Destination $destination -Recurse -Force
           Write-Host "EXP22_8_PAYLOAD=PASS SHA256=$actual"
 
+      - name: Repair and verify EXP22.8 packaging wrapper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:GITHUB_WORKSPACE 'kit/ci/exp22_8/package_exp228.ps1'
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "EXP22.8 package wrapper missing: $path" }
+          $lines = [IO.File]::ReadAllLines((Resolve-Path -LiteralPath $path))
+          $bad = 'if ($LASTEXITCODE -ne 0) { throw "EXP22.6 base packager returned exit code $LASTEXITCODE" }'
+          $good = 'if (-not $?) { throw "EXP22.6 base packager failed without a terminating exception." }'
+          $badIndexes = @()
+          $goodCount = 0
+          for ($i = 0; $i -lt $lines.Length; ++$i) {
+            if ($lines[$i] -eq $bad) { $badIndexes += $i }
+            if ($lines[$i] -eq $good) { ++$goodCount }
+          }
+          if ($badIndexes.Count -eq 1 -and $goodCount -eq 0) {
+            $lines[$badIndexes[0]] = $good
+            [IO.File]::WriteAllLines($path, $lines, [Text.UTF8Encoding]::new($false))
+          }
+          elseif ($badIndexes.Count -eq 0 -and $goodCount -eq 1) {
+            Write-Host 'EXP22.8 package wrapper was already repaired.'
+          }
+          else {
+            throw "EXP22.8 package wrapper contract mismatch. Bad=$($badIndexes.Count) Good=$goodCount"
+          }
+          $verify = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $path))
+          if ($verify.Contains('$LASTEXITCODE')) { throw 'EXP22.8 package wrapper still contains unsafe LASTEXITCODE access.' }
+          if (-not $verify.Contains($good)) { throw 'EXP22.8 package wrapper repaired marker is missing.' }
+          Write-Host 'EXP22_8_PACKAGE_WRAPPER=PASS MODE=POWERSHELL_SCRIPT_STATUS'
+
       - name: Checkout exact EXP22.4 donor snapshot
         uses: actions/checkout@v4
         with:
