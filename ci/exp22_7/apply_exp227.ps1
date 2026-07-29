@@ -28,42 +28,55 @@ $sourceFiles = @(
 function Get-Sha256Hex {
   param([Parameter(Mandatory=$true)][byte[]]$Bytes)
   $sha = [Security.Cryptography.SHA256]::Create()
-  try {
-    return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '')
-  }
-  finally {
-    $sha.Dispose()
-  }
+  try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '') }
+  finally { $sha.Dispose() }
 }
 
-# GitHub stores the patch as canonical LF text, but a Windows checkout can
-# materialize it as CRLF before this script starts. Raw-byte hashing therefore
-# produced a false mismatch even though the patch content was unchanged.
-# Validate the canonical UTF-8/LF representation and apply that exact copy.
-$expectedCanonicalPatchSha = '04998D9BA9717F6D1612B3A8F39B48F0E8F92AE3494F8C037F376B176DC22444'
+# The repository payload is validated first in its original canonical LF form.
+# A deterministic two-site compatibility transform then protects std::max from
+# the legacy Windows max macro without changing EXP22.7 runtime behavior.
+$expectedSourcePatchSha = '04998D9BA9717F6D1612B3A8F39B48F0E8F92AE3494F8C037F376B176DC22444'
+$expectedEffectivePatchSha = '6495B878E8E35E51080020236AE5075BDA5B0BC4482AE157BF3D6531D632F61E'
 $rawPatchBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $patchSource))
 $rawPatchSha = Get-Sha256Hex -Bytes $rawPatchBytes
 $utf8Strict = [Text.UTF8Encoding]::new($false, $true)
-try {
-  $patchText = $utf8Strict.GetString($rawPatchBytes)
-}
-catch {
-  throw "EXP22.7 patch is not valid UTF-8 text: $($_.Exception.Message)"
-}
+try { $patchText = $utf8Strict.GetString($rawPatchBytes) }
+catch { throw "EXP22.7 patch is not valid UTF-8 text: $($_.Exception.Message)" }
 if ($patchText.Length -gt 0 -and $patchText[0] -eq [char]0xFEFF) {
   $patchText = $patchText.Substring(1)
 }
 $crlfCount = ([regex]::Matches($patchText, "`r`n")).Count
-$canonicalPatchText = $patchText.Replace("`r`n", "`n").Replace("`r", "`n")
+$sourcePatchText = $patchText.Replace("`r`n", "`n").Replace("`r", "`n")
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
-$canonicalPatchBytes = $utf8NoBom.GetBytes($canonicalPatchText)
-$canonicalPatchSha = Get-Sha256Hex -Bytes $canonicalPatchBytes
-if ($canonicalPatchSha -ne $expectedCanonicalPatchSha) {
-  throw "EXP22.7 canonical patch hash mismatch. Expected=$expectedCanonicalPatchSha Actual=$canonicalPatchSha Raw=$rawPatchSha"
+$sourcePatchBytes = $utf8NoBom.GetBytes($sourcePatchText)
+$sourcePatchSha = Get-Sha256Hex -Bytes $sourcePatchBytes
+if ($sourcePatchSha -ne $expectedSourcePatchSha) {
+  throw "EXP22.7 source patch hash mismatch. Expected=$expectedSourcePatchSha Actual=$sourcePatchSha Raw=$rawPatchSha"
 }
 
-$canonicalPatch = Join-Path $env:RUNNER_TEMP 'exp22_7-static-dynamic-hit-table-canonical-lf.patch'
-[IO.File]::WriteAllBytes($canonicalPatch, $canonicalPatchBytes)
+$macroSites = @(
+  'g_glRaytracingExp226.exp227HitSlotHighWater = std::max(',
+  'highestActiveSlot = std::max(highestActiveSlot, inst.exp227HitSlot + 1u);'
+)
+foreach ($site in $macroSites) {
+  $count = ([regex]::Matches($sourcePatchText, [regex]::Escape($site))).Count
+  if ($count -ne 1) {
+    throw "EXP22.7 MSVC compatibility anchor count mismatch. Anchor=[$site] Expected=1 Actual=$count"
+  }
+}
+$effectivePatchText = $sourcePatchText.Replace(
+  $macroSites[0],
+  'g_glRaytracingExp226.exp227HitSlotHighWater = (std::max)(').Replace(
+  $macroSites[1],
+  'highestActiveSlot = (std::max)(highestActiveSlot, inst.exp227HitSlot + 1u);')
+$effectivePatchBytes = $utf8NoBom.GetBytes($effectivePatchText)
+$effectivePatchSha = Get-Sha256Hex -Bytes $effectivePatchBytes
+if ($effectivePatchSha -ne $expectedEffectivePatchSha) {
+  throw "EXP22.7 effective patch hash mismatch. Expected=$expectedEffectivePatchSha Actual=$effectivePatchSha"
+}
+
+$effectivePatch = Join-Path $env:RUNNER_TEMP 'exp22_7-static-dynamic-hit-table-msvc-safe-lf.patch'
+[IO.File]::WriteAllBytes($effectivePatch, $effectivePatchBytes)
 
 $auditDir = Join-Path $work 'ci/exp22_7'
 New-Item -ItemType Directory -Path $auditDir -Force | Out-Null
@@ -71,21 +84,22 @@ $transportAudit = @(
   'DARKWOLF_EXP22_7_PATCH_TRANSPORT_AUDIT',
   "SourcePath=$patchSource",
   "RawSHA256=$rawPatchSha",
-  "CanonicalLFSHA256=$canonicalPatchSha",
-  "ExpectedCanonicalLFSHA256=$expectedCanonicalPatchSha",
+  "SourceCanonicalLFSHA256=$sourcePatchSha",
+  "ExpectedSourceCanonicalLFSHA256=$expectedSourcePatchSha",
+  "EffectiveMSVCSafeLFSHA256=$effectivePatchSha",
+  "ExpectedEffectiveMSVCSafeLFSHA256=$expectedEffectivePatchSha",
   "RawBytes=$($rawPatchBytes.Length)",
-  "CanonicalBytes=$($canonicalPatchBytes.Length)",
+  "SourceCanonicalBytes=$($sourcePatchBytes.Length)",
+  "EffectiveBytes=$($effectivePatchBytes.Length)",
   "CRLFSequences=$crlfCount",
+  'CompatibilityTransform=parenthesize-two-std-max-calls',
   'CanonicalEncoding=UTF-8-no-BOM',
   'CanonicalLineEnding=LF'
 )
-[IO.File]::WriteAllLines(
-  (Join-Path $auditDir 'PATCH_TRANSPORT_AUDIT.txt'),
-  $transportAudit,
-  $utf8NoBom)
+[IO.File]::WriteAllLines((Join-Path $auditDir 'PATCH_TRANSPORT_AUDIT.txt'), $transportAudit, $utf8NoBom)
 [IO.File]::WriteAllBytes(
-  (Join-Path $auditDir '360-d3d12-static-dynamic-hit-table-exp22_7-canonical-lf.patch'),
-  $canonicalPatchBytes)
+  (Join-Path $auditDir '360-d3d12-static-dynamic-hit-table-exp22_7-effective-msvc-safe.patch'),
+  $effectivePatchBytes)
 
 function Normalize-SourceToCanonicalLf {
   param([Parameter(Mandatory=$true)][string]$RelativePath)
@@ -94,8 +108,7 @@ function Normalize-SourceToCanonicalLf {
     throw "EXP22.7 source file is missing before normalization: $RelativePath"
   }
   $body = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $path))
-  $normalized = $body.Replace("`r`n", "`n").Replace("`r", "`n")
-  [IO.File]::WriteAllText($path, $normalized, $utf8NoBom)
+  [IO.File]::WriteAllText($path, $body.Replace("`r`n", "`n").Replace("`r", "`n"), $utf8NoBom)
 }
 
 function Test-Manifest {
@@ -138,14 +151,14 @@ try {
 
   Test-Manifest -Manifest $inputManifest -Phase 'INPUT'
 
-  git apply --check --whitespace=error-all -- $canonicalPatch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical patch pre-apply check failed.' }
-  git apply --whitespace=error-all -- $canonicalPatch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical patch application failed.' }
+  git apply --check --whitespace=error-all -- $effectivePatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 effective patch pre-apply check failed.' }
+  git apply --whitespace=error-all -- $effectivePatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 effective patch application failed.' }
   git diff --check -- $sourceFiles
   if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 source diff contains whitespace errors.' }
-  git apply --reverse --check -- $canonicalPatch
-  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 canonical reverse patch verification failed.' }
+  git apply --reverse --check -- $effectivePatch
+  if ($LASTEXITCODE -ne 0) { throw 'EXP22.7 effective reverse patch verification failed.' }
 
   Test-Manifest -Manifest $outputManifest -Phase 'OUTPUT'
 
@@ -166,6 +179,7 @@ try {
     @('src/opengl/gl_d3d12raylight.cpp', 'hitTableCpuShadow'),
     @('src/opengl/gl_d3d12raylight.cpp', 'glRaytracingWaitMainCmdFence'),
     @('src/opengl/gl_d3d12raylight.cpp', 'exp227PartialTableUpdates'),
+    @('src/opengl/gl_d3d12raylight.cpp', '(std::max)('),
     @('src/renderer/tr_cmds.cpp', 'EXP22_7_PERF'),
     @('src/opengl/opengl.h', 'fullTableRebuilds')
   )
@@ -175,22 +189,23 @@ try {
       throw "EXP22.7 required marker missing: $($marker[0]) :: $($marker[1])"
     }
   }
+  $rayBody = [IO.File]::ReadAllText((Resolve-Path -LiteralPath 'src/opengl/gl_d3d12raylight.cpp'))
+  if ($rayBody.Contains('std::max(')) {
+    throw 'EXP22.7 source still contains an unprotected std::max call that can collide with the Windows max macro.'
+  }
 
   $diff = git diff -- $sourceFiles
   $diffText = $diff -join "`n"
   if ([string]::IsNullOrWhiteSpace($diffText)) {
     throw 'EXP22.7 patch produced no source diff.'
   }
-  [IO.File]::WriteAllText(
-    (Join-Path $auditDir 'EXP22_7_SOURCE_DIFF.patch'),
-    ($diffText + "`n"),
-    $utf8NoBom)
+  [IO.File]::WriteAllText((Join-Path $auditDir 'EXP22_7_SOURCE_DIFF.patch'), ($diffText + "`n"), $utf8NoBom)
   Copy-Item -LiteralPath $inputManifest -Destination (Join-Path $auditDir 'SOURCE_INPUT_SHA256SUMS.txt') -Force
   Copy-Item -LiteralPath $outputManifest -Destination (Join-Path $auditDir 'SOURCE_OUTPUT_SHA256SUMS.txt') -Force
   Copy-Item -LiteralPath $contract -Destination (Join-Path $auditDir 'SOURCE_CONTRACT_SUMMARY.txt') -Force
 
-  Write-Host "EXP22_7_PATCH_TRANSPORT=PASS RAW_SHA256=$rawPatchSha CANONICAL_LF_SHA256=$canonicalPatchSha CRLF=$crlfCount"
-  Write-Host "EXP22_7_PATCH=PASS SHA256=$canonicalPatchSha FILES=3"
+  Write-Host "EXP22_7_PATCH_TRANSPORT=PASS RAW_SHA256=$rawPatchSha SOURCE_LF_SHA256=$sourcePatchSha EFFECTIVE_SHA256=$effectivePatchSha CRLF=$crlfCount"
+  Write-Host "EXP22_7_PATCH=PASS SHA256=$effectivePatchSha FILES=3 MSVC_MAX_MACRO_SAFE=1"
   Write-Host 'EXP22_7_SOURCE_AUDIT=PASS'
 }
 finally {
