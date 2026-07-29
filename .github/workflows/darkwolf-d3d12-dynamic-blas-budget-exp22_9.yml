@@ -44,7 +44,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $archive = Join-Path $env:GITHUB_WORKSPACE 'exp228kit/ci/exp22_8/DarkWolf_EXP22_8_Persistent_Dynamic_SBT_GitHub_Kit.zip'
-          $expected = 'F7DEF4E8161FECBE8C35846B6101684074E47D87B800E5F4A6AF8392B26C302C'
+          $expected = 'F508891F491C4EAACF38BD1E41696FF6F7E8CC52971AF91631EA6EF9F3807754'
           if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
             throw "EXP22.8 baseline kit missing at exact commit ef4c951f2c880e41c88094e937aa91fcc4efea12: $archive"
           }
