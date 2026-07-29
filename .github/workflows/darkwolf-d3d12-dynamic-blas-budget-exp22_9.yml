@@ -56,7 +56,18 @@ jobs:
           if (Test-Path -LiteralPath $temp) {
             Remove-Item -LiteralPath $temp -Recurse -Force
           }
-          Expand-Archive -LiteralPath $archive -DestinationPath $temp -Force
+          New-Item -ItemType Directory -Path $temp -Force | Out-Null
+          $tar = (Get-Command tar.exe -ErrorAction Stop).Source
+          & $tar -tf $archive | Out-Null
+          $listExit = $LASTEXITCODE
+          if ($listExit -ne 0) {
+            throw "EXP22.8 baseline ZIP validation failed. tar exit code=$listExit"
+          }
+          & $tar -xf $archive -C $temp
+          $extractExit = $LASTEXITCODE
+          if ($extractExit -ne 0) {
+            throw "EXP22.8 baseline ZIP extraction failed. tar exit code=$extractExit"
+          }
           $source = Join-Path $temp 'ci/exp22_8'
           if (-not (Test-Path -LiteralPath $source -PathType Container)) {
             throw "Expanded EXP22.8 payload directory is missing: $source"
@@ -79,7 +90,7 @@ jobs:
               throw "Required EXP22.8 baseline file is missing after extraction: $requiredPath"
             }
           }
-          Write-Host "EXP22_8_BASELINE_PAYLOAD=PASS COMMIT=ef4c951f2c880e41c88094e937aa91fcc4efea12 SHA256=$actual"
+          Write-Host "EXP22_8_BASELINE_PAYLOAD=PASS COMMIT=ef4c951f2c880e41c88094e937aa91fcc4efea12 SHA256=$actual EXTRACTOR=bsdtar"
 
       - name: Checkout exact EXP22.4 donor
         uses: actions/checkout@v4
