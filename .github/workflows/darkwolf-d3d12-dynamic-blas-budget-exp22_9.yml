@@ -2,6 +2,12 @@ name: DarkWolf EXP22.9 Dynamic BLAS Budget Release
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/darkwolf-d3d12-dynamic-blas-budget-exp22_9.yml'
+      - 'ci/exp22_9/**'
   push:
     branches:
       - exp22-9-dynamic-blas-budget
